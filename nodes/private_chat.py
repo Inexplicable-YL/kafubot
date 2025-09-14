@@ -1,9 +1,8 @@
 """# from typing import Any"""
 
-import re
 import warnings
 from datetime import datetime
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 from typing_extensions import override
 from zoneinfo import ZoneInfo
 
@@ -14,35 +13,6 @@ from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 from pipeline import PipelineProcess
 
 warnings.filterwarnings("ignore")
-
-
-class SegmentDelay(TypedDict):
-    """返回列表中每个元素的类型定义。"""
-
-    output: str
-    delay: float
-
-
-def split_with_delay(
-    input: str,  # noqa: A002
-    *,
-    coefficient: float = 0.2,
-) -> list[SegmentDelay]:
-    """将输入数据中的 `output` 字段按空格拆分，并为每个子串添加延迟。"""
-    if not input or not isinstance(input, str):
-        return []
-    raw = input.strip()
-    if not raw:
-        return []
-
-    segments = re.split(r"\s+", raw)
-
-    result: list[SegmentDelay] = []
-    for i, segment in enumerate(segments):
-        delay = 0.0 if i == 0 else len(segment) * coefficient
-        result.append({"output": segment, "delay": delay})
-
-    return result
 
 
 _OPTIONAL_PROMPT_KEY: Literal["_optional_prompt"] = "_optional_prompt"

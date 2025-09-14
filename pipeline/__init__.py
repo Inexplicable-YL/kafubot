@@ -7,9 +7,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import anyio
-from anyio import from_thread, to_thread
-
-from .worker import Job, Result, worker_entry
+from anyio import to_thread
+from worker import Job, Result, worker_entry
 
 if TYPE_CHECKING:
     from multiprocessing.context import SpawnContext
@@ -25,25 +24,13 @@ class PipelineProcess:
     def __init__(
         self,
         cfg_path: str,
+        ctx: SpawnContext,
         *,
         name: str | None = None,
         heartbeat: float = 30.0,
         other_chains: list[Any] | None = None,
     ) -> None:
         """Spawns a new worker process and prepares communication channels."""
-
-        async def _ensure_ctx() -> None:
-            async with PipelineProcess._ctx_lock:
-                if PipelineProcess._ctx is None:
-                    mp.set_start_method("spawn", force=True)
-                    PipelineProcess._ctx = mp.get_context("spawn")
-
-        try:
-            from_thread.run(_ensure_ctx)  # inside an event loop
-        except RuntimeError:
-            anyio.run(_ensure_ctx)  # outside an event loop
-
-        ctx = PipelineProcess._ctx  # guaranteed non-None
 
         self._task_q: mp.Queue = ctx.Queue(maxsize=128)
         self._res_q: mp.Queue = ctx.Queue(maxsize=128)
@@ -94,11 +81,24 @@ class PipelineProcess:
 
 async def run_demo() -> None:
     """Demonstrates concurrent use of two independent pipelines."""
-    pipe_a = PipelineProcess("cfg_a.toml", name="A")
-    pipe_b = PipelineProcess("cfg_b.toml", name="B")
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(lambda: pipe_a.ainvoke({"text": "hello"}))
-        tg.start_soon(lambda: pipe_b.ainvoke({"text": "world"}))
+    from datetime import datetime  # noqa: PLC0415
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    mp.set_start_method("spawn", force=True)
+    ctx = mp.get_context("spawn")
+    pipe_a = PipelineProcess("private_config.toml", ctx, name="A")
+    r = await pipe_a.ainvoke(
+        {
+            "input": "你好",
+            "time": datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime(
+                "%Y年%m月%d日 %H时%M分"
+            ),
+            "optional_prompt": "",
+        },
+        config={"configurable": {"session_id": "session_id"}},
+    )
+    print("A:", r)
+    await pipe_a.aclose()
 
 
 if __name__ == "__main__":
