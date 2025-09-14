@@ -48,7 +48,7 @@ def text_rerank(query: str, documents: list[str], top_n: int = 10) -> str | None
         documents=documents,
         top_n=top_n,
         return_documents=False,
-        api_key=os.getenv("DASHSCOPE_API_KEY"),
+        api_key=os.getenv("DASHSCOPE_API_KEY", ""),
     )
     if resp.status_code == HTTPStatus.OK:
         return "\n".join(documents[r.index] for r in resp.output.results)
@@ -175,8 +175,10 @@ search_model = create_agent(
     description="自动根据问题类型调用维基百科或网页搜索，支持多轮尝试、结果优化与简体中文输出，内置失败兜底逻辑。遇到不明确的问题请尝试!!"
 )
 async def search_tool(query: str) -> str | None:
-    if result := await search_model.ainvoke({"input": f"query: {query}"}):
-        return result.get("output", None).replace("\n", " ").replace("\r", "").strip()
+    if result := (await search_model.ainvoke({"input": f"query: {query}"})).get(
+        "output", None
+    ):
+        return result.replace("\n", " ").replace("\r", "").strip()
     return None
 
 

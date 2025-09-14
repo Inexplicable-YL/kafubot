@@ -7,6 +7,7 @@ from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.adapter.cqhttp.exceptions import ApiTimeout
 
 from agent import clear
+from pipeline import PipelineProcess
 
 from .llm import get_answer, handle_img
 
@@ -15,6 +16,10 @@ class GroupChat(Node[GroupMessageEvent, dict, Any]):
     """AIChat"""
 
     priority: int = 0
+
+    @property
+    def runnable(self) -> PipelineProcess:
+        return self.bot.global_state["_pipeline"]["_group"]
 
     async def handle(self) -> None:
         random_trigger = (
@@ -57,6 +62,7 @@ class GroupChat(Node[GroupMessageEvent, dict, Any]):
 
         if self.event.get_plain_text() and (
             answer := await get_answer(
+                runnable=self.runnable,
                 session_id=str(self.event.group_id),
                 name=name,
                 message=self.event.get_plain_text(),

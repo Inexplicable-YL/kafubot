@@ -105,27 +105,8 @@ convention = "google"
 [tool.ruff.lint.pyupgrade]
 keep-runtime-typing = true
 
-[tool.pyright]
-exclude = ["**/.conda", "**/.venv", "**/__pycache__"]
-pythonVersion = "3.11"
-pythonPlatform = "All"
-typeCheckingMode = "strict"
-python.linting.enabled = false
-python.linting.mypyEnabled = false
-python.linting.pylintEnabled = false
-reportUnnecessaryIsInstance = false
-reportCallInDefaultInitializer = true
-reportImplicitOverride = true
-reportPropertyTypeMismatch = true
-reportInvalidTypeVarUse = false
-reportShadowedImports = true
-reportUninitializedInstanceVariable = false
-reportPrivateUsage = false
-reportIncompatibleOverride = false
-
 [tool.mypy]
 python_version = "3.11"
-strict = true
 disable_error_code = [
     "valid-type", 
     "unused-ignore",

@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 from anyio import to_thread
-from worker import Job, Result, worker_entry
+
+from .worker import Job, Result, worker_entry
 
 if TYPE_CHECKING:
     from multiprocessing.context import SpawnContext
@@ -63,7 +64,7 @@ class PipelineProcess:
 
     async def health_check(self) -> bool:
         """Sends a heartbeat to the worker and returns True on success."""
-        await to_thread.run_sync(self._task_q.put, Job("heartbeat", None))
+        await to_thread.run_sync(self._task_q.put, Job("heartbeat", -1))
         try:
             with anyio.fail_after(5):
                 res: Result = await to_thread.run_sync(self._res_q.get)
@@ -75,8 +76,8 @@ class PipelineProcess:
 
     async def aclose(self) -> None:
         """Gracefully terminates the worker process."""
-        await to_thread.run_sync(self._task_q.put, Job("quit", None))
-        self._proc.join(timeout=5)
+        await to_thread.run_sync(self._task_q.put, Job("quit", -1))
+        await to_thread.run_sync(self._proc.join, 5)
 
 
 async def run_demo() -> None:

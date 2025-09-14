@@ -15,12 +15,12 @@ from sekaibot.log import logger
 from sortedcontainers import SortedDict  # type: ignore
 from zhconv import convert  # type: ignore
 
-from agent import create_agent, create_agent_with_history
+from agent import create_agent
 from agent.history import AsyncPersistentLRUDict
-from search_tool import search_tool
+from pipeline import PipelineProcess
 
 from .image import image_file_to_base64_jpg
-from .prompt import ignore_prompt, photo_prompt, text_prompt
+from .prompt import photo_prompt
 
 id_gen = count(start=1)
 
@@ -43,14 +43,6 @@ img_cache = AsyncPersistentLRUDict(
 message_dict: dict[str, SortedDict[int, BaseMessage]] = defaultdict(SortedDict)
 message_dict_locks: dict[str, Lock] = defaultdict(Lock)
 
-text_model = create_agent_with_history(
-    "deepseek-chat",
-    provider="DEEPSEEK",
-    prompt=text_prompt,
-    temperature=1.2,
-    tools=[search_tool],
-    verbose=True,
-)
 photo_model = create_agent(
     "gpt-4.1-mini",
     provider="OPENAI",
@@ -159,6 +151,7 @@ async def _get_img_description(
 
 
 async def get_answer(
+    runnable: PipelineProcess,
     session_id: str,
     name: str,
     message: str,
@@ -189,28 +182,31 @@ async def get_answer(
                         tg.start_soon(_get_img_description, messages, msg_id, msg)
 
         print(list(messages.values()))
-        res = await use_llm(session_id, list(messages.values()), is_tome)
-        answer: str = res.get("output", "ignore")
-        if "ignore" not in answer:
+        res = await use_llm(runnable, session_id, list(messages.values()), is_tome)
+        answer: str = res.get("output", [])
+        if answer:
             return convert(answer, "zh-tw")
 
     return None
 
 
 async def use_llm(
-    session_id: str, messages: list[BaseMessage], is_tome: bool
+    runnable: PipelineProcess,
+    session_id: str,
+    messages: list[BaseMessage],
+    is_tome: bool,
 ) -> dict[str, Any]:
     try:
-        return await text_model.ainvoke(
+        return await runnable.ainvoke(
             {
-                "messages": messages,
-                "ignore_prompt": ignore_prompt if not is_tome else "",
-                "current_time": datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
+                "input": messages,
+                "time": datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
                     "%Y年%m月%d日 %H时%M分"
                 ),
-            },
+            }
+            | ({"pass": True} if is_tome else {}),
             config={"configurable": {"session_id": session_id}},
         )
     except Exception:
         logger.exception("use llm error")
-        return {"output": "##ignore"}
+        return {"output": []}

@@ -1,12 +1,13 @@
 import multiprocessing as mp
 import re
-from typing import TypedDict, cast
+from typing import TypedDict
 
+from dotenv import load_dotenv
 from sekaibot import Bot
 
 from pipeline import PipelineProcess
 
-bot = Bot(config_file="config.toml")
+load_dotenv()
 
 
 class SegmentDelay(TypedDict):
@@ -38,20 +39,20 @@ def split_with_delay(
     return result
 
 
-@bot.bot_run_hook
-async def on_bot_run(_bot: Bot) -> None:
+bot = Bot(config_file="config.toml")
+
+
+@bot.bot_startup_hook
+async def on_bot_startup(_bot: Bot) -> None:
     mp.set_start_method("spawn", force=True)
     ctx = mp.get_context("spawn")
     _bot.global_state["_pipeline"]["_private"] = PipelineProcess(
         "private_config.toml", ctx, name="private", other_chains=[split_with_delay]
     )
-    # _bot.global_state["_pipeline"]["_group"] = PipelineProcess("group_config.toml")
+    _bot.global_state["_pipeline"]["_group"] = PipelineProcess(
+        "group_config.toml", ctx, name="group"
+    )
 
 
-@bot.bot_exit_hook
-async def on_bot_exit(_bot: Bot) -> None:
-    await cast("PipelineProcess", _bot.global_state["_pipeline"]["_private"]).aclose()
-    # await cast("PipelineProcess", _bot.global_state["_pipeline"]["_group"]).aclose()
-
-
-bot.run()
+if __name__ == "__main__":
+    bot.run()

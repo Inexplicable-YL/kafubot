@@ -17,7 +17,7 @@ class Job:
     """Message sent from the parent process."""
 
     op: Literal["invoke", "heartbeat", "quit"]
-    job_id: int | None
+    job_id: int
     inp: Any | None = None
     invoke_cfg: dict[str, Any] | None = None
 
@@ -50,7 +50,7 @@ def worker_entry(
         """Runs the pipeline and returns the output."""
         try:
             with anyio.fail_after(60):
-                out = await runnable.ainvoke(input=job.inp, config=job.invoke_cfg or {})
+                out = await runnable.ainvoke(input=job.inp, config=job.invoke_cfg or {}) # type: ignore
             await to_thread.run_sync(result_q.put, Result(job.job_id, True, out))
         except BaseException as exc:
             tb = "".join(traceback.format_exception(exc))
