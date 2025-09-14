@@ -8,10 +8,10 @@ from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 from anyio import sleep
-from cogniweave import build_pipeline, init_config
-from langchain_core.runnables.base import Runnable
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
+
+from pipeline import PipelineProcess
 
 warnings.filterwarnings("ignore")
 
@@ -45,7 +45,6 @@ def split_with_delay(
     return result
 
 
-_RUNNABLE_KEY: Literal["_runnable"] = "_runnable"
 _OPTIONAL_PROMPT_KEY: Literal["_optional_prompt"] = "_optional_prompt"
 _RESULT_WARNING_COUNT_KEY: Literal["_result_warning_count"] = "_result_warning_count"
 
@@ -53,11 +52,8 @@ _RESULT_WARNING_COUNT_KEY: Literal["_result_warning_count"] = "_result_warning_c
 class PrivateReply(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
     priority = 1
 
-    def get_or_create_runnable(self) -> Runnable:
-        if _RUNNABLE_KEY not in self.node_state:
-            init_config(_config_file="./chat_config.toml")
-            self.node_state[_RUNNABLE_KEY] = build_pipeline() | split_with_delay
-        return self.node_state[_RUNNABLE_KEY]
+    def get_runnable(self) -> PipelineProcess:
+        return self.bot.global_state["_pipeline"]["_private"]
 
     @property
     def optional_prompt(self) -> str:
@@ -92,7 +88,7 @@ class PrivateReply(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
 
     @override
     async def handle(self) -> None:
-        runnable = self.get_or_create_runnable()
+        runnable = self.get_runnable()
         text = self.event.get_plain_text()
         print(text)
         session_id = self.event.get_session_id()
