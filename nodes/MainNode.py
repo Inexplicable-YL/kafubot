@@ -5,7 +5,6 @@ from typing import Any
 from typing_extensions import override
 
 from _sound import get_character_name_list_text, parse_character_command
-
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent, PrivateMessageEvent
 from sekaibot.permission import User
@@ -122,6 +121,7 @@ class YanCheng(Node[GroupMessageEvent, dict, Any]):  # type: ignore
         if len(self.keyw) > 1 and "芽" in self.keyw:
             await self.reply("理芽不是言承的……！", at_sender=True)
             self.stop()
+
 
 @Keywords("/回调", "/callback", "/cb")
 @User("2682064633")

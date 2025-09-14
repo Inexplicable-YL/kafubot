@@ -18,5 +18,6 @@ class PokeNotice(Node[PokeNotifyEvent, Any, Any]):
 
     async def rule(self) -> bool:
         return (
-            self.event.target_id == self.event.self_id and self.event.user_id != self.event.self_id
+            self.event.target_id == self.event.self_id
+            and self.event.user_id != self.event.self_id
         )

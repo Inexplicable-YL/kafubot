@@ -49,7 +49,7 @@ class ChatMessageHistory(BaseChatMessageHistory):
         messages = messages_to_dict(self.messages)
         messages.append(messages_to_dict([message])[0])
         if self.max_len and len(messages) > self.max_len:
-            messages = messages[-self.max_len:]
+            messages = messages[-self.max_len :]
         self.file_path.write_text(
             json.dumps(messages, ensure_ascii=self.ensure_ascii), encoding=self.encoding
         )
@@ -63,6 +63,7 @@ class ChatMessageHistory(BaseChatMessageHistory):
 
 class AsyncPersistentLRUDict:
     """文件储存缓存"""
+
     _data: OrderedDict[str, str]
 
     def __init__(self, file_path: str, max_len: int | None = None):

@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 from anyio import sleep
 from cogniweave import build_pipeline, init_config
 from langchain_core.runnables.base import Runnable
-
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 

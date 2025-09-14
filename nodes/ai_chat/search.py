@@ -180,7 +180,7 @@ async def search_tool(query: str) -> str | None:
 
 
 async def main():
-    import time
+    import time  # noqa: PLC0415
 
     t1 = time.time()
     print(f"start time: {t1}")
