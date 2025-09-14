@@ -6,6 +6,8 @@ from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.adapter.cqhttp.message import CQHTTPMessage, CQHTTPMessageSegment
 from sekaibot.rule import WordFilter
 
+REPEAT_THRESHOLD = 3
+
 
 @WordFilter(word_file=Path("./nodes/sensitive_words_lines.txt"), use_aho=True)
 class CopyWith(Node[GroupMessageEvent, dict, Any]):
@@ -35,7 +37,7 @@ class CopyWith(Node[GroupMessageEvent, dict, Any]):
             if state["repeated"]:
                 return
             state["count"] += 1
-            if state["count"] >= 3:
+            if state["count"] >= REPEAT_THRESHOLD:
                 await self.call_api(
                     "forward_group_single_msg",
                     message_id=self.event.message_id,
@@ -53,4 +55,4 @@ class CopyWith(Node[GroupMessageEvent, dict, Any]):
             }
 
     async def rule(self) -> bool:
-        return (not self.event.is_tome()) and self.event.user_id != 2854196310
+        return (not self.event.is_tome()) and self.event.user_id != 2854196310  # noqa: PLR2004
