@@ -55,7 +55,7 @@ class PrivateReply(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
 
     def get_or_create_runnable(self) -> Runnable:
         if _RUNNABLE_KEY not in self.node_state:
-            init_config(_config_file="./example/chat_config.toml")
+            init_config(_config_file="./chat_config.toml")
             self.node_state[_RUNNABLE_KEY] = build_pipeline() | split_with_delay
         return self.node_state[_RUNNABLE_KEY]
 

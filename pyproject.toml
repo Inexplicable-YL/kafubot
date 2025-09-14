@@ -105,12 +105,6 @@ convention = "google"
 [tool.ruff.lint.pyupgrade]
 keep-runtime-typing = true
 
-[tool.ruff.lint.per-file-ignores]
-"packages/*/sekaibot/__init__.py" = ["D104"]
-"packages/*/sekaibot/adapter/__init__.py" = ["D104"]
-"example/nodes/*.py" = ["D", "T", "ANN"]
-"test/*.py" = ["D", "PLR2004"]
-
 [tool.pyright]
 exclude = ["**/.conda", "**/.venv", "**/__pycache__"]
 pythonVersion = "3.11"

@@ -2,7 +2,7 @@
 # 这里是 KafuBot 自身的配置
 event_queue_size=100
 nodes = []
-node_dirs = ["./example/nodes"]
+node_dirs = ["./nodes"]
 adapters = ["sekaibot.adapter.cqhttp"]
 adapter_max_retries = 30
 
