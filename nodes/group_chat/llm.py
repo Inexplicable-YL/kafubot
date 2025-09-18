@@ -153,7 +153,7 @@ async def _get_img_description(
     if _img_description := await get_img_description(
         file_path=img_model.file_path, name=img_model.name, file_id=img_model.file_id
     ):
-        msgs[key][0] = _img_description
+        msgs[key] = (_img_description, msgs[key][1])
     else:
         with suppress(KeyError):
             msgs.pop(key)
@@ -187,17 +187,18 @@ async def get_answer(
             message_dict.pop(session_id)
         messages = {k: messages[k] for k in list(messages.keys())[-12:]}
 
-        with suppress(Exception):
-            async with anyio.create_task_group() as tg:
-                for msg_id, (msg, _) in messages.items():
-                    if isinstance(msg, UnhandleImage):
-                        tg.start_soon(_get_img_description, messages, msg_id, msg)
+        # with suppress(Exception):
+        async with anyio.create_task_group() as tg:
+            for msg_id, msg in messages.items():
+                if isinstance(msg[0], UnhandleImage):
+                    tg.start_soon(_get_img_description, messages, msg_id, msg[0])
 
         print(list(messages.values()))
         res = await use_llm(runnable, session_id, list(messages.values()), is_tome)
-        answer: str = res.get("output", [])
-        if answer:
-            return convert(answer, "zh-tw")
+        if isinstance(res, dict):
+            res: str = res.get("output", [])
+        if res:
+            return convert(res, "zh-tw")
 
     return None
 

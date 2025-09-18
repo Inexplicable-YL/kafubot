@@ -70,6 +70,7 @@ class GroupChat(Node[GroupMessageEvent, dict, Any]):
                 random_trigger=random_trigger,
             )
         ):
+            print(answer)
             if self.event.is_tome():
                 await self.reply(answer, reply_message=True)
             else:

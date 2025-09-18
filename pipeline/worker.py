@@ -54,7 +54,7 @@ def worker_entry(
     async def handle_invoke(job: Job) -> None:
         """Runs the pipeline and returns the output."""
         try:
-            with anyio.fail_after(60):
+            with anyio.fail_after(300):
                 out = await runnable.ainvoke(input=job.inp, config=job.invoke_cfg or {})  # type: ignore
             await to_thread.run_sync(result_q.put, Result(job.job_id, True, out))
         except BaseException as exc:

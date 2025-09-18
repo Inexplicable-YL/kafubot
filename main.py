@@ -43,6 +43,11 @@ def split_with_delay(
 
 bot = Bot(config_file="config.toml")
 
+def build_private_pipeline():
+    return build_pipeline(tools=[search_tool]) | split_with_delay
+
+def build_group_pipeline():
+    return build_pipeline(tools=[search_tool])
 
 @bot.bot_startup_hook
 async def on_bot_startup(_bot: Bot) -> None:
@@ -50,13 +55,13 @@ async def on_bot_startup(_bot: Bot) -> None:
     ctx = mp.get_context("spawn")
     _bot.global_state["_pipeline"]["_private"] = PipelineProcess(
         "private_config.toml",
-        lambda _: build_pipeline() | split_with_delay,
+        build_private_pipeline,
         ctx,
         name="private",
     )
     _bot.global_state["_pipeline"]["_group"] = PipelineProcess(
         "group_config.toml",
-        lambda _: build_pipeline(tools=[search_tool]),
+        build_group_pipeline,
         ctx,
         name="group",
     )
