@@ -44,7 +44,7 @@ def split_with_delay(
 bot = Bot(config_file="config.toml")
 
 def build_private_pipeline():
-    return build_pipeline(tools=[search_tool]) | split_with_delay
+    return build_pipeline() | split_with_delay
 
 def build_group_pipeline():
     return build_pipeline(tools=[search_tool])
