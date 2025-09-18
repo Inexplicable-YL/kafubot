@@ -1,5 +1,6 @@
 chat_model="deepseek/deepseek-chat"# "kimi/kimi-k2-0711-preview"
 history_limit=40
+index_name="group"
 
 [prompt_values.end_detector]
 zh="""

@@ -12,24 +12,25 @@ from anyio import to_thread
 from .worker import Job, Result, worker_entry
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from multiprocessing.context import SpawnContext
+
+    from langchain_core.runnables.base import Runnable
 
 
 class PipelineProcess:
     """Long-running worker process bound to a single configuration."""
 
     _ids = itertools.count(1)
-    _ctx: SpawnContext | None = None
-    _ctx_lock: anyio.Lock = anyio.Lock()
 
     def __init__(
         self,
         cfg_path: str,
+        build_func: Callable[[], Runnable],
         ctx: SpawnContext,
         *,
         name: str | None = None,
         heartbeat: float = 30.0,
-        other_chains: list[Any] | None = None,
     ) -> None:
         """Spawns a new worker process and prepares communication channels."""
 
@@ -38,7 +39,7 @@ class PipelineProcess:
         self._proc = ctx.Process(
             target=worker_entry,
             args=(cfg_path, self._task_q, self._res_q),
-            kwargs={"other_chains": other_chains or []},
+            kwargs={"build_func": build_func},
             name=name or f"worker-{Path(cfg_path).stem}",
             daemon=True,
         )

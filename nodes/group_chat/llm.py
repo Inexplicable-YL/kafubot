@@ -1,3 +1,4 @@
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -40,7 +41,9 @@ img_cache = AsyncPersistentLRUDict(
 )
 
 
-message_dict: dict[str, SortedDict[int, BaseMessage]] = defaultdict(SortedDict)
+message_dict: dict[str, dict[int, tuple[BaseMessage | UnhandleImage, float]]] = (
+    defaultdict(SortedDict)
+)
 message_dict_locks: dict[str, Lock] = defaultdict(Lock)
 
 photo_model = create_agent(
@@ -97,12 +100,16 @@ async def handle_img(
             },
         ]
         async with message_dict_locks[session_id]:
-            message_dict[session_id][message_id] = HumanMessage(content=content)  # type: ignore
+            message_dict[session_id][message_id] = (
+                HumanMessage(content=content),
+                time.time(),
+            )  # type: ignore
         return
     if file_path := await get_img_func(file_id):
         async with message_dict_locks[session_id]:
-            message_dict[session_id][message_id] = UnhandleImage(
-                file_path=file_path, file_id=file_id, name=name
+            message_dict[session_id][message_id] = (
+                UnhandleImage(file_path=file_path, file_id=file_id, name=name),
+                time.time(),
             )
 
 
@@ -139,12 +146,14 @@ def get_trigger(message: str, trigger: float = 0.8) -> bool:
 
 
 async def _get_img_description(
-    msgs: dict[int, Any], key: int, img_model: UnhandleImage
+    msgs: dict[int, tuple[BaseMessage | UnhandleImage, float]],
+    key: int,
+    img_model: UnhandleImage,
 ) -> None:
     if _img_description := await get_img_description(
         file_path=img_model.file_path, name=img_model.name, file_id=img_model.file_id
     ):
-        msgs[key] = _img_description
+        msgs[key][0] = _img_description
     else:
         with suppress(KeyError):
             msgs.pop(key)
@@ -164,7 +173,10 @@ async def get_answer(
     if not content:
         return None
     async with message_dict_locks[session_id]:
-        message_dict[session_id][message_id] = HumanMessage(content=content)  # type: ignore
+        message_dict[session_id][message_id] = (
+            HumanMessage(content=content),
+            time.time(),
+        )  # type: ignore
 
     if (
         get_trigger(message, trigger=0.9 if random_trigger else 1.1)
@@ -173,11 +185,11 @@ async def get_answer(
         async with message_dict_locks[session_id]:
             messages = message_dict[session_id].copy()
             message_dict.pop(session_id)
-        messages = SortedDict({k: messages[k] for k in messages.keys()[-12:]})
+        messages = {k: messages[k] for k in list(messages.keys())[-12:]}
 
         with suppress(Exception):
             async with anyio.create_task_group() as tg:
-                for msg_id, msg in messages.items():
+                for msg_id, (msg, _) in messages.items():
                     if isinstance(msg, UnhandleImage):
                         tg.start_soon(_get_img_description, messages, msg_id, msg)
 
@@ -193,13 +205,20 @@ async def get_answer(
 async def use_llm(
     runnable: PipelineProcess,
     session_id: str,
-    messages: list[BaseMessage],
+    messages: list[tuple[BaseMessage, float]],
     is_tome: bool,
 ) -> dict[str, Any]:
     try:
+        await runnable.ainvoke(
+            {
+                "input": messages[:-1],
+                "pass": False,
+            },
+            config={"configurable": {"session_id": session_id}},
+        )
         return await runnable.ainvoke(
             {
-                "input": messages,
+                "input": messages[-1][0],
                 "time": datetime.now(ZoneInfo("Asia/Shanghai")).strftime(
                     "%Y年%m月%d日 %H时%M分"
                 ),

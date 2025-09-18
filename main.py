@@ -2,10 +2,12 @@ import multiprocessing as mp
 import re
 from typing import TypedDict
 
+from cogniweave import build_pipeline
 from dotenv import load_dotenv
 from sekaibot import Bot
 
 from pipeline import PipelineProcess
+from search_tool import search_tool
 
 load_dotenv()
 
@@ -47,10 +49,16 @@ async def on_bot_startup(_bot: Bot) -> None:
     mp.set_start_method("spawn", force=True)
     ctx = mp.get_context("spawn")
     _bot.global_state["_pipeline"]["_private"] = PipelineProcess(
-        "private_config.toml", ctx, name="private", other_chains=[split_with_delay]
+        "private_config.toml",
+        lambda _: build_pipeline() | split_with_delay,
+        ctx,
+        name="private",
     )
     _bot.global_state["_pipeline"]["_group"] = PipelineProcess(
-        "group_config.toml", ctx, name="group"
+        "group_config.toml",
+        lambda _: build_pipeline(tools=[search_tool]),
+        ctx,
+        name="group",
     )
 
 
