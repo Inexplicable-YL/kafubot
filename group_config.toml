@@ -1,4 +1,5 @@
 agent_model="deepseek/deepseek-chat"
+short_memory_model="deepseek/deepseek-chat"
 history_limit=24
 index_name="group"
 
