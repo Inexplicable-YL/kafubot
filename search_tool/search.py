@@ -161,8 +161,8 @@ def web_search(keyw: str, query: str, top_n: int = 3) -> str | None:
 
 
 search_model = create_agent(
-    "gpt-5-mini",
-    provider="OPENAI",
+    "deepseek-chat",
+    provider="DEEPSEEK",
     prompt=search_prompt,
     temperature=0.7,
     tools=[moegirl_search, wiki_search, web_search],

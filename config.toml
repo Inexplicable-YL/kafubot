@@ -16,7 +16,7 @@ verbose_exception = true
 # 这里是 CQHTTP 适配器的配置
 adapter_type = "reverse-ws"
 host = "127.0.0.1"
-port = 8080
+port = 8888
 url = "/cqhttp/ws"
 api_timeout=10
 

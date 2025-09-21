@@ -1,5 +1,5 @@
-chat_model="deepseek/deepseek-chat"# "kimi/kimi-k2-0711-preview"
-history_limit=40
+agent_model="deepseek/deepseek-chat"
+history_limit=24
 index_name="group"
 
 [prompt_values.end_detector]
@@ -37,7 +37,7 @@ zh="""
 严格按此格式输出，仅作判断，不做解释。
 """
 
-[prompt_values.chat]
+[prompt_values.agent]
 zh="""
 **你将进入一个群聊角色扮演任务，必须严格遵循以下设定。**
 
