@@ -2,6 +2,7 @@ agent_model="deepseek/deepseek-chat"
 short_memory_model="deepseek/deepseek-chat"
 history_limit=24
 index_name="group"
+long_memory_model="openai/gpt-5"
 
 [prompt_values.end_detector]
 zh="""
