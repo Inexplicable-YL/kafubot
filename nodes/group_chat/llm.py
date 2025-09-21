@@ -37,7 +37,7 @@ class UnhandleImage(BaseModel):
 
 
 img_cache = AsyncPersistentLRUDict(
-    file_path="../sekaibot-cache/img_cache.tmp", max_len=100
+    file_path="../sekaibot-cache/img_cache.tmp", max_len=150
 )
 
 

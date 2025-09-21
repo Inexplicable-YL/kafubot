@@ -1,5 +1,3 @@
-"""# from typing import Any"""
-
 import warnings
 from datetime import datetime
 from typing import Any, Literal
@@ -17,6 +15,7 @@ warnings.filterwarnings("ignore")
 
 _OPTIONAL_PROMPT_KEY: Literal["_optional_prompt"] = "_optional_prompt"
 _RESULT_WARNING_COUNT_KEY: Literal["_result_warning_count"] = "_result_warning_count"
+_PROCESS_STATE_KEY: Literal["_process"] = "_process"
 
 
 class PrivateReply(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
@@ -56,6 +55,20 @@ class PrivateReply(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
             self.node_state[_RESULT_WARNING_COUNT_KEY] = {}
         self.node_state[_RESULT_WARNING_COUNT_KEY][self.event.get_session_id()] = value
 
+    @property
+    def process_state(self) -> bool:
+        if _PROCESS_STATE_KEY not in self.node_state:
+            self.node_state[_PROCESS_STATE_KEY] = {}
+        if self.event.get_session_id() not in self.node_state[_PROCESS_STATE_KEY]:
+            self.node_state[_PROCESS_STATE_KEY][self.event.get_session_id()] = False
+        return self.node_state[_PROCESS_STATE_KEY][self.event.get_session_id()]
+
+    @process_state.setter
+    def process_state(self, value: bool) -> None:
+        if _PROCESS_STATE_KEY not in self.node_state:
+            self.node_state[_PROCESS_STATE_KEY] = {}
+        self.node_state[_PROCESS_STATE_KEY][self.event.get_session_id()] = value
+
     @override
     async def handle(self) -> None:
         runnable = self.get_runnable()
@@ -82,16 +95,20 @@ class PrivateReply(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
                 config={"configurable": {"session_id": session_id}},
             )
 
+        state = not self.process_state
+        self.process_state = True
         result = await runnable.ainvoke(
             {
                 "input": text,
                 "time": datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime(
                     "%Y年%m月%d日 %H时%M分"
                 ),
+                "pass": state,
                 "optional_prompt": self.optional_prompt,
             },
             config={"configurable": {"session_id": session_id}},
         )
+        self.process_state = False
 
         if len(result) > 5 and len(result) != 0:  # noqa: PLR2004
             self.optional_prompt = (
