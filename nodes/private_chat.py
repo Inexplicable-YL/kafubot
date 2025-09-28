@@ -95,6 +95,14 @@ class PrivateReply(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
                 config={"configurable": {"session_id": session_id}},
             )
 
+        name_map: dict[str, str] = {
+            "shiroko": "白子小姐",
+            "空想少女": "アルス",
+            "かたちなきもの": "言霊",
+        }
+        name: str = self.event.sender.nickname
+        name = name_map.get(name, name)
+
         state = not self.process_state
         self.process_state = True
         result = await runnable.ainvoke(
@@ -103,6 +111,7 @@ class PrivateReply(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
                 "time": datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime(
                     "%Y年%m月%d日 %H时%M分"
                 ),
+                "user_name": name,
                 "pass": state,
                 "optional_prompt": self.optional_prompt,
             },

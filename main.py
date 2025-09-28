@@ -1,5 +1,6 @@
+import multiprocessing as mp
 import re
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from cogniweave import build_pipeline, init_config
 from dotenv import load_dotenv
@@ -43,19 +44,26 @@ bot = Bot(config_file="config.toml")
 
 
 def build_private_pipeline():
-    init_config("private_config.toml")
+    init_config(_config_file="private_config.toml")
     return build_pipeline() | split_with_delay
 
 
 def build_group_pipeline():
-    init_config("group_config.toml")
+    init_config(_config_file="group_config.toml")
     return build_pipeline()
 
 
 @bot.bot_startup_hook
 async def on_bot_startup(_bot: Bot) -> None:
+    mp.set_start_method("spawn", force=True)
     _bot.global_state["_pipeline"]["_private"] = PipelineProcess(build_private_pipeline)
     _bot.global_state["_pipeline"]["_group"] = PipelineProcess(build_group_pipeline)
+
+
+@bot.bot_exit_hook
+async def on_bot_exit(_bot: Bot) -> None:
+    await cast("PipelineProcess", _bot.global_state["_pipeline"]["_private"]).aclose()
+    await cast("PipelineProcess", _bot.global_state["_pipeline"]["_group"]).aclose()
 
 
 if __name__ == "__main__":

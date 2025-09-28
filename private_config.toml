@@ -1,6 +1,5 @@
 chat_model="deepseek/deepseek-chat"# "kimi/kimi-k2-0711-preview"
 history_limit=24
-short_memory_model="deepseek/deepseek-chat"# "kimi/kimi-k2-0711-preview"
 long_memory_model="openai/gpt-5"
 
 [prompt_values.end_detector]
@@ -128,8 +127,15 @@ zh="""
 
 ---
 
-现在的时间是：
+### 【现在的时间】
+
 {time}
+
+---
+
+### 【对方的用户名】
+
+{user_name}
 
 ---
 
