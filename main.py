@@ -1,13 +1,11 @@
-import multiprocessing as mp
 import re
 from typing import TypedDict
 
-from cogniweave import build_pipeline
+from cogniweave import build_pipeline, init_config
 from dotenv import load_dotenv
 from sekaibot import Bot
 
 from pipeline import PipelineProcess
-from search_tool import search_tool
 
 load_dotenv()
 
@@ -43,28 +41,21 @@ def split_with_delay(
 
 bot = Bot(config_file="config.toml")
 
+
 def build_private_pipeline():
+    init_config("private_config.toml")
     return build_pipeline() | split_with_delay
 
+
 def build_group_pipeline():
-    return build_pipeline(tools=[search_tool])
+    init_config("group_config.toml")
+    return build_pipeline()
+
 
 @bot.bot_startup_hook
 async def on_bot_startup(_bot: Bot) -> None:
-    mp.set_start_method("spawn", force=True)
-    ctx = mp.get_context("spawn")
-    _bot.global_state["_pipeline"]["_private"] = PipelineProcess(
-        "private_config.toml",
-        build_private_pipeline,
-        ctx,
-        name="private",
-    )
-    _bot.global_state["_pipeline"]["_group"] = PipelineProcess(
-        "group_config.toml",
-        build_group_pipeline,
-        ctx,
-        name="group",
-    )
+    _bot.global_state["_pipeline"]["_private"] = PipelineProcess(build_private_pipeline)
+    _bot.global_state["_pipeline"]["_group"] = PipelineProcess(build_group_pipeline)
 
 
 if __name__ == "__main__":
