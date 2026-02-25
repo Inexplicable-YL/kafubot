@@ -12,7 +12,7 @@ from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 
 from dify_client import AsyncChatClient
 
-_api_key = os.environ.get("DIFY_API_KEY")
+_api_key = os.environ.get("DIFY_API_KEY") or "app-GoBKws26waHSs9XpWIYSdU9A"
 if _api_key is None:
     raise ValueError("DIFY_API_KEY is not set")
 
