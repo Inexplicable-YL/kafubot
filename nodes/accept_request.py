@@ -5,8 +5,8 @@ from sekaibot.adapter.cqhttp.event import FriendRequestEvent, GroupRequestEvent
 
 
 class AcceptRequest(Node[FriendRequestEvent | GroupRequestEvent, Any, Any]):
-    priority: int = 0
-    block: bool = True
+    priority = 0
+    block = True
 
     async def handle(self) -> None:
         await self.event.approve()
