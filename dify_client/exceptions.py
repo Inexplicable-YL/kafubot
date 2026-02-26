@@ -1,6 +1,6 @@
 """Custom exceptions for the Dify client."""
 
-from typing import Any, Dict
+from typing import Any
 
 
 class DifyClientError(Exception):
@@ -10,7 +10,7 @@ class DifyClientError(Exception):
         self,
         message: str,
         status_code: int | None = None,
-        response: Dict[str, Any] | None = None,
+        response: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.message = message
@@ -22,7 +22,7 @@ class APIError(DifyClientError):
     """Raised when the API returns an error response."""
 
     def __init__(
-        self, message: str, status_code: int, response: Dict[str, Any] | None = None
+        self, message: str, status_code: int, response: dict[str, Any] | None = None
     ):
         super().__init__(message, status_code, response)
         self.status_code = status_code
@@ -30,8 +30,6 @@ class APIError(DifyClientError):
 
 class AuthenticationError(DifyClientError):
     """Raised when authentication fails."""
-
-    pass
 
 
 class RateLimitError(DifyClientError):
@@ -47,34 +45,22 @@ class RateLimitError(DifyClientError):
 class ValidationError(DifyClientError):
     """Raised when request validation fails."""
 
-    pass
-
 
 class NetworkError(DifyClientError):
     """Raised when network-related errors occur."""
-
-    pass
 
 
 class TimeoutError(DifyClientError):
     """Raised when request times out."""
 
-    pass
-
 
 class FileUploadError(DifyClientError):
     """Raised when file upload fails."""
-
-    pass
 
 
 class DatasetError(DifyClientError):
     """Raised when dataset operations fail."""
 
-    pass
-
 
 class WorkflowError(DifyClientError):
     """Raised when workflow operations fail."""
-
-    pass
