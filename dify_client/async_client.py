@@ -21,7 +21,7 @@ Example:
 
 import json
 import os
-from typing import IO, Any, Dict, List, Literal, Union
+from typing import IO, Any, Literal
 
 import aiofiles
 import httpx
@@ -75,8 +75,8 @@ class AsyncDifyClient:
         self,
         method: str,
         endpoint: str,
-        json: Dict | None = None,
-        params: Dict | None = None,
+        json: dict | None = None,
+        params: dict | None = None,
         stream: bool = False,
         **kwargs,
     ):
@@ -191,7 +191,7 @@ class AsyncDifyClient:
         url = f"/apps/{app_id}/site/config"
         return await self._send_request("GET", url)
 
-    async def update_app_site_config(self, app_id: str, config_data: Dict[str, Any]):
+    async def update_app_site_config(self, app_id: str, config_data: dict[str, Any]):
         """Update app site configuration.
 
         Args:
@@ -255,7 +255,7 @@ class AsyncCompletionClient(AsyncDifyClient):
         inputs: dict,
         response_mode: Literal["blocking", "streaming"],
         user: str,
-        files: Dict | None = None,
+        files: dict | None = None,
     ):
         """Create a completion message.
 
@@ -292,7 +292,7 @@ class AsyncChatClient(AsyncDifyClient):
         user: str,
         response_mode: Literal["blocking", "streaming"] = "blocking",
         conversation_id: str | None = None,
-        files: Dict | None = None,
+        files: dict | None = None,
     ):
         """Create a chat message.
 
@@ -379,7 +379,7 @@ class AsyncChatClient(AsyncDifyClient):
             "DELETE", f"/conversations/{conversation_id}", data
         )
 
-    async def audio_to_text(self, audio_file: Union[IO[bytes], tuple], user: str):
+    async def audio_to_text(self, audio_file: IO[bytes] | tuple, user: str):
         """Convert audio to text."""
         data = {"user": user}
         files = {"file": audio_file}
@@ -599,7 +599,7 @@ class AsyncWorkflowClient(AsyncDifyClient):
         url = f"/apps/{app_id}/workflow/draft"
         return await self._send_request("GET", url)
 
-    async def update_workflow_draft(self, app_id: str, workflow_data: Dict[str, Any]):
+    async def update_workflow_draft(self, app_id: str, workflow_data: dict[str, Any]):
         """Update workflow draft configuration.
 
         Args:
@@ -672,7 +672,7 @@ class AsyncWorkspaceClient(AsyncDifyClient):
         return await self._send_request("GET", url)
 
     async def validate_model_provider_credentials(
-        self, provider_name: str, credentials: Dict[str, Any]
+        self, provider_name: str, credentials: dict[str, Any]
     ):
         """Validate model provider credentials."""
         url = (
@@ -735,7 +735,7 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         )
 
     async def create_document_by_text(
-        self, name: str, text: str, extra_params: Dict | None = None, **kwargs
+        self, name: str, text: str, extra_params: dict | None = None, **kwargs
     ):
         """Create a document by text.
 
@@ -763,7 +763,7 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         document_id: str,
         name: str,
         text: str,
-        extra_params: Dict | None = None,
+        extra_params: dict | None = None,
         **kwargs,
     ):
         """Update a document by text."""
@@ -779,7 +779,7 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         self,
         file_path: str,
         original_document_id: str | None = None,
-        extra_params: Dict | None = None,
+        extra_params: dict | None = None,
     ):
         """Create a document by file."""
         async with aiofiles.open(file_path, "rb") as f:
@@ -798,7 +798,7 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
             )
 
     async def update_document_by_file(
-        self, document_id: str, file_path: str, extra_params: Dict | None = None
+        self, document_id: str, file_path: str, extra_params: dict | None = None
     ):
         """Update a document by file."""
         async with aiofiles.open(file_path, "rb") as f:
@@ -893,8 +893,8 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
     async def hit_testing(
         self,
         query: str,
-        retrieval_model: Dict[str, Any] = None,
-        external_retrieval_model: Dict[str, Any] = None,
+        retrieval_model: dict[str, Any] = None,
+        external_retrieval_model: dict[str, Any] = None,
     ):
         """Perform hit testing on the dataset."""
         data = {"query": query}
@@ -910,13 +910,13 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         url = f"/datasets/{self._get_dataset_id()}/metadata"
         return await self._send_request("GET", url)
 
-    async def create_dataset_metadata(self, metadata_data: Dict[str, Any]):
+    async def create_dataset_metadata(self, metadata_data: dict[str, Any]):
         """Create dataset metadata."""
         url = f"/datasets/{self._get_dataset_id()}/metadata"
         return await self._send_request("POST", url, json=metadata_data)
 
     async def update_dataset_metadata(
-        self, metadata_id: str, metadata_data: Dict[str, Any]
+        self, metadata_id: str, metadata_data: dict[str, Any]
     ):
         """Update dataset metadata."""
         url = f"/datasets/{self._get_dataset_id()}/metadata/{metadata_id}"
@@ -928,14 +928,14 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         return await self._send_request("GET", url)
 
     async def manage_built_in_metadata(
-        self, action: str, metadata_data: Dict[str, Any] = None
+        self, action: str, metadata_data: dict[str, Any] = None
     ):
         """Manage built-in metadata with specified action."""
         data = metadata_data or {}
         url = f"/datasets/{self._get_dataset_id()}/metadata/built-in/{action}"
         return await self._send_request("POST", url, json=data)
 
-    async def update_documents_metadata(self, operation_data: List[Dict[str, Any]]):
+    async def update_documents_metadata(self, operation_data: list[dict[str, Any]]):
         """Update metadata for multiple documents."""
         url = f"/datasets/{self._get_dataset_id()}/documents/metadata"
         data = {"operation_data": operation_data}
@@ -946,7 +946,7 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         """List all dataset tags."""
         return await self._send_request("GET", "/datasets/tags")
 
-    async def bind_dataset_tags(self, tag_ids: List[str]):
+    async def bind_dataset_tags(self, tag_ids: list[str]):
         """Bind tags to dataset."""
         data = {"tag_ids": tag_ids, "target_id": self._get_dataset_id()}
         return await self._send_request("POST", "/datasets/tags/binding", json=data)
@@ -971,7 +971,7 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
     async def run_datasource_node(
         self,
         node_id: str,
-        inputs: Dict[str, Any],
+        inputs: dict[str, Any],
         datasource_type: str,
         is_published: bool = True,
         credential_id: str = None,
@@ -989,9 +989,9 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
 
     async def run_rag_pipeline(
         self,
-        inputs: Dict[str, Any],
+        inputs: dict[str, Any],
         datasource_type: str,
-        datasource_info_list: List[Dict[str, Any]],
+        datasource_info_list: list[dict[str, Any]],
         start_node_id: str,
         is_published: bool = True,
         response_mode: Literal["streaming", "blocking"] = "blocking",
@@ -1033,7 +1033,7 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
         indexing_technique: str | None = None,
         embedding_model: str | None = None,
         embedding_model_provider: str | None = None,
-        retrieval_model: Dict[str, Any] | None = None,
+        retrieval_model: dict[str, Any] | None = None,
         **kwargs,
     ):
         """Update dataset configuration.
@@ -1071,7 +1071,7 @@ class AsyncKnowledgeBaseClient(AsyncDifyClient):
     async def batch_update_document_status(
         self,
         action: Literal["enable", "disable", "archive", "un_archive"],
-        document_ids: List[str],
+        document_ids: list[str],
         dataset_id: str | None = None,
     ):
         """Batch update document status."""
@@ -1140,7 +1140,7 @@ class AsyncEnterpriseClient(AsyncDifyClient):
         """Get current account information."""
         return await self._send_request("GET", "/account")
 
-    async def update_account_info(self, account_data: Dict[str, Any]):
+    async def update_account_info(self, account_data: dict[str, Any]):
         """Update account information."""
         return await self._send_request("PUT", "/account", json=account_data)
 
@@ -1166,7 +1166,7 @@ class AsyncEnterpriseClient(AsyncDifyClient):
         url = f"/members/{member_id}"
         return await self._send_request("GET", url)
 
-    async def update_member(self, member_id: str, member_data: Dict[str, Any]):
+    async def update_member(self, member_id: str, member_data: dict[str, Any]):
         """Update member information."""
         url = f"/members/{member_id}"
         return await self._send_request("PUT", url, json=member_data)
@@ -1191,7 +1191,7 @@ class AsyncEnterpriseClient(AsyncDifyClient):
         """List all available roles in the workspace."""
         return await self._send_request("GET", "/roles")
 
-    async def create_role(self, name: str, description: str, permissions: List[str]):
+    async def create_role(self, name: str, description: str, permissions: list[str]):
         """Create a new role with specified permissions."""
         data = {"name": name, "description": description, "permissions": permissions}
         return await self._send_request("POST", "/roles", json=data)
@@ -1201,7 +1201,7 @@ class AsyncEnterpriseClient(AsyncDifyClient):
         url = f"/roles/{role_id}"
         return await self._send_request("GET", url)
 
-    async def update_role(self, role_id: str, role_data: Dict[str, Any]):
+    async def update_role(self, role_id: str, role_data: dict[str, Any]):
         """Update role information."""
         url = f"/roles/{role_id}"
         return await self._send_request("PUT", url, json=role_data)
@@ -1221,7 +1221,7 @@ class AsyncEnterpriseClient(AsyncDifyClient):
         url = f"/roles/{role_id}/permissions"
         return await self._send_request("GET", url)
 
-    async def update_role_permissions(self, role_id: str, permissions: List[str]):
+    async def update_role_permissions(self, role_id: str, permissions: list[str]):
         """Update permissions for a role."""
         url = f"/roles/{role_id}/permissions"
         data = {"permissions": permissions}
@@ -1232,7 +1232,7 @@ class AsyncEnterpriseClient(AsyncDifyClient):
         """Get workspace settings and configuration."""
         return await self._send_request("GET", "/workspace/settings")
 
-    async def update_workspace_settings(self, settings_data: Dict[str, Any]):
+    async def update_workspace_settings(self, settings_data: dict[str, Any]):
         """Update workspace settings."""
         return await self._send_request(
             "PUT", "/workspace/settings", json=settings_data
@@ -1251,7 +1251,7 @@ class AsyncEnterpriseClient(AsyncDifyClient):
         """Get current subscription information."""
         return await self._send_request("GET", "/subscription")
 
-    async def update_subscription(self, subscription_data: Dict[str, Any]):
+    async def update_subscription(self, subscription_data: dict[str, Any]):
         """Update subscription settings."""
         return await self._send_request("PUT", "/subscription", json=subscription_data)
 
@@ -1292,7 +1292,7 @@ class AsyncEnterpriseClient(AsyncDifyClient):
         return await self._send_request("GET", "/audit/logs", params=params)
 
     async def export_audit_logs(
-        self, format: str = "csv", filters: Dict[str, Any] | None = None
+        self, format: str = "csv", filters: dict[str, Any] | None = None
     ):
         """Export audit logs in specified format."""
         params = {"format": format}
@@ -1317,7 +1317,7 @@ class AsyncSecurityClient(AsyncDifyClient):
     async def create_api_key(
         self,
         name: str,
-        permissions: List[str],
+        permissions: list[str],
         expires_at: str | None = None,
         description: str | None = None,
     ):
@@ -1334,7 +1334,7 @@ class AsyncSecurityClient(AsyncDifyClient):
         url = f"/security/api-keys/{key_id}"
         return await self._send_request("GET", url)
 
-    async def update_api_key(self, key_id: str, key_data: Dict[str, Any]):
+    async def update_api_key(self, key_id: str, key_data: dict[str, Any]):
         """Update API key information."""
         url = f"/security/api-keys/{key_id}"
         return await self._send_request("PUT", url, json=key_data)
@@ -1354,7 +1354,7 @@ class AsyncSecurityClient(AsyncDifyClient):
         """Get current rate limiting configuration."""
         return await self._send_request("GET", "/security/rate-limits")
 
-    async def update_rate_limits(self, limits_config: Dict[str, Any]):
+    async def update_rate_limits(self, limits_config: dict[str, Any]):
         """Update rate limiting configuration."""
         return await self._send_request(
             "PUT", "/security/rate-limits", json=limits_config
@@ -1375,7 +1375,7 @@ class AsyncSecurityClient(AsyncDifyClient):
             "GET", "/security/access-policies", params=params
         )
 
-    async def create_access_policy(self, policy_data: Dict[str, Any]):
+    async def create_access_policy(self, policy_data: dict[str, Any]):
         """Create a new access control policy."""
         return await self._send_request(
             "POST", "/security/access-policies", json=policy_data
@@ -1386,7 +1386,7 @@ class AsyncSecurityClient(AsyncDifyClient):
         url = f"/security/access-policies/{policy_id}"
         return await self._send_request("GET", url)
 
-    async def update_access_policy(self, policy_id: str, policy_data: Dict[str, Any]):
+    async def update_access_policy(self, policy_id: str, policy_data: dict[str, Any]):
         """Update an access control policy."""
         url = f"/security/access-policies/{policy_id}"
         return await self._send_request("PUT", url, json=policy_data)
@@ -1401,7 +1401,7 @@ class AsyncSecurityClient(AsyncDifyClient):
         """Get security configuration settings."""
         return await self._send_request("GET", "/security/settings")
 
-    async def update_security_settings(self, settings_data: Dict[str, Any]):
+    async def update_security_settings(self, settings_data: dict[str, Any]):
         """Update security configuration settings."""
         return await self._send_request("PUT", "/security/settings", json=settings_data)
 
@@ -1429,7 +1429,7 @@ class AsyncSecurityClient(AsyncDifyClient):
         return await self._send_request("GET", "/security/ip-whitelist")
 
     async def update_ip_whitelist(
-        self, ip_list: List[str], description: str | None = None
+        self, ip_list: list[str], description: str | None = None
     ):
         """Update IP whitelist configuration."""
         data = {"ip_list": ip_list}
@@ -1442,7 +1442,7 @@ class AsyncSecurityClient(AsyncDifyClient):
         return await self._send_request("GET", "/security/ip-blacklist")
 
     async def update_ip_blacklist(
-        self, ip_list: List[str], description: str | None = None
+        self, ip_list: list[str], description: str | None = None
     ):
         """Update IP blacklist configuration."""
         data = {"ip_list": ip_list}
@@ -1455,13 +1455,13 @@ class AsyncSecurityClient(AsyncDifyClient):
         """Get authentication configuration settings."""
         return await self._send_request("GET", "/security/auth-settings")
 
-    async def update_auth_settings(self, auth_data: Dict[str, Any]):
+    async def update_auth_settings(self, auth_data: dict[str, Any]):
         """Update authentication configuration settings."""
         return await self._send_request(
             "PUT", "/security/auth-settings", json=auth_data
         )
 
-    async def test_auth_configuration(self, auth_config: Dict[str, Any]):
+    async def test_auth_configuration(self, auth_config: dict[str, Any]):
         """Test authentication configuration."""
         return await self._send_request(
             "POST", "/security/auth-settings/test", json=auth_config
@@ -1477,7 +1477,7 @@ class AsyncAnalyticsClient(AsyncDifyClient):
         start_date: str,
         end_date: str,
         granularity: str = "day",
-        metrics: List[str] | None = None,
+        metrics: list[str] | None = None,
     ):
         """Get usage analytics for specified date range."""
         params = {
@@ -1574,7 +1574,7 @@ class AsyncAnalyticsClient(AsyncDifyClient):
         return await self._send_request("GET", "/analytics/health")
 
     # Custom Reports APIs
-    async def create_custom_report(self, report_config: Dict[str, Any]):
+    async def create_custom_report(self, report_config: dict[str, Any]):
         """Create a custom analytics report."""
         return await self._send_request(
             "POST", "/analytics/reports", json=report_config
@@ -1590,7 +1590,7 @@ class AsyncAnalyticsClient(AsyncDifyClient):
         url = f"/analytics/reports/{report_id}"
         return await self._send_request("GET", url)
 
-    async def update_custom_report(self, report_id: str, report_config: Dict[str, Any]):
+    async def update_custom_report(self, report_id: str, report_config: dict[str, Any]):
         """Update a custom analytics report."""
         url = f"/analytics/reports/{report_id}"
         return await self._send_request("PUT", url, json=report_config)
@@ -1633,7 +1633,7 @@ class AsyncIntegrationClient(AsyncDifyClient):
             params["status"] = status
         return await self._send_request("GET", "/integrations/webhooks", params=params)
 
-    async def create_webhook(self, webhook_data: Dict[str, Any]):
+    async def create_webhook(self, webhook_data: dict[str, Any]):
         """Create a new webhook."""
         return await self._send_request(
             "POST", "/integrations/webhooks", json=webhook_data
@@ -1644,7 +1644,7 @@ class AsyncIntegrationClient(AsyncDifyClient):
         url = f"/integrations/webhooks/{webhook_id}"
         return await self._send_request("GET", url)
 
-    async def update_webhook(self, webhook_id: str, webhook_data: Dict[str, Any]):
+    async def update_webhook(self, webhook_id: str, webhook_data: dict[str, Any]):
         """Update webhook configuration."""
         url = f"/integrations/webhooks/{webhook_id}"
         return await self._send_request("PUT", url, json=webhook_data)
@@ -1676,7 +1676,7 @@ class AsyncIntegrationClient(AsyncDifyClient):
         return await self._send_request("GET", "/integrations/plugins", params=params)
 
     async def install_plugin(
-        self, plugin_id: str, config: Dict[str, Any] | None = None
+        self, plugin_id: str, config: dict[str, Any] | None = None
     ):
         """Install a plugin."""
         data = {"plugin_id": plugin_id}
@@ -1691,7 +1691,7 @@ class AsyncIntegrationClient(AsyncDifyClient):
         url = f"/integrations/plugins/{installation_id}"
         return await self._send_request("GET", url)
 
-    async def update_plugin_config(self, installation_id: str, config: Dict[str, Any]):
+    async def update_plugin_config(self, installation_id: str, config: dict[str, Any]):
         """Update plugin configuration."""
         url = f"/integrations/plugins/{installation_id}/config"
         return await self._send_request("PUT", url, json=config)
@@ -1720,7 +1720,7 @@ class AsyncIntegrationClient(AsyncDifyClient):
         url = f"/integrations/export/apps/{app_id}"
         return await self._send_request("GET", url, params=params)
 
-    async def import_app_data(self, import_data: Dict[str, Any]):
+    async def import_app_data(self, import_data: dict[str, Any]):
         """Import application data."""
         return await self._send_request(
             "POST", "/integrations/import/apps", json=import_data
@@ -1740,14 +1740,14 @@ class AsyncIntegrationClient(AsyncDifyClient):
             "GET", "/integrations/export/workspace", params=params
         )
 
-    async def import_workspace_data(self, import_data: Dict[str, Any]):
+    async def import_workspace_data(self, import_data: dict[str, Any]):
         """Import workspace data."""
         return await self._send_request(
             "POST", "/integrations/import/workspace", json=import_data
         )
 
     # Backup and Restore APIs
-    async def create_backup(self, backup_config: Dict[str, Any] | None = None):
+    async def create_backup(self, backup_config: dict[str, Any] | None = None):
         """Create a system backup."""
         data = backup_config or {}
         return await self._send_request(
@@ -1765,7 +1765,7 @@ class AsyncIntegrationClient(AsyncDifyClient):
         return await self._send_request("GET", url)
 
     async def restore_backup(
-        self, backup_id: str, restore_config: Dict[str, Any] | None = None
+        self, backup_id: str, restore_config: dict[str, Any] | None = None
     ):
         """Restore from backup."""
         data = restore_config or {}
@@ -1799,7 +1799,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
             "GET", "/models/fine-tuning/jobs", params=params
         )
 
-    async def create_fine_tuning_job(self, job_config: Dict[str, Any]):
+    async def create_fine_tuning_job(self, job_config: dict[str, Any]):
         """Create a new fine-tuning job."""
         return await self._send_request(
             "POST", "/models/fine-tuning/jobs", json=job_config
@@ -1810,7 +1810,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
         url = f"/models/fine-tuning/jobs/{job_id}"
         return await self._send_request("GET", url)
 
-    async def update_fine_tuning_job(self, job_id: str, job_config: Dict[str, Any]):
+    async def update_fine_tuning_job(self, job_id: str, job_config: dict[str, Any]):
         """Update fine-tuning job configuration."""
         url = f"/models/fine-tuning/jobs/{job_id}"
         return await self._send_request("PUT", url, json=job_config)
@@ -1850,7 +1850,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
             "GET", "/models/custom/deployments", params=params
         )
 
-    async def create_custom_deployment(self, deployment_config: Dict[str, Any]):
+    async def create_custom_deployment(self, deployment_config: dict[str, Any]):
         """Create a custom model deployment."""
         return await self._send_request(
             "POST", "/models/custom/deployments", json=deployment_config
@@ -1862,7 +1862,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
         return await self._send_request("GET", url)
 
     async def update_custom_deployment(
-        self, deployment_id: str, deployment_config: Dict[str, Any]
+        self, deployment_id: str, deployment_config: dict[str, Any]
     ):
         """Update custom deployment configuration."""
         url = f"/models/custom/deployments/{deployment_id}"
@@ -1874,7 +1874,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
         return await self._send_request("DELETE", url)
 
     async def scale_custom_deployment(
-        self, deployment_id: str, scale_config: Dict[str, Any]
+        self, deployment_id: str, scale_config: dict[str, Any]
     ):
         """Scale custom deployment resources."""
         url = f"/models/custom/deployments/{deployment_id}/scale"
@@ -1892,7 +1892,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
         model_name: str,
         start_date: str,
         end_date: str,
-        metrics: List[str] | None = None,
+        metrics: list[str] | None = None,
     ):
         """Get model performance history."""
         params = {"start_date": start_date, "end_date": end_date}
@@ -1941,7 +1941,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
         return await self._send_request("GET", url, params=params)
 
     async def create_model_version(
-        self, model_provider: str, model_name: str, version_config: Dict[str, Any]
+        self, model_provider: str, model_name: str, version_config: dict[str, Any]
     ):
         """Create a new model version."""
         url = f"/models/{model_provider}/{model_name}/versions"
@@ -1978,7 +1978,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
             params["filter"] = filter
         return await self._send_request("GET", "/models/registry", params=params)
 
-    async def register_model(self, model_config: Dict[str, Any]):
+    async def register_model(self, model_config: dict[str, Any]):
         """Register a new model in the registry."""
         return await self._send_request("POST", "/models/registry", json=model_config)
 
@@ -1987,7 +1987,7 @@ class AsyncAdvancedModelClient(AsyncDifyClient):
         url = f"/models/registry/{model_id}"
         return await self._send_request("GET", url)
 
-    async def update_registry_model(self, model_id: str, model_config: Dict[str, Any]):
+    async def update_registry_model(self, model_id: str, model_config: dict[str, Any]):
         """Update registered model information."""
         url = f"/models/registry/{model_id}"
         return await self._send_request("PUT", url, json=model_config)
@@ -2002,7 +2002,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
     """Async Advanced App Configuration APIs for comprehensive app management."""
 
     # App Creation and Management APIs
-    async def create_app(self, app_config: Dict[str, Any]):
+    async def create_app(self, app_config: dict[str, Any]):
         """Create a new application."""
         return await self._send_request("POST", "/apps", json=app_config)
 
@@ -2026,7 +2026,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         url = f"/apps/{app_id}"
         return await self._send_request("GET", url)
 
-    async def update_app(self, app_id: str, app_config: Dict[str, Any]):
+    async def update_app(self, app_id: str, app_config: dict[str, Any]):
         """Update application configuration."""
         url = f"/apps/{app_id}"
         return await self._send_request("PUT", url, json=app_config)
@@ -2036,7 +2036,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         url = f"/apps/{app_id}"
         return await self._send_request("DELETE", url)
 
-    async def duplicate_app(self, app_id: str, duplicate_config: Dict[str, Any]):
+    async def duplicate_app(self, app_id: str, duplicate_config: dict[str, Any]):
         """Duplicate an application."""
         url = f"/apps/{app_id}/duplicate"
         return await self._send_request("POST", url, json=duplicate_config)
@@ -2053,7 +2053,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
 
     # App Publishing and Versioning APIs
     async def publish_app(
-        self, app_id: str, publish_config: Dict[str, Any] | None = None
+        self, app_id: str, publish_config: dict[str, Any] | None = None
     ):
         """Publish an application."""
         data = publish_config or {}
@@ -2071,7 +2071,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         url = f"/apps/{app_id}/versions"
         return await self._send_request("GET", url, params=params)
 
-    async def create_app_version(self, app_id: str, version_config: Dict[str, Any]):
+    async def create_app_version(self, app_id: str, version_config: dict[str, Any]):
         """Create a new application version."""
         url = f"/apps/{app_id}/versions"
         return await self._send_request("POST", url, json=version_config)
@@ -2102,14 +2102,14 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         return await self._send_request("GET", url)
 
     async def create_app_from_template(
-        self, template_id: str, app_config: Dict[str, Any]
+        self, template_id: str, app_config: dict[str, Any]
     ):
         """Create an app from a template."""
         url = f"/apps/templates/{template_id}/create"
         return await self._send_request("POST", url, json=app_config)
 
     async def create_custom_template(
-        self, app_id: str, template_config: Dict[str, Any]
+        self, app_id: str, template_config: dict[str, Any]
     ):
         """Create a custom template from an existing app."""
         url = f"/apps/{app_id}/create-template"
@@ -2121,7 +2121,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         app_id: str,
         start_date: str,
         end_date: str,
-        metrics: List[str] | None = None,
+        metrics: list[str] | None = None,
     ):
         """Get application analytics."""
         params = {"start_date": start_date, "end_date": end_date}
@@ -2167,7 +2167,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         url = f"/apps/{app_id}/advanced-config"
         return await self._send_request("GET", url)
 
-    async def update_app_advanced_config(self, app_id: str, config: Dict[str, Any]):
+    async def update_app_advanced_config(self, app_id: str, config: dict[str, Any]):
         """Update advanced application configuration."""
         url = f"/apps/{app_id}/advanced-config"
         return await self._send_request("PUT", url, json=config)
@@ -2178,7 +2178,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         return await self._send_request("GET", url)
 
     async def update_app_environment_variables(
-        self, app_id: str, variables: Dict[str, str]
+        self, app_id: str, variables: dict[str, str]
     ):
         """Update application environment variables."""
         url = f"/apps/{app_id}/environment"
@@ -2189,7 +2189,7 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         url = f"/apps/{app_id}/resource-limits"
         return await self._send_request("GET", url)
 
-    async def update_app_resource_limits(self, app_id: str, limits: Dict[str, Any]):
+    async def update_app_resource_limits(self, app_id: str, limits: dict[str, Any]):
         """Update application resource limits."""
         url = f"/apps/{app_id}/resource-limits"
         return await self._send_request("PUT", url, json=limits)
@@ -2201,14 +2201,14 @@ class AsyncAdvancedAppClient(AsyncDifyClient):
         return await self._send_request("GET", url)
 
     async def add_app_integration(
-        self, app_id: str, integration_config: Dict[str, Any]
+        self, app_id: str, integration_config: dict[str, Any]
     ):
         """Add integration to application."""
         url = f"/apps/{app_id}/integrations"
         return await self._send_request("POST", url, json=integration_config)
 
     async def update_app_integration(
-        self, app_id: str, integration_id: str, config: Dict[str, Any]
+        self, app_id: str, integration_id: str, config: dict[str, Any]
     ):
         """Update application integration."""
         url = f"/apps/{app_id}/integrations/{integration_id}"
