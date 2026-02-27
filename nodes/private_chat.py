@@ -16,12 +16,12 @@ from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 
 from dify_client import AsyncChatClient
 
-_api_key = os.environ.get("DIFY_API_KEY") or "app-GoBKws26waHSs9XpWIYSdU9A"
+_api_key = os.environ.get("DIFY_API_KEY")
 if _api_key is None:
     raise ValueError("DIFY_API_KEY is not set")
 
 API_KEY = _api_key
-BASE_URL = "http://192.168.3.55:81/v1"
+BASE_URL = os.environ.get("DIFY_BASE_URL")
 CACHE_DIR = Path(".cache")
 SESSION_DB_PATH = CACHE_DIR / "private_chat.db"
 LOGGER = logging.getLogger(__name__)
@@ -275,9 +275,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
                     session_id, latest_conversation_id
                 )
 
-    async def _process_message_chunk(
-        self, chunk: dict[str, Any], answer: str
-    ) -> str:
+    async def _process_message_chunk(self, chunk: dict[str, Any], answer: str) -> str:
         """Process a streaming message chunk and send reply.
 
         Args:
