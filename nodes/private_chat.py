@@ -21,7 +21,7 @@ if _api_key is None:
     raise ValueError("DIFY_API_KEY is not set")
 
 API_KEY = _api_key
-BASE_URL = os.environ.get("DIFY_BASE_URL")
+BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
 CACHE_DIR = Path(".cache")
 SESSION_DB_PATH = CACHE_DIR / "private_chat.db"
 LOGGER = logging.getLogger(__name__)
