@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from nodes import docker as docker_node  # noqa: E402
+from nodes import docker_cli as docker_node  # noqa: E402
 
 LINES_200 = 200
 SINCE_30 = 30
