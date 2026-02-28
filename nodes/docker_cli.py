@@ -23,25 +23,40 @@ except Exception:  # pragma: no cover
     docker = None
     APIError = DockerException = Exception  # type: ignore[assignment,misc]
 
-PROJECT_NAME = "dify"
+PROJECT_NAME = "docker"
 SERVICES: tuple[str, ...] = (
     "api",
     "worker",
+    "worker_beat",
     "web",
-    "db",
+    "db_postgres",
     "redis",
+    "weaviate",
     "sandbox",
     "plugin_daemon",
     "ssrf_proxy",
     "nginx",
+    "init_permissions",
 )
+SERVICE_ALIASES: dict[str, str] = {
+    "db": "db_postgres",
+    "postgres": "db_postgres",
+    "pg": "db_postgres",
+    "workerbeat": "worker_beat",
+    "worker-beat": "worker_beat",
+    "beat": "worker_beat",
+    "plugin": "plugin_daemon",
+    "ssrf": "ssrf_proxy",
+}
 START_ORDER: tuple[str, ...] = (
-    "db",
+    "db_postgres",
     "redis",
+    "weaviate",
     "sandbox",
     "plugin_daemon",
     "api",
     "worker",
+    "worker_beat",
     "web",
     "ssrf_proxy",
     "nginx",
@@ -156,7 +171,8 @@ def chunk_text(text: str, max_chars: int = MAX_REPLY_CHARS) -> list[str]:
 
 
 def normalize_target(target: str, allow_all: bool) -> str | None:
-    value = target.strip().lower()
+    value = target.strip().lower().replace("-", "_")
+    value = SERVICE_ALIASES.get(value, value)
     if allow_all and value == "all":
         return value
     return value if value in SERVICES else None
@@ -433,6 +449,14 @@ class DifyDockerService:
             f"com.docker.compose.service={service}",
         ]
         containers = client.containers.list(all=True, filters={"label": labels})
+
+        if not containers:
+            # fallback: match by compose service only (useful when project name differs)
+            containers = client.containers.list(
+                all=True,
+                filters={"label": [f"com.docker.compose.service={service}"]},
+            )
+
         if len(containers) > 1:
             names = [self._container_name(container) for container in containers]
             return OperationResult.fail(
@@ -448,12 +472,16 @@ class DifyDockerService:
                 }
             )
 
-        fallback_name = f"{self.project_name}-{service}-1"
-        with contextlib.suppress(Exception):
-            container = client.containers.get(fallback_name)
-            return OperationResult.success(
-                {"container": container, "container_name": fallback_name}
-            )
+        fallback_names = (
+            f"{self.project_name}-{service}-1",
+            f"{service}-1",
+        )
+        for fallback_name in fallback_names:
+            with contextlib.suppress(Exception):
+                container = client.containers.get(fallback_name)
+                return OperationResult.success(
+                    {"container": container, "container_name": fallback_name}
+                )
 
         return OperationResult.fail(
             "service_not_found",

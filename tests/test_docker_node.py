@@ -148,6 +148,8 @@ def test_parser_missing_required_argument() -> None:
 def test_normalize_target() -> None:
     assert docker_node.normalize_target("api", allow_all=False) == "api"
     assert docker_node.normalize_target("ALL", allow_all=True) == "all"
+    assert docker_node.normalize_target("db", allow_all=False) == "db_postgres"
+    assert docker_node.normalize_target("worker-beat", allow_all=False) == "worker_beat"
     assert docker_node.normalize_target("unknown", allow_all=True) is None
 
 
@@ -195,11 +197,11 @@ def test_service_finds_container_by_label(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_service_fallback_to_container_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    api = FakeContainer("dify-api-1", status="exited")
+    api = FakeContainer("docker-api-1", status="exited")
     client = FakeClient(
         FakeContainers(
             by_service={},
-            by_name={"dify-api-1": api},
+            by_name={"docker-api-1": api},
         )
     )
     patch_docker_module(monkeypatch, client)
@@ -212,6 +214,7 @@ def test_service_fallback_to_container_name(monkeypatch: pytest.MonkeyPatch) -> 
     assert item["exists"] is True
     assert item["running"] is False
     assert item["status"] == "exited"
+    assert item["container_name"] == "docker-api-1"
 
 
 def test_service_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
