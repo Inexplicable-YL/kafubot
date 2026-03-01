@@ -1,6 +1,5 @@
 import contextlib
 import json
-import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -13,6 +12,7 @@ import anyio
 import httpx
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
+from sekaibot.log import logger
 
 from dify_client import AsyncChatClient
 
@@ -24,7 +24,6 @@ API_KEY = _api_key
 BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
 CACHE_DIR = Path(".cache")
 SESSION_DB_PATH = CACHE_DIR / "private_chat.db"
-LOGGER = logging.getLogger(__name__)
 MERGE_WINDOW_SECONDS = 5.0
 
 
@@ -213,7 +212,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
                 if exc.response.status_code == httpx.codes.NOT_FOUND:
                     await conversation_store.delete_conversation_id(session_id)
                     return
-                LOGGER.warning(
+                logger.warning(
                     "Failed to delete Dify conversation for session_id=%s status=%s",
                     session_id,
                     exc.response.status_code,
@@ -221,7 +220,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
                 )
                 return
             except Exception as exc:
-                LOGGER.warning(
+                logger.warning(
                     "Failed to delete Dify conversation for session_id=%s",
                     session_id,
                     exc_info=exc,
@@ -241,7 +240,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
             timeout=180,
         ) as client:
             answer: str = ""
-            LOGGER.debug("Processing query: %s", query)
+            logger.debug("Processing query: %s", query)
             response = await client.create_chat_message(
                 inputs={"name": name},
                 query=query,
@@ -286,7 +285,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
             Updated answer text (remaining buffer after sending chunks)
         """
         text: str = chunk.get("answer", "")
-        LOGGER.debug("Received chunk: %s", text)
+        logger.debug("Received chunk: %s", text)
         text = text.strip(" ")
         if not text:
             return answer
@@ -297,7 +296,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
             if i < len(lines) - 1:
                 answer += stripped
                 if answer:
-                    LOGGER.debug("Sending reply chunk: %s", answer)
+                    logger.debug("Sending reply chunk: %s", answer)
                     await self.reply(answer)
                 answer = ""
             else:
