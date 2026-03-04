@@ -19,6 +19,7 @@ from sekaibot.rule import Keywords
     "四维",
     "超",
     "香氤",
+    "叩之",
 )
 @User("group_596488203", "group_1011357049", "group_1058218429")
 class AutoReply(Node[GroupMessageEvent, dict, Any]):  # type: ignore
@@ -32,42 +33,77 @@ class AutoReply(Node[GroupMessageEvent, dict, Any]):  # type: ignore
         keyw = self.zb[0] if self.zb else "蒸"
 
         keyw = "林睿晨" if keyw == "lrc" else keyw
-        text = random.choice(  # noqa: S311
-            (
-                "{keyw}鞭好粗",
-                "{keyw}鞭好大",
-                "香草{keyw}",
-                "香茶{keyw}",
-                "{keyw}好可爱",
-                "{keyw}立了",
-                "香甜{keyw}",
-                "{keyw}草我",
-                "诶我草{keyw}怎么这么坏啊",
-                "被{keyw}茶了",
-                "{keyw}是四爱",
-                "{keyw}是4i",
-                "{keyw}是南通",
-                "{keyw}素指南",
-                "{keyw}就是爱慕",
-                "{keyw}是正太",
-                "{keyw}不见了",
-                "{keyw}蛇了",
-                "{keyw}北朝的初雪",
-                "{keyw}北朝的初水",
-                "{keyw}北朝的豪爽",
-                "香甜{keyw}的小学",
-                "北{keyw}顶到职场了",
-                "想吃{keyw}精",
-                "想吃{keyw}的大橘瓣",
-                "想电{keyw}的前列腺",
-                "{keyw}转过去一下我有急事",
-                "想吃{keyw}的高玩",
-                "{keyw}很带派",
-                "想吃{keyw}的大汗脚",
-                "被{keyw}口了",
-                "{keyw}是蓝凉",
+        if keyw != "叩之":
+            text = random.choice(  # noqa: S311
+                (
+                    "{keyw}鞭好粗",
+                    "{keyw}鞭好大",
+                    "香草{keyw}",
+                    "香茶{keyw}",
+                    "{keyw}好可爱",
+                    "{keyw}立了",
+                    "香甜{keyw}",
+                    "{keyw}草我",
+                    "诶我草{keyw}怎么这么坏啊",
+                    "被{keyw}茶了",
+                    "{keyw}是四爱",
+                    "{keyw}是4i",
+                    "{keyw}是南通",
+                    "{keyw}素指南",
+                    "{keyw}就是爱慕",
+                    "{keyw}是正太",
+                    "{keyw}不见了",
+                    "{keyw}蛇了",
+                    "{keyw}北朝的初雪",
+                    "{keyw}北朝的初水",
+                    "{keyw}北朝的豪爽",
+                    "香甜{keyw}的小学",
+                    "北{keyw}顶到职场了",
+                    "想吃{keyw}精",
+                    "想吃{keyw}的大橘瓣",
+                    "想电{keyw}的前列腺",
+                    "{keyw}转过去一下我有急事",
+                    "想吃{keyw}的高玩",
+                    "{keyw}很带派",
+                    "想吃{keyw}的大汗脚",
+                    "被{keyw}口了",
+                    "{keyw}是蓝凉",
+                    "{keyw}是冯冯",
+                )
+            ).format(keyw=keyw)
+        else:
+            text = random.choice(  # noqa: S311
+                (
+                    "香草叩之",
+                    "香茶叩之",
+                    "叩之好可爱",
+                    "香甜叩之",
+                    "叩之草我",
+                    "诶我草叩之怎么这么坏啊",
+                    "叩之是四爱",
+                    "叩之是4i",
+                    "叩之就是爱慕",
+                    "叩之不见了",
+                    "叩之北朝的初雪",
+                    "叩之北朝的初水",
+                    "叩之北朝的豪爽",
+                    "香甜叩之的小学",
+                    "叩之很带派",
+                    "想吃叩之的大汗脚",
+                    "被叩之口了",
+                    "叩之是冯冯",
+                    "叩之是直女装姬",
+                    "叩之是拉拉",
+                    "叩之是lg",
+                    "叩之太畜了",
+                    "叩之太畜了",
+                    "叩之滚",
+                    "叩之卡比去",
+                    "叩之扣比去",
+                    "恐双了",
+                    "叩之是酷儿",
+                )
             )
-        ).format(keyw=keyw)
         await self.reply(text)
 
     @override
