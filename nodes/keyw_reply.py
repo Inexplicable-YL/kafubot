@@ -21,7 +21,7 @@ from sekaibot.rule import Keywords
     "香氤",
     "叩之",
 )
-@User("group_596488203", "group_1011357049", "group_1058218429")
+@User("group_596488203", "group_1011357049", "group_1058218429", "group_1087911123")
 class AutoReply(Node[GroupMessageEvent, dict, Any]):  # type: ignore
     """Hello, World! 示例节点。"""
 
