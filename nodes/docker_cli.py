@@ -15,6 +15,7 @@ from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 from sekaibot.exceptions import ParserExit
 from sekaibot.internal.rule.utils import ArgumentParser
 from sekaibot.permission import User
+from sekaibot.rule import Keywords
 
 try:
     import docker
@@ -195,11 +196,6 @@ def parse_docker_command(text: str) -> Any | ParserExit:
         return DOCKER_PARSER.parse_args(argv)
     except ParserExit as exc:
         return exc
-
-
-def is_docker_command(text: str) -> bool:
-    stripped = text.strip()
-    return stripped == "/docker" or stripped.startswith("/docker ")
 
 
 class DifyDockerService:
@@ -549,14 +545,11 @@ DOCKER_PARSER = build_docker_parser()
 
 
 @User("2682064633")
+@Keywords("/docker")
 class DockerManager(Node[PrivateMessageEvent, dict, Any]):  # type: ignore
     priority = 0
     block = True
     service = DifyDockerService()
-
-    @override
-    async def rule(self) -> bool:
-        return is_docker_command(self.event.get_plain_text())
 
     @override
     async def handle(self) -> None:  # noqa: PLR0911

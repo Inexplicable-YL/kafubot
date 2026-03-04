@@ -50,7 +50,7 @@ class NetworkError(DifyClientError):
     """Raised when network-related errors occur."""
 
 
-class TimeoutError(DifyClientError):
+class DifyTimeoutError(DifyClientError):
     """Raised when request times out."""
 
 

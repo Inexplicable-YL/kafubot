@@ -3,7 +3,7 @@
 import json
 import logging
 import time
-from typing import Callable, Dict
+from collections.abc import Callable
 
 try:
     # Python 3.10+
@@ -76,7 +76,7 @@ class BaseClientMixin:
         else:
             self.enable_logging = enable_logging
 
-    def _get_headers(self, content_type: str = "application/json") -> Dict[str, str]:
+    def _get_headers(self, content_type: str = "application/json") -> dict[str, str]:
         """Get common request headers."""
         return {
             "Authorization": f"Bearer {self.api_key}",
@@ -97,13 +97,13 @@ class BaseClientMixin:
                     status_code=response.status_code,
                     response=response.json() if response.content else None,
                 )
-            elif response.status_code == 429:
+            if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
                 raise RateLimitError(
                     "Rate limit exceeded. Please try again later.",
                     retry_after=int(retry_after) if retry_after else None,
                 )
-            elif response.status_code >= 400:
+            if response.status_code >= 400:
                 try:
                     error_data = response.json()
                     message = error_data.get("message", f"HTTP {response.status_code}")
@@ -172,17 +172,16 @@ class BaseClientMixin:
                     )
                     # Convert to custom exceptions
                     if isinstance(e, httpx.TimeoutException):
-                        from .exceptions import TimeoutError
+                        from .exceptions import DifyTimeoutError
 
-                        raise TimeoutError(
+                        raise DifyTimeoutError(
                             f"Request timed out after {self.max_retries} retries{context_msg}"
                         ) from e
-                    else:
-                        from .exceptions import NetworkError
+                    from .exceptions import NetworkError
 
-                        raise NetworkError(
-                            f"Network error after {self.max_retries} retries{context_msg}: {str(e)}"
-                        ) from e
+                    raise NetworkError(
+                        f"Network error after {self.max_retries} retries{context_msg}: {str(e)}"
+                    ) from e
 
         if last_exception:
             raise last_exception
@@ -222,11 +221,11 @@ class BaseClientMixin:
             # Type-specific validations
             if key == "user" and not isinstance(value, str):
                 raise ValidationError(f"Parameter '{key}' must be a string")
-            elif key in ["page", "limit", "page_size"] and not isinstance(value, int):
+            if key in ["page", "limit", "page_size"] and not isinstance(value, int):
                 raise ValidationError(f"Parameter '{key}' must be an integer")
-            elif key == "files" and not isinstance(value, (list, dict)):
+            if key == "files" and not isinstance(value, (list, dict)):
                 raise ValidationError(f"Parameter '{key}' must be a list or dict")
-            elif key == "rating" and value not in ["like", "dislike"]:
+            if key == "rating" and value not in ["like", "dislike"]:
                 raise ValidationError(f"Parameter '{key}' must be 'like' or 'dislike'")
 
     def _log_request(self, method: str, url: str, **kwargs) -> None:

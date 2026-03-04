@@ -1,6 +1,5 @@
 import contextlib
 import json
-import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -13,8 +12,10 @@ import anyio
 import httpx
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
+from sekaibot.log import logger
 
 from dify_client import AsyncChatClient
+from dify_client.exceptions import DifyTimeoutError
 
 _api_key = os.environ.get("DIFY_API_KEY")
 if _api_key is None:
@@ -24,7 +25,6 @@ API_KEY = _api_key
 BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
 CACHE_DIR = Path(".cache")
 SESSION_DB_PATH = CACHE_DIR / "private_chat.db"
-LOGGER = logging.getLogger(__name__)
 MERGE_WINDOW_SECONDS = 5.0
 
 
@@ -213,7 +213,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
                 if exc.response.status_code == httpx.codes.NOT_FOUND:
                     await conversation_store.delete_conversation_id(session_id)
                     return
-                LOGGER.warning(
+                logger.warning(
                     "Failed to delete Dify conversation for session_id=%s status=%s",
                     session_id,
                     exc.response.status_code,
@@ -221,7 +221,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
                 )
                 return
             except Exception as exc:
-                LOGGER.warning(
+                logger.warning(
                     "Failed to delete Dify conversation for session_id=%s",
                     session_id,
                     exc_info=exc,
@@ -234,46 +234,71 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
         conversation_store = self.node_state.conversation_store
         conversation_id = await conversation_store.get_conversation_id(session_id) or ""
         latest_conversation_id: str | None = None
+        for _ in range(3):
+            try:
+                async with AsyncChatClient(
+                    API_KEY,
+                    base_url=BASE_URL,
+                    timeout=90,
+                ) as client:
+                    answer: str = ""
+                    logger.debug("Processing query: %s", query)
+                    response = await client.create_chat_message(
+                        inputs={"name": name},
+                        query=query,
+                        user=session_id,
+                        conversation_id=conversation_id,
+                        response_mode="streaming",
+                    )
+                    response.raise_for_status()
+                    async for segment in response.aiter_lines():
+                        if segment.startswith("data:") and (
+                            data := segment[5:].strip()
+                        ):
+                            with contextlib.suppress(json.JSONDecodeError):
+                                if chunk := json.loads(data):
+                                    chunk_conversation_id = chunk.get(
+                                        "conversation_id", ""
+                                    )
+                                    if (
+                                        isinstance(chunk_conversation_id, str)
+                                        and chunk_conversation_id.strip()
+                                    ):
+                                        latest_conversation_id = (
+                                            chunk_conversation_id.strip()
+                                        )
+                                    event: str = chunk.get("event")
+                                    if event == "message":
+                                        answer = await self._process_message_chunk(
+                                            chunk, answer
+                                        )
+                                    elif event == "message_end":
+                                        break
 
-        async with AsyncChatClient(
-            API_KEY,
-            base_url=BASE_URL,
-            timeout=180,
-        ) as client:
-            answer: str = ""
-            LOGGER.debug("Processing query: %s", query)
-            response = await client.create_chat_message(
-                inputs={"name": name},
-                query=query,
-                user=session_id,
-                conversation_id=conversation_id,
-                response_mode="streaming",
-            )
-            response.raise_for_status()
-            async for segment in response.aiter_lines():
-                if segment.startswith("data:") and (data := segment[5:].strip()):
-                    with contextlib.suppress(json.JSONDecodeError):
-                        if chunk := json.loads(data):
-                            chunk_conversation_id = chunk.get("conversation_id", "")
-                            if (
-                                isinstance(chunk_conversation_id, str)
-                                and chunk_conversation_id.strip()
-                            ):
-                                latest_conversation_id = chunk_conversation_id.strip()
-                            event: str = chunk.get("event")
-                            if event == "message":
-                                answer = await self._process_message_chunk(
-                                    chunk, answer
-                                )
-                            elif event == "message_end":
-                                break
-
-            if answer.strip():
-                await self.reply(answer.strip())
-            if latest_conversation_id and latest_conversation_id != conversation_id:
-                await conversation_store.set_conversation_id(
-                    session_id, latest_conversation_id
+                    if answer.strip():
+                        await self.reply(answer.strip())
+                    if (
+                        latest_conversation_id
+                        and latest_conversation_id != conversation_id
+                    ):
+                        await conversation_store.set_conversation_id(
+                            session_id, latest_conversation_id
+                        )
+                    return
+            except DifyTimeoutError as exc:
+                logger.warning(
+                    "Request to Dify timed out for session_id=%s",
+                    session_id,
+                    exc_info=exc,
                 )
+                anyio.sleep(45)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "Failed to process Dify request for session_id=%s",
+                    session_id,
+                    exc_info=exc,
+                )
+                anyio.sleep(45)
 
     async def _process_message_chunk(self, chunk: dict[str, Any], answer: str) -> str:
         """Process a streaming message chunk and send reply.
@@ -286,7 +311,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
             Updated answer text (remaining buffer after sending chunks)
         """
         text: str = chunk.get("answer", "")
-        LOGGER.debug("Received chunk: %s", text)
+        logger.debug("Received chunk: %s", text)
         text = text.strip(" ")
         if not text:
             return answer
@@ -297,7 +322,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
             if i < len(lines) - 1:
                 answer += stripped
                 if answer:
-                    LOGGER.debug("Sending reply chunk: %s", answer)
+                    logger.debug("Sending reply chunk: %s", answer)
                     await self.reply(answer)
                 answer = ""
             else:
