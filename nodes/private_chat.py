@@ -234,71 +234,67 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
         conversation_store = self.node_state.conversation_store
         conversation_id = await conversation_store.get_conversation_id(session_id) or ""
         latest_conversation_id: str | None = None
-        for _ in range(3):
-            try:
-                async with AsyncChatClient(
-                    API_KEY,
-                    base_url=BASE_URL,
-                    timeout=90,
-                ) as client:
-                    answer: str = ""
-                    logger.debug("Processing query: %s", query)
-                    response = await client.create_chat_message(
-                        inputs={"name": name},
-                        query=query,
-                        user=session_id,
-                        conversation_id=conversation_id,
-                        response_mode="streaming",
-                    )
-                    response.raise_for_status()
-                    async for segment in response.aiter_lines():
-                        if segment.startswith("data:") and (
-                            data := segment[5:].strip()
-                        ):
-                            with contextlib.suppress(json.JSONDecodeError):
-                                if chunk := json.loads(data):
-                                    chunk_conversation_id = chunk.get(
-                                        "conversation_id", ""
-                                    )
-                                    if (
-                                        isinstance(chunk_conversation_id, str)
-                                        and chunk_conversation_id.strip()
-                                    ):
-                                        latest_conversation_id = (
-                                            chunk_conversation_id.strip()
-                                        )
-                                    event: str = chunk.get("event")
-                                    if event == "message":
-                                        answer = await self._process_message_chunk(
-                                            chunk, answer
-                                        )
-                                    elif event == "message_end":
-                                        break
-
-                    if answer.strip():
-                        await self.reply(answer.strip())
-                    if (
-                        latest_conversation_id
-                        and latest_conversation_id != conversation_id
+        try:
+            async with AsyncChatClient(
+                API_KEY,
+                base_url=BASE_URL,
+                timeout=180,
+            ) as client:
+                answer: str = ""
+                logger.debug("Processing query: %s", query)
+                response = await client.create_chat_message(
+                    inputs={"name": name},
+                    query=query,
+                    user=session_id,
+                    conversation_id=conversation_id,
+                    response_mode="streaming",
+                )
+                response.raise_for_status()
+                async for segment in response.aiter_lines():
+                    if segment.startswith("data:") and (
+                        data := segment[5:].strip()
                     ):
-                        await conversation_store.set_conversation_id(
-                            session_id, latest_conversation_id
-                        )
-                    return
-            except DifyTimeoutError as exc:
-                logger.warning(
-                    "Request to Dify timed out for session_id=%s",
-                    session_id,
-                    exc_info=exc,
-                )
-                anyio.sleep(45)
-            except Exception as exc:  # pragma: no cover
-                logger.warning(
-                    "Failed to process Dify request for session_id=%s",
-                    session_id,
-                    exc_info=exc,
-                )
-                anyio.sleep(45)
+                        with contextlib.suppress(json.JSONDecodeError):
+                            if chunk := json.loads(data):
+                                chunk_conversation_id = chunk.get(
+                                    "conversation_id", ""
+                                )
+                                if (
+                                    isinstance(chunk_conversation_id, str)
+                                    and chunk_conversation_id.strip()
+                                ):
+                                    latest_conversation_id = (
+                                        chunk_conversation_id.strip()
+                                    )
+                                event: str = chunk.get("event")
+                                if event == "message":
+                                    answer = await self._process_message_chunk(
+                                        chunk, answer
+                                    )
+                                elif event == "message_end":
+                                    break
+
+                if answer.strip():
+                    await self.reply(answer.strip())
+                if (
+                    latest_conversation_id
+                    and latest_conversation_id != conversation_id
+                ):
+                    await conversation_store.set_conversation_id(
+                        session_id, latest_conversation_id
+                    )
+        except DifyTimeoutError as exc:
+            logger.warning(
+                "Request to Dify timed out for session_id=%s",
+                session_id,
+                exc_info=exc,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "Failed to process Dify request for session_id=%s",
+                session_id,
+                exc_info=exc,
+            )
 
     async def _process_message_chunk(self, chunk: dict[str, Any], answer: str) -> str:
         """Process a streaming message chunk and send reply.
