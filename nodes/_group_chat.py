@@ -332,7 +332,7 @@ def get_decision_app() -> Runnable[dict[str, Any], bool]:
 
         history = await get_session_history(session_id).aget_messages()
         history = [
-            HumanMessage(content="可不（机器人）：" + content_to_text(message.content))
+            HumanMessage(content="可不（机器人）: " + content_to_text(message.content))
             if isinstance(message, AIMessage)
             else message
             for message in history
