@@ -11,7 +11,7 @@ REPEAT_THRESHOLD = 3
 
 @WordFilter(word_file=Path("./nodes/sensitive_words_lines.txt"), use_aho=True)
 class Repeater(Node[GroupMessageEvent, dict, Any]):
-    priority: int = 2
+    priority = 5
 
     async def handle(self) -> None:
         def del_file_id(msg: CQHTTPMessageSegment):

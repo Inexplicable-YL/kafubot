@@ -27,6 +27,7 @@ class AutoReply(Node[GroupMessageEvent, dict, Any]):  # type: ignore
     """Hello, World! 示例节点。"""
 
     priority = 0
+    block = True
     zb = Keywords.Param()
 
     @override
@@ -51,9 +52,7 @@ class AutoReply(Node[GroupMessageEvent, dict, Any]):  # type: ignore
                     "叩之北朝的初雪",
                     "叩之北朝的初水",
                     "叩之北朝的豪爽",
-                    "香甜叩之的小学",
                     "叩之很带派",
-                    "想吃叩之的大汗脚",
                     "被叩之口了",
                     "叩之是冯冯",
                     "叩之是直女装姬",

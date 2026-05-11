@@ -1,103 +1,70 @@
-import contextlib
-import json
-import os
-import time
+import math
 from dataclasses import dataclass, field
-from pathlib import Path
+from datetime import UTC, datetime
 from typing import Any
 from typing_extensions import override
+from zoneinfo import ZoneInfo
 
-import aiosqlite
 import anyio
-import httpx
+from _private_chat import (
+    clear_session_history,
+    get_chat_app,
+)
+from _prompt import (
+    get_extra_prompt,
+)
+from langchain_core.runnables import Runnable
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
-from sekaibot.log import logger
 
-from dify_client import AsyncChatClient
-from dify_client.exceptions import DifyTimeoutError
-
-_api_key = os.environ.get("DIFY_API_KEY")
-if _api_key is None:
-    raise ValueError("DIFY_API_KEY is not set")
-
-API_KEY = _api_key
-BASE_URL = os.environ.get("DIFY_BASE_URL", "https://api.dify.ai/v1")
-CACHE_DIR = Path(".cache")
-SESSION_DB_PATH = CACHE_DIR / "private_chat.db"
 MERGE_WINDOW_SECONDS = 5.0
+
+ACTIVITY_DAY = (8, 20)  # 8:00-20:00 is considered day time
+ACTIVITY_DAY_MULTIPLIER = 0.5
+ACTIVITY_NIGHT_MULTIPLIER = 1.0
+ACTIVITY_LIMITS: tuple[tuple[int, int], ...] = (  # (window_seconds, threshold)
+    (3600, 40),
+    (3600 * 5, 100),
+    (3600 * 24 * 7, 450),
+)
+if ACTIVITY_DAY_MULTIPLIER <= 0 or ACTIVITY_NIGHT_MULTIPLIER <= 0:
+    raise ValueError("activity multipliers must be positive")
+
+
+ACTIVITY_HISTORY_LIMIT = math.ceil(
+    max((threshold for _, threshold in ACTIVITY_LIMITS), default=0)
+    / min(ACTIVITY_DAY_MULTIPLIER, ACTIVITY_NIGHT_MULTIPLIER)
+)
 
 
 @dataclass
-class SessionConversationStore:
-    db_path: Path = field(default_factory=lambda: SESSION_DB_PATH)
-    init_lock: anyio.Lock = field(default_factory=anyio.Lock)
-    initialized: bool = False
+class ActivityRecord:
+    timestamp: datetime
+    weight: float
 
-    async def ensure_initialized(self) -> None:
-        if self.initialized:
-            return
 
-        async with self.init_lock:
-            if self.initialized:
-                return
+def _activity_weight(event_time: int) -> float:
+    background_time = datetime.fromtimestamp(
+        event_time,
+        tz=UTC,
+    ).astimezone(ZoneInfo("Asia/Shanghai"))
+    if ACTIVITY_DAY[0] <= background_time.hour < ACTIVITY_DAY[1]:
+        return ACTIVITY_DAY_MULTIPLIER
+    return ACTIVITY_NIGHT_MULTIPLIER
 
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS session_conversations (
-                        session_id TEXT PRIMARY KEY,
-                        conversation_id TEXT NOT NULL,
-                        updated_at INTEGER NOT NULL
-                    )
-                    """
-                )
-                await db.commit()
 
-            self.initialized = True
-
-    async def get_conversation_id(self, session_id: str) -> str | None:
-        await self.ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT conversation_id FROM session_conversations WHERE session_id = ?",
-                (session_id,),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-
-        if row is None:
-            return None
-
-        conversation_id = row[0]
-        if not isinstance(conversation_id, str) or not conversation_id:
-            return None
-        return conversation_id
-
-    async def set_conversation_id(self, session_id: str, conversation_id: str) -> None:
-        await self.ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """
-                INSERT INTO session_conversations (session_id, conversation_id, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    conversation_id = excluded.conversation_id,
-                    updated_at = excluded.updated_at
-                """,
-                (session_id, conversation_id, int(time.time())),
-            )
-            await db.commit()
-
-    async def delete_conversation_id(self, session_id: str) -> None:
-        await self.ensure_initialized()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "DELETE FROM session_conversations WHERE session_id = ?",
-                (session_id,),
-            )
-            await db.commit()
+def _is_activity_limited(activites: list[ActivityRecord], event_time: int) -> bool:
+    return any(
+        threshold > 0
+        and window_seconds > 0
+        and sum(
+            activity.weight
+            for activity in activites
+            if event_time - int(activity.timestamp.timestamp()) < window_seconds
+        )
+        >= threshold
+        for window_seconds, threshold in ACTIVITY_LIMITS
+    )
 
 
 @dataclass
@@ -112,6 +79,7 @@ class SessionQueueState:
     latest_waiter_id: int = 0
     last_enqueue_time: float | None = None
     merge_window_seconds: float = MERGE_WINDOW_SECONDS
+    activites: list[ActivityRecord] = field(default_factory=list)
     condition: anyio.Condition = field(default_factory=anyio.Condition)
 
     async def enqueue(self, message: str) -> EnqueueDecision:
@@ -129,7 +97,7 @@ class SessionQueueState:
             self.condition.notify_all()
             return EnqueueDecision(waiter_id=waiter_id)
 
-    async def wait_and_claim(self, waiter_id: int) -> str | None:
+    async def wait_and_claim(self, waiter_id: int) -> list[str] | None:
         """Wait for messages to be ready for processing.
 
         Returns None if a newer message has superseded this waiter.
@@ -157,7 +125,7 @@ class SessionQueueState:
                         # Recalculate on next iteration if timeout fired
                         continue
 
-                    merged_message = "\n\n".join(self.pending_messages)
+                    merged_message = self.pending_messages.copy()
                     self.pending_messages.clear()
                     self.running = True
                     return merged_message
@@ -172,19 +140,14 @@ class SessionQueueState:
 
 @dataclass
 class PrivateReplyState:
+    chat_app: Runnable[dict[str, Any], str] = field(default_factory=get_chat_app)
+    histories_for_extra_prompt: dict[str, list[str]] = field(default_factory=dict)
     sessions: dict[str, SessionQueueState] = field(default_factory=dict)
     sessions_lock: anyio.Lock = field(default_factory=anyio.Lock)
-    conversation_store: SessionConversationStore = field(
-        default_factory=SessionConversationStore
-    )
 
 
 class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: ignore
     priority = 1
-
-    @override
-    def __init_state__(self) -> PrivateReplyState:
-        return PrivateReplyState()
 
     async def _get_session_state(self, session_id: str) -> SessionQueueState:
         async with self.node_state.sessions_lock:
@@ -193,143 +156,57 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
             return self.node_state.sessions[session_id]
 
     async def _delete_conversation(self, session_id: str) -> None:
-        conversation_store = self.node_state.conversation_store
-        conversation_id = await conversation_store.get_conversation_id(session_id)
-        if conversation_id is None:
-            return
+        await clear_session_history(session_id)
+        async with self.node_state.sessions_lock:
+            if session_id in self.node_state.sessions:
+                del self.node_state.sessions[session_id]
 
-        async with AsyncChatClient(
-            API_KEY,
-            base_url=BASE_URL,
-            timeout=180,
-        ) as client:
-            try:
-                response = await client.delete_conversation(
-                    conversation_id=conversation_id,
-                    user=session_id,
-                )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == httpx.codes.NOT_FOUND:
-                    await conversation_store.delete_conversation_id(session_id)
-                    return
-                logger.warning(
-                    "Failed to delete Dify conversation for session_id=%s status=%s",
-                    session_id,
-                    exc.response.status_code,
-                    exc_info=exc,
-                )
-                return
-            except Exception as exc:
-                logger.warning(
-                    "Failed to delete Dify conversation for session_id=%s",
-                    session_id,
-                    exc_info=exc,
-                )
-                return
-
-        await conversation_store.delete_conversation_id(session_id)
-
-    async def _run_chat(self, query: str, name: str, session_id: str) -> None:
-        conversation_store = self.node_state.conversation_store
-        conversation_id = await conversation_store.get_conversation_id(session_id) or ""
-        latest_conversation_id: str | None = None
-        try:
-            async with AsyncChatClient(
-                API_KEY,
-                base_url=BASE_URL,
-                timeout=180,
-            ) as client:
-                answer: str = ""
-                logger.debug("Processing query: %s", query)
-                response = await client.create_chat_message(
-                    inputs={"name": name},
-                    query=query,
-                    user=session_id,
-                    conversation_id=conversation_id,
-                    response_mode="streaming",
-                )
-                response.raise_for_status()
-                async for segment in response.aiter_lines():
-                    if segment.startswith("data:") and (
-                        data := segment[5:].strip()
-                    ):
-                        with contextlib.suppress(json.JSONDecodeError):
-                            if chunk := json.loads(data):
-                                chunk_conversation_id = chunk.get(
-                                    "conversation_id", ""
-                                )
-                                if (
-                                    isinstance(chunk_conversation_id, str)
-                                    and chunk_conversation_id.strip()
-                                ):
-                                    latest_conversation_id = (
-                                        chunk_conversation_id.strip()
-                                    )
-                                event: str = chunk.get("event")
-                                if event == "message":
-                                    answer = await self._process_message_chunk(
-                                        chunk, answer
-                                    )
-                                elif event == "message_end":
-                                    break
-
-                if answer.strip():
-                    await self.reply(answer.strip())
-                if (
-                    latest_conversation_id
-                    and latest_conversation_id != conversation_id
-                ):
-                    await conversation_store.set_conversation_id(
-                        session_id, latest_conversation_id
-                    )
-        except DifyTimeoutError as exc:
-            logger.warning(
-                "Request to Dify timed out for session_id=%s",
-                session_id,
-                exc_info=exc,
-            )
-        except Exception as exc:  # pragma: no cover
-            logger.warning(
-                "Failed to process Dify request for session_id=%s",
-                session_id,
-                exc_info=exc,
-            )
-
-    async def _process_message_chunk(self, chunk: dict[str, Any], answer: str) -> str:
-        """Process a streaming message chunk and send reply.
-
-        Args:
-            chunk: The parsed JSON chunk from the streaming response
-            answer: Accumulated answer text
-
-        Returns:
-            Updated answer text (remaining buffer after sending chunks)
-        """
-        text: str = chunk.get("answer", "")
-        logger.debug("Received chunk: %s", text)
-        text = text.strip(" ")
-        if not text:
-            return answer
-
-        lines = text.split("\n")
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if i < len(lines) - 1:
-                answer += stripped
-                if answer:
-                    logger.debug("Sending reply chunk: %s", answer)
-                    await self.reply(answer)
-                answer = ""
-            else:
-                answer += stripped
-        return answer
+    async def _run_chat(self, messages: list[str], name: str, session_id: str) -> bool:
+        if self.node_state is None:
+            self.node_state = PrivateReplyState()
+        if self.node_state.chat_app is None:
+            self.node_state.chat_app = get_chat_app()
+        self.node_state.histories_for_extra_prompt.setdefault(session_id, [])
+        self.node_state.histories_for_extra_prompt[session_id].append(
+            "\n".join(messages)
+        )
+        replied = False
+        answer = ""
+        async for reply in self.node_state.chat_app.astream(
+            {
+                "messages": messages,
+                "extra_prompt": get_extra_prompt(
+                    "\n".join(self.node_state.histories_for_extra_prompt[session_id])
+                ),
+                "now_time": datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                "user_name": name,
+                "thinking": True,
+                "reasoning_effort": "high",
+            },
+            config={"configurable": {"session_id": session_id}},
+        ):
+            if reply is not None:
+                await self.reply(reply)
+                answer += reply
+                replied = True
+        if replied:
+            self.node_state.histories_for_extra_prompt[session_id].append(answer)
+        self.node_state.histories_for_extra_prompt[session_id] = (
+            self.node_state.histories_for_extra_prompt[session_id][-2:]
+        )
+        return replied
 
     @override
     async def handle(self) -> None:
-        text = self.event.get_plain_text()
+        text = (
+            f"[{datetime.fromtimestamp(self.event.time, tz=UTC).astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')}]"
+            + self.event.get_plain_text()
+        )
         if not text:
             return
+
         session_id = self.event.get_session_id()
 
         keyws = ["clear", "清除", "清空", "清理", "删除", "重置", "重新开始", "重启"]
@@ -346,13 +223,33 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
         name = name_map.get(name, name)
 
         session_state = await self._get_session_state(session_id)
+        if _is_activity_limited(session_state.activites, self.event.time):
+            return
+
         decision = await session_state.enqueue(text)
 
-        query = await session_state.wait_and_claim(decision.waiter_id)
-        if query is None:
+        messages = await session_state.wait_and_claim(decision.waiter_id)
+        if messages is None:
             return
 
         try:
-            await self._run_chat(query=query, name=name, session_id=session_id)
+            replied = await self._run_chat(
+                messages=messages,
+                name=name,
+                session_id=session_id,
+            )
+            if replied:
+                session_state.activites.append(
+                    ActivityRecord(
+                        timestamp=datetime.fromtimestamp(self.event.time, tz=UTC),
+                        weight=_activity_weight(self.event.time),
+                    )
+                )
+                if len(session_state.activites) > ACTIVITY_HISTORY_LIMIT:
+                    session_state.activites = (
+                        session_state.activites[-ACTIVITY_HISTORY_LIMIT:]
+                        if ACTIVITY_HISTORY_LIMIT > 0
+                        else []
+                    )
         finally:
             await session_state.finish_run()
