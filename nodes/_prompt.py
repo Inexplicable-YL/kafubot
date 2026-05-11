@@ -698,7 +698,7 @@ EXTRA_PROMPTS: list[tuple[re.Pattern[str], str] | Callable[[str], str]] = [
 
 
 def get_extra_prompt(text: str) -> str:
-    text = text + "\n" + opencc.OpenCC("s2t").convert(text)
+    text = opencc.OpenCC("s2t").convert(text) + "\n" + text
     extra_prompts: list[str] = []
     for item in EXTRA_PROMPTS:
         if isinstance(item, tuple):
