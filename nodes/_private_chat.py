@@ -230,6 +230,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:
 
         model = ChatDeepSeek(
             model=DEEPSEEK_MODEL,
+            base_url=os.getenv("DEEPSEEK_BASE_URL"),
             temperature=1.2,
             max_retries=2,
         ).bind(**runtime_kwargs)

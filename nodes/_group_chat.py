@@ -364,6 +364,7 @@ def get_decision_app() -> Runnable[dict[str, Any], bool]:
     )
     model = ChatDeepSeek(
         model=DECISION_DEEPSEEK_MODEL,
+        base_url=os.getenv("DEEPSEEK_BASE_URL"),
         temperature=0,
         max_retries=2,
     ).bind(
@@ -449,6 +450,7 @@ def get_chat_app() -> Runnable[dict[str, Any], AssistantReply]:  # noqa: PLR0915
 
         model = ChatDeepSeek(
             model=CHAT_DEEPSEEK_MODEL,
+            base_url=os.getenv("DEEPSEEK_BASE_URL"),
             temperature=1.2,
             max_retries=2,
         ).bind(**runtime_kwargs)

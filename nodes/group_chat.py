@@ -118,14 +118,6 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             for window_seconds, threshold in self.config.activity_limits
         )
 
-    def _ensure_state(self) -> None:
-        if self.node_state is None:
-            self.node_state = GroupChatState()
-        if not self.node_state.agent:
-            self.node_state.agent = get_agent_app()
-        if not self.node_state.storages:
-            self.node_state.storages = {}
-
     async def _get_history_storage(
         self,
         session_id: str,
@@ -256,7 +248,6 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
 
     @override
     async def handle(self) -> None:
-        self._ensure_state()
         session_id = str(self.event.group_id)
         history_storage = await self._get_history_storage(session_id)
 

@@ -6,18 +6,21 @@ from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 import anyio
+from _image import get_image_analyzer, read_image_as_base64
 from _private_chat import (
     clear_session_history,
     get_chat_app,
 )
-from _prompt import (
-    get_extra_prompt,
-)
+from _prompt import get_extra_prompt
 from langchain_core.runnables import Runnable
 from pydantic import model_validator
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 from sekaibot.config import ConfigModel
+
+BACKUP_MESSAGES_LIMIT = 10
+
+EXTRA_PROMPT_MAX_HISTORY = 3
 
 
 class PrivateChatConfig(ConfigModel):
@@ -60,11 +63,6 @@ class ActivityRecord:
 
 
 @dataclass
-class EnqueueDecision:
-    waiter_id: int
-
-
-@dataclass
 class SessionQueueState:
     running: bool = False
     pending_messages: list[str] = field(default_factory=list)
@@ -74,30 +72,16 @@ class SessionQueueState:
     activites: list[ActivityRecord] = field(default_factory=list)
     condition: anyio.Condition = field(default_factory=anyio.Condition)
 
-    async def enqueue(self, message: str) -> EnqueueDecision:
-        """Add a message to the queue.
-
-        Note: Each new message resets the merge window timer, allowing messages
-        arriving in quick succession to be batched together. The window extends
-        from the most recent message, not the first.
-        """
+    async def enqueue(self, message: str) -> int:
         async with self.condition:
             self.pending_messages.append(message)
             self.latest_waiter_id += 1
             self.last_enqueue_time = anyio.current_time()
             waiter_id = self.latest_waiter_id
             self.condition.notify_all()
-            return EnqueueDecision(waiter_id=waiter_id)
+            return waiter_id
 
     async def wait_and_claim(self, waiter_id: int) -> list[str] | None:
-        """Wait for messages to be ready for processing.
-
-        Returns None if a newer message has superseded this waiter.
-        Waits for the merge window to expire with no new messages before claiming.
-
-        Note: Uses anyio.move_on_after for timeout, which may cancel the wait
-        early. After timeout, we recalculate remaining time on next iteration.
-        """
         async with self.condition:
             while True:
                 if waiter_id != self.latest_waiter_id:
@@ -133,13 +117,19 @@ class SessionQueueState:
 @dataclass
 class PrivateReplyState:
     chat_app: Runnable[dict[str, Any], str] = field(default_factory=get_chat_app)
-    histories_for_extra_prompt: dict[str, list[str]] = field(default_factory=dict)
+    image_analyzer: Runnable[dict[str, Any], str] = field(
+        default_factory=get_image_analyzer
+    )
+    backup_histories: dict[str, list[str]] = field(default_factory=dict)
     sessions: dict[str, SessionQueueState] = field(default_factory=dict)
     sessions_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
 
 class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig]):  # type: ignore
     priority = 1
+
+    def __init_state__(self) -> PrivateReplyState:
+        return PrivateReplyState()
 
     def _activity_weight(self, event_time: int) -> float:
         background_time = datetime.fromtimestamp(
@@ -169,36 +159,27 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
             for window_seconds, threshold in self.config.activity_limits
         )
 
-    async def _get_session_state(self, session_id: str) -> SessionQueueState:
-        async with self.node_state.sessions_lock:
-            if session_id not in self.node_state.sessions:
-                self.node_state.sessions[session_id] = SessionQueueState(
-                    merge_window_seconds=self.config.merge_window_seconds
-                )
-            return self.node_state.sessions[session_id]
-
-    async def _delete_conversation(self, session_id: str) -> None:
+    async def _delete_chat(self, session_id: str) -> None:
         await clear_session_history(session_id)
         async with self.node_state.sessions_lock:
             if session_id in self.node_state.sessions:
                 del self.node_state.sessions[session_id]
+        await self.reply("[SYSTEM]已清除对话历史。")
 
     async def _run_chat(self, messages: list[str], name: str, session_id: str) -> bool:
-        if self.node_state is None:
-            self.node_state = PrivateReplyState()
-        if self.node_state.chat_app is None:
-            self.node_state.chat_app = get_chat_app()
-        self.node_state.histories_for_extra_prompt.setdefault(session_id, [])
-        self.node_state.histories_for_extra_prompt[session_id].append(
-            "\n".join(messages)
-        )
+        self.node_state.backup_histories.setdefault(session_id, [])
+        self.node_state.backup_histories[session_id].append("\n".join(messages))
         replied = False
         answer = ""
         async for reply in self.node_state.chat_app.astream(
             {
                 "messages": messages,
                 "extra_prompt": get_extra_prompt(
-                    "\n".join(self.node_state.histories_for_extra_prompt[session_id])
+                    "\n".join(
+                        self.node_state.backup_histories[session_id][
+                            -EXTRA_PROMPT_MAX_HISTORY:
+                        ]
+                    )
                 ),
                 "now_time": datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime(
                     "%Y-%m-%d %H:%M:%S"
@@ -214,26 +195,49 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
                 answer += reply
                 replied = True
         if replied:
-            self.node_state.histories_for_extra_prompt[session_id].append(answer)
-        self.node_state.histories_for_extra_prompt[session_id] = (
-            self.node_state.histories_for_extra_prompt[session_id][-2:]
-        )
+            self.node_state.backup_histories[session_id].append(answer)
+        self.node_state.backup_histories[session_id] = self.node_state.backup_histories[
+            session_id
+        ][-BACKUP_MESSAGES_LIMIT:]
         return replied
+
+    async def get_image(self, file: str) -> str | None:
+        try:
+            result: dict[str, str] = await self.event.adapter.call_api(
+                "get_image", file=file
+            )
+            path, url = result.get("file"), result.get("url")
+            if path is not None:
+                return await read_image_as_base64(path, url)
+        except Exception:
+            return None
+        return None
 
     @override
     async def handle(self) -> None:
+        text = self.event.get_plain_text()
+        if not text:
+            file: str | None = None
+            if len(self.event.message) == 1 and self.event.message[0].type == "image":
+                file = self.event.message[0].data.get("file")
+            if file is not None:
+                base64 = await self.get_image(file)
+                print(
+                    f"base64: {base64[:100]}..."
+                    if base64
+                    else "No image found or failed to read image."
+                )
+            return
         text = (
             f"[{datetime.fromtimestamp(self.event.time, tz=UTC).astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')}]"
-            + self.event.get_plain_text()
+            + text
         )
-        if not text:
-            return
 
         session_id = self.event.get_session_id()
 
         keyws = ["clear", "清除", "清空", "清理", "删除", "重置", "重新开始", "重启"]
         if any(keyw in text for keyw in keyws):
-            await self._delete_conversation(session_id=session_id)
+            await self._delete_chat(session_id=session_id)
             return
 
         name_map: dict[str, str] = {
@@ -244,13 +248,19 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
         name: str = self.event.sender.nickname or ""
         name = name_map.get(name, name)
 
-        session_state = await self._get_session_state(session_id)
+        async with self.node_state.sessions_lock:
+            if session_id not in self.node_state.sessions:
+                self.node_state.sessions[session_id] = SessionQueueState(
+                    merge_window_seconds=self.config.merge_window_seconds
+                )
+            session_state = self.node_state.sessions[session_id]
+
         if self._is_activity_limited(session_state.activites, self.event.time):
             return
 
         decision = await session_state.enqueue(text)
 
-        messages = await session_state.wait_and_claim(decision.waiter_id)
+        messages = await session_state.wait_and_claim(decision)
         if messages is None:
             return
 
