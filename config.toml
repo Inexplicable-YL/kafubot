@@ -33,6 +33,7 @@ auto_reply_groups=[
     1048490205,
     172844144,
     565525468,
+    154243984,
 ]
 interval_seconds=40
 activity_limits=[

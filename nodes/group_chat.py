@@ -18,6 +18,7 @@ from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.adapter.cqhttp.message import CQHTTPMessage, CQHTTPMessageSegment
 from sekaibot.config import ConfigModel
 
+from nodes._activity import get_activity_store
 from nodes._group import (
     AssistantReply,
     get_agent_app,
@@ -91,16 +92,11 @@ class GroupChatConfig(ConfigModel):
         self.auto_reply_groups = self.auto_reply_groups.union(BASE_AUTO_REPLY_GROUPS)
         return self
 
-    @property
-    def activity_history_limit(self):
-        return max((threshold for _, threshold in self.activity_limits), default=0)
-
 
 @dataclass
 class Histories:
     messages: list[dict[str, Any]] = field(default_factory=list)
     backup_messages: list[dict[str, Any]] = field(default_factory=list)
-    activites: list[datetime] = field(default_factory=list)
     timestamp: int = 0
     on_handle: bool = False
     lock: anyio.Lock = field(default_factory=anyio.Lock)
@@ -124,17 +120,12 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
     def __init_state__(self) -> GroupChatState:
         return GroupChatState()
 
-    def _is_activity_limited(
-        self,
-        activites: list[datetime],
-        event_time: int,
-    ) -> bool:
-        return any(
-            threshold > 0
-            and window_seconds > 0
-            and len(activites) >= threshold
-            and event_time - int(activites[-threshold].timestamp()) < window_seconds
-            for window_seconds, threshold in self.config.activity_limits
+    async def _is_activity_limited(self, session_id: str, event_time: int) -> bool:
+        return await get_activity_store().is_limited(
+            scope="group",
+            session_id=session_id,
+            event_time=event_time,
+            activity_limits=self.config.activity_limits,
         )
 
     async def _get_history_storage(
@@ -148,6 +139,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
 
     async def _claim_messages_for_reply(
         self,
+        session_id: str,
         history_storage: Histories,
         message: dict[str, Any],
         text: str,
@@ -160,10 +152,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 -BACKUP_MESSAGES_LIMIT:
             ]
 
-            if self._is_activity_limited(
-                history_storage.activites,
-                self.event.time,
-            ):
+            if await self._is_activity_limited(session_id, self.event.time):
                 return None
 
             if history_storage.on_handle:
@@ -260,20 +249,22 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         replied: bool,
     ) -> None:
         async with history_storage.lock:
-            if replied:
-                history_storage.timestamp = self.event.time
-                history_storage.activites.append(
-                    datetime.fromtimestamp(self.event.time, tz=UTC)
-                )
-                if len(history_storage.activites) > self.config.activity_history_limit:
-                    history_storage.activites = (
-                        history_storage.activites[-self.config.activity_history_limit :]
-                        if self.config.activity_history_limit > 0
-                        else []
+            try:
+                if replied:
+                    history_storage.timestamp = self.event.time
+                    await get_activity_store().record(
+                        scope="group",
+                        session_id=str(self.event.group_id),
+                        event_time=self.event.time,
+                        weight=1.0,
+                        activity_limits=self.config.activity_limits,
                     )
-            else:
-                history_storage.messages = current_messages + history_storage.messages
-            history_storage.on_handle = False
+                else:
+                    history_storage.messages = (
+                        current_messages + history_storage.messages
+                    )
+            finally:
+                history_storage.on_handle = False
 
     @override
     async def handle(self) -> None:
@@ -295,6 +286,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         }
 
         current_messages = await self._claim_messages_for_reply(
+            session_id=session_id,
             history_storage=history_storage,
             message=message,
             text=text,

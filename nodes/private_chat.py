@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -18,6 +17,7 @@ from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 from sekaibot.config import ConfigModel
 
+from nodes._activity import get_activity_store
 from nodes._private import (
     clear_session_history,
     get_chat_app,
@@ -60,19 +60,6 @@ class PrivateChatConfig(ConfigModel):
             raise ValueError("image_hash_similarity_threshold must be between 0 and 64")
         return self
 
-    @property
-    def activity_history_limit(self):
-        return math.ceil(
-            max((threshold for _, threshold in self.activity_limits), default=0)
-            / min(self.activity_day_multiplier, self.activity_night_multiplier)
-        )
-
-
-@dataclass
-class ActivityRecord:
-    timestamp: datetime
-    weight: float
-
 
 @dataclass
 class QueuedMessage:
@@ -92,7 +79,6 @@ class SessionQueueState:
     last_enqueue_time: float | None = None
     merge_window_seconds: float = 5
     pending_image_count: int = 0
-    activites: list[ActivityRecord] = field(default_factory=list)
     condition: anyio.Condition = field(default_factory=anyio.Condition)
 
     async def enqueue_text(self, message: str) -> int:
@@ -304,23 +290,17 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
             return self.config.activity_day_multiplier
         return self.config.activity_night_multiplier
 
-    def _is_activity_limited(
-        self, activites: list[ActivityRecord], event_time: int
-    ) -> bool:
-        return any(
-            threshold > 0
-            and window_seconds > 0
-            and sum(
-                activity.weight
-                for activity in activites
-                if event_time - int(activity.timestamp.timestamp()) < window_seconds
-            )
-            >= threshold
-            for window_seconds, threshold in self.config.activity_limits
+    async def _is_activity_limited(self, session_id: str, event_time: int) -> bool:
+        return await get_activity_store().is_limited(
+            scope="private",
+            session_id=session_id,
+            event_time=event_time,
+            activity_limits=self.config.activity_limits,
         )
 
     async def _delete_chat(self, session_id: str) -> None:
         await clear_session_history(session_id)
+        await get_activity_store().clear_session(scope="private", session_id=session_id)
         async with self.node_state.sessions_lock:
             if session_id in self.node_state.sessions:
                 del self.node_state.sessions[session_id]
@@ -460,7 +440,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
             return
 
         try:
-            if self._is_activity_limited(session_state.activites, self.event.time):
+            if await self._is_activity_limited(session_id, self.event.time):
                 await self._record_user_context(
                     messages=messages,
                     session_id=session_id,
@@ -473,17 +453,12 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
                 session_id=session_id,
             )
             if replied:
-                session_state.activites.append(
-                    ActivityRecord(
-                        timestamp=datetime.fromtimestamp(self.event.time, tz=UTC),
-                        weight=self._activity_weight(self.event.time),
-                    )
+                await get_activity_store().record(
+                    scope="private",
+                    session_id=session_id,
+                    event_time=self.event.time,
+                    weight=self._activity_weight(self.event.time),
+                    activity_limits=self.config.activity_limits,
                 )
-                if len(session_state.activites) > self.config.activity_history_limit:
-                    session_state.activites = (
-                        session_state.activites[-self.config.activity_history_limit :]
-                        if self.config.activity_history_limit > 0
-                        else []
-                    )
         finally:
             await session_state.finish_run()
