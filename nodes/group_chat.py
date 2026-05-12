@@ -16,26 +16,19 @@ from _prompt import (
     get_extra_prompt,
 )
 from langchain_core.runnables import Runnable
+from pydantic import model_validator
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.adapter.cqhttp.message import CQHTTPMessageSegment
+from sekaibot.config import ConfigModel
 
-INTERVAL_SECONDS = 40
-ACTIVITY_LIMITS: tuple[tuple[int, int], ...] = (  # (window_seconds, threshold)
-    (300, 20),
-    (3600, 40),
-    (3600 * 5, 100),
-    (3600 * 24 * 7, 500),
-)
-ACTIVITY_HISTORY_LIMIT = max((threshold for _, threshold in ACTIVITY_LIMITS), default=0)
-
-ALLOWED_AUTO_REPLY_GROUPS = {
+BASE_AUTO_REPLY_GROUPS = {
     596488203,
     1011357049,
     1058218429,
     1087911123,
     834922207,
-    648749016,
+    895484096,
 }
 
 BACKUP_MESSAGES_LIMIT = 20
@@ -43,14 +36,27 @@ BACKUP_MESSAGES_LIMIT = 20
 EXTRA_PROMPT_MAX_HISTORY = 5
 
 
-def _is_activity_limited(activites: list[datetime], event_time: int) -> bool:
-    return any(
-        threshold > 0
-        and window_seconds > 0
-        and len(activites) >= threshold
-        and event_time - int(activites[-threshold].timestamp()) < window_seconds
-        for window_seconds, threshold in ACTIVITY_LIMITS
+class GroupChatConfig(ConfigModel):
+    """群聊记录节点配置"""
+
+    __config_name__ = "group_chat"
+
+    auto_reply_groups: set[int] = BASE_AUTO_REPLY_GROUPS
+    interval_seconds: int = 40
+    # (window_seconds, threshold)
+    activity_limits: tuple[tuple[int, int], ...] = (
+        (3600 * 5, 100),
+        (3600 * 24 * 7, 500),
     )
+
+    @model_validator(mode="after")
+    def _add_default_auto_reply_groups(self):
+        self.auto_reply_groups = self.auto_reply_groups.union(BASE_AUTO_REPLY_GROUPS)
+        return self
+
+    @property
+    def activity_history_limit(self):
+        return max((threshold for _, threshold in self.activity_limits), default=0)
 
 
 @dataclass
@@ -90,7 +96,7 @@ def extract(text: str) -> tuple[str | None, str | None, str]:
     return name, time, clean_text.strip()
 
 
-class GroupChat(Node[GroupMessageEvent, GroupChatState, Any]):
+class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
     """群聊记录节点"""
 
     priority = 1
@@ -98,6 +104,19 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, Any]):
     @override
     def __init_state__(self) -> GroupChatState:
         return GroupChatState()
+
+    def _is_activity_limited(
+        self,
+        activites: list[datetime],
+        event_time: int,
+    ) -> bool:
+        return any(
+            threshold > 0
+            and window_seconds > 0
+            and len(activites) >= threshold
+            and event_time - int(activites[-threshold].timestamp()) < window_seconds
+            for window_seconds, threshold in self.config.activity_limits
+        )
 
     def _ensure_state(self) -> None:
         if self.node_state is None:
@@ -130,20 +149,24 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, Any]):
                 -BACKUP_MESSAGES_LIMIT:
             ]
 
-            if _is_activity_limited(history_storage.activites, self.event.time):
+            if self._is_activity_limited(
+                history_storage.activites,
+                self.event.time,
+            ):
                 return None
 
             if history_storage.on_handle:
                 return None
 
             if (
-                self.event.time - history_storage.timestamp <= INTERVAL_SECONDS
+                self.event.time - history_storage.timestamp
+                <= self.config.interval_seconds
                 and not is_tome
                 and "可不" not in text
             ):
                 return None
 
-            if self.event.group_id not in ALLOWED_AUTO_REPLY_GROUPS and not is_tome:
+            if self.event.group_id not in self.config.auto_reply_groups and not is_tome:
                 return None
 
             history_storage.on_handle = True
@@ -221,10 +244,10 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, Any]):
                 history_storage.activites.append(
                     datetime.fromtimestamp(self.event.time, tz=UTC)
                 )
-                if len(history_storage.activites) > ACTIVITY_HISTORY_LIMIT:
+                if len(history_storage.activites) > self.config.activity_history_limit:
                     history_storage.activites = (
-                        history_storage.activites[-ACTIVITY_HISTORY_LIMIT:]
-                        if ACTIVITY_HISTORY_LIMIT > 0
+                        history_storage.activites[-self.config.activity_history_limit :]
+                        if self.config.activity_history_limit > 0
                         else []
                     )
             else:

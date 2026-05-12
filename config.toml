@@ -22,3 +22,31 @@ api_timeout=10
 
 [permission]
 superusers = ["2682064633", "3613158872", "2641460187", "group_596488203", "group_1011357049"]
+
+[node.group_chat]
+auto_reply_groups=[
+    648749016,
+    752699901,
+    913873554,
+    954012874,
+    897593721,
+    1048490205,
+]
+interval_seconds=40
+activity_limits=[
+    [300, 20],
+    [3600, 40],
+    [18000, 100],
+    [604800, 500],
+]
+
+[node.private_chat]
+merge_window_seconds=5
+activity_day=[8,20]
+activity_limits=[
+    [3600, 30],
+    [18000, 80],
+    [604800, 400],
+]
+activity_day_multiplier=0.5
+activity_night_multiplier=1.0

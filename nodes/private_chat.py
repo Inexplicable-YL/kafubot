@@ -14,57 +14,49 @@ from _prompt import (
     get_extra_prompt,
 )
 from langchain_core.runnables import Runnable
+from pydantic import model_validator
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
-
-MERGE_WINDOW_SECONDS = 5.0
-
-ACTIVITY_DAY = (8, 20)  # 8:00-20:00 is considered day time
-ACTIVITY_DAY_MULTIPLIER = 0.5
-ACTIVITY_NIGHT_MULTIPLIER = 1.0
-ACTIVITY_LIMITS: tuple[tuple[int, int], ...] = (  # (window_seconds, threshold)
-    (3600, 40),
-    (3600 * 5, 100),
-    (3600 * 24 * 7, 450),
-)
-if ACTIVITY_DAY_MULTIPLIER <= 0 or ACTIVITY_NIGHT_MULTIPLIER <= 0:
-    raise ValueError("activity multipliers must be positive")
+from sekaibot.config import ConfigModel
 
 
-ACTIVITY_HISTORY_LIMIT = math.ceil(
-    max((threshold for _, threshold in ACTIVITY_LIMITS), default=0)
-    / min(ACTIVITY_DAY_MULTIPLIER, ACTIVITY_NIGHT_MULTIPLIER)
-)
+class PrivateChatConfig(ConfigModel):
+    """私聊记录节点配置"""
+
+    __config_name__ = "private_chat"
+    merge_window_seconds: float = 5
+    activity_day: tuple[int, int] = (8, 20)  # 8:00-20:00 is considered day time
+    # (window_seconds, threshold)
+    activity_limits: tuple[tuple[int, int], ...] = (
+        (3600 * 5, 100),
+        (3600 * 24 * 7, 450),
+    )
+    activity_day_multiplier: float = 0.5
+    activity_night_multiplier: float = 1.0
+
+    @model_validator(mode="after")
+    def _validate_activity_limits(self):
+        if any(
+            threshold < 0 or window_seconds < 0
+            for window_seconds, threshold in self.activity_limits
+        ):
+            raise ValueError(
+                "activity limits must have non-negative window and threshold"
+            )
+        return self
+
+    @property
+    def activity_history_limit(self):
+        return math.ceil(
+            max((threshold for _, threshold in self.activity_limits), default=0)
+            / min(self.activity_day_multiplier, self.activity_night_multiplier)
+        )
 
 
 @dataclass
 class ActivityRecord:
     timestamp: datetime
     weight: float
-
-
-def _activity_weight(event_time: int) -> float:
-    background_time = datetime.fromtimestamp(
-        event_time,
-        tz=UTC,
-    ).astimezone(ZoneInfo("Asia/Shanghai"))
-    if ACTIVITY_DAY[0] <= background_time.hour < ACTIVITY_DAY[1]:
-        return ACTIVITY_DAY_MULTIPLIER
-    return ACTIVITY_NIGHT_MULTIPLIER
-
-
-def _is_activity_limited(activites: list[ActivityRecord], event_time: int) -> bool:
-    return any(
-        threshold > 0
-        and window_seconds > 0
-        and sum(
-            activity.weight
-            for activity in activites
-            if event_time - int(activity.timestamp.timestamp()) < window_seconds
-        )
-        >= threshold
-        for window_seconds, threshold in ACTIVITY_LIMITS
-    )
 
 
 @dataclass
@@ -78,7 +70,7 @@ class SessionQueueState:
     pending_messages: list[str] = field(default_factory=list)
     latest_waiter_id: int = 0
     last_enqueue_time: float | None = None
-    merge_window_seconds: float = MERGE_WINDOW_SECONDS
+    merge_window_seconds: float = 5
     activites: list[ActivityRecord] = field(default_factory=list)
     condition: anyio.Condition = field(default_factory=anyio.Condition)
 
@@ -146,13 +138,43 @@ class PrivateReplyState:
     sessions_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
 
-class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: ignore
+class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig]):  # type: ignore
     priority = 1
+
+    def _activity_weight(self, event_time: int) -> float:
+        background_time = datetime.fromtimestamp(
+            event_time,
+            tz=UTC,
+        ).astimezone(ZoneInfo("Asia/Shanghai"))
+        if (
+            self.config.activity_day[0]
+            <= background_time.hour
+            < self.config.activity_day[1]
+        ):
+            return self.config.activity_day_multiplier
+        return self.config.activity_night_multiplier
+
+    def _is_activity_limited(
+        self, activites: list[ActivityRecord], event_time: int
+    ) -> bool:
+        return any(
+            threshold > 0
+            and window_seconds > 0
+            and sum(
+                activity.weight
+                for activity in activites
+                if event_time - int(activity.timestamp.timestamp()) < window_seconds
+            )
+            >= threshold
+            for window_seconds, threshold in self.config.activity_limits
+        )
 
     async def _get_session_state(self, session_id: str) -> SessionQueueState:
         async with self.node_state.sessions_lock:
             if session_id not in self.node_state.sessions:
-                self.node_state.sessions[session_id] = SessionQueueState()
+                self.node_state.sessions[session_id] = SessionQueueState(
+                    merge_window_seconds=self.config.merge_window_seconds
+                )
             return self.node_state.sessions[session_id]
 
     async def _delete_conversation(self, session_id: str) -> None:
@@ -223,7 +245,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
         name = name_map.get(name, name)
 
         session_state = await self._get_session_state(session_id)
-        if _is_activity_limited(session_state.activites, self.event.time):
+        if self._is_activity_limited(session_state.activites, self.event.time):
             return
 
         decision = await session_state.enqueue(text)
@@ -242,13 +264,13 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, Any]):  # type: 
                 session_state.activites.append(
                     ActivityRecord(
                         timestamp=datetime.fromtimestamp(self.event.time, tz=UTC),
-                        weight=_activity_weight(self.event.time),
+                        weight=self._activity_weight(self.event.time),
                     )
                 )
-                if len(session_state.activites) > ACTIVITY_HISTORY_LIMIT:
+                if len(session_state.activites) > self.config.activity_history_limit:
                     session_state.activites = (
-                        session_state.activites[-ACTIVITY_HISTORY_LIMIT:]
-                        if ACTIVITY_HISTORY_LIMIT > 0
+                        session_state.activites[-self.config.activity_history_limit :]
+                        if self.config.activity_history_limit > 0
                         else []
                     )
         finally:
