@@ -24,6 +24,7 @@ dependencies = [
     "anyio==4.9.0",
     "docker==7.1.0",
     "exceptiongroup==1.2.2",
+    "imagehash>=4.3.2",
     "pyahocorasick==2.1.0",
     "pydantic==2.11.3",
     "pygtrie==2.5.0",

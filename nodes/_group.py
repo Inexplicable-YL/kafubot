@@ -27,9 +27,9 @@ from langchain_core.runnables.branch import RunnableBranch
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_deepseek import ChatDeepSeek
 from pydantic import BaseModel, TypeAdapter
-from sqlalchemy import Column, DateTime, Integer, Text, delete, select
+from sqlalchemy import DateTime, Integer, Text, delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -117,18 +117,31 @@ class AssistantReply(BaseModel):
         return AssistantReply(timestamp=self.timestamp, text=self.text + other.text)
 
 
-class ChatMessageRecord(declarative_base()):
+class ChatMessageBase(DeclarativeBase):
+    pass
+
+
+class ChatMessageRecord(ChatMessageBase):
     __tablename__ = TABLE_NAME
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    session_id = Column(Text, index=True, nullable=False)
-    role = Column(Text, nullable=False)
-    content = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False)
-    user_timestamp = Column(DateTime(timezone=True), nullable=True)
-    user_name = Column(Text, nullable=True)
-    user_text = Column(Text, nullable=True)
-    assistant_timestamp = Column(DateTime(timezone=True), nullable=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(Text, index=True, nullable=False)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    user_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    user_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    assistant_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
 
 class MessageConverter(BaseMessageConverter):
@@ -137,11 +150,11 @@ class MessageConverter(BaseMessageConverter):
 
     @override
     def from_sql_model(self, sql_message: ChatMessageRecord) -> BaseMessage:
-        role = cast("str", sql_message.role)
+        role = sql_message.role
         if role == "human":
-            user_timestamp = cast("datetime | None", sql_message.user_timestamp)
-            user_name = cast("str | None", sql_message.user_name)
-            user_text = cast("str | None", sql_message.user_text)
+            user_timestamp = sql_message.user_timestamp
+            user_name = sql_message.user_name
+            user_text = sql_message.user_text
             if (
                 user_timestamp is not None
                 and user_name is not None
@@ -162,9 +175,9 @@ class MessageConverter(BaseMessageConverter):
                         }
                     },
                 )
-            return HumanMessage(content=cast("str", sql_message.content))
+            return HumanMessage(content=sql_message.content)
         if role == "ai":
-            return AIMessage(content=cast("str", sql_message.content))
+            return AIMessage(content=sql_message.content)
         raise ValueError(f"Unknown message role: {role}")
 
     @override
@@ -560,76 +573,3 @@ def get_agent_app() -> Runnable[dict[str, Any], None | AssistantReply]:
         (decision_app, chat_app),
         lambda _: None,
     )
-
-
-if __name__ == "__main__":
-
-    async def main() -> None:
-        if not os.getenv("DEEPSEEK_API_KEY"):
-            raise RuntimeError("DEEPSEEK_API_KEY is required")
-
-        agent_app = get_agent_app()
-
-        session_id = "group-chat-001"
-
-        messages1 = [
-            {
-                "timestamp": "2026-05-10T08:00:00",
-                "user": "张三",
-                "text": "又是早八。",
-            },
-            {
-                "timestamp": "2026-05-10T08:03:08",
-                "user": "李四",
-                "text": "好累啊，不想去上班了。",
-            },
-            {
-                "timestamp": "2026-05-10T08:07:15",
-                "user": "王五",
-                "text": "早上连饭都没来得及吃。",
-            },
-        ]
-        messages2 = [
-            {
-                "timestamp": "2026-05-10T08:10:00",
-                "user": "张三",
-                "text": "如果没有可不的歌，真的活不下去了。还好有歌听。",
-            }
-        ]
-
-        reply1: AssistantReply | None = None
-        async for reply in agent_app.astream(
-            {
-                "messages": messages1,
-                "now_time": "2026-05-10 08:08:00",
-                "thinking": True,
-                "reasoning_effort": "high",
-                "is_tome": True,
-            },
-            config={"configurable": {"session_id": session_id}},
-        ):
-            if reply is not None:
-                print(reply.text, end="")
-                reply1 = reply if reply1 is None else reply1 + reply
-        if reply1 is not None:
-            messages1 = []
-            print("First round reply:", reply1.model_dump_json(indent=2))
-
-        reply2: AssistantReply | None = None
-        async for reply in agent_app.astream(
-            {
-                "messages": messages1 + messages2,
-                "now_time": "2026-05-10 08:11:00",
-                "thinking": True,
-                "reasoning_effort": "high",
-                "is_tome": False,
-            },
-            config={"configurable": {"session_id": session_id}},
-        ):
-            if reply is not None:
-                print(reply.text, end="")
-                reply2 = reply if reply2 is None else reply2 + reply
-        if reply2 is not None:
-            print("Second round reply:", reply2.model_dump_json(indent=2))
-
-    asyncio.run(main())

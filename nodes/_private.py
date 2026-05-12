@@ -20,9 +20,9 @@ from langchain_core.runnables import (
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_deepseek import ChatDeepSeek
 from pydantic import TypeAdapter
-from sqlalchemy import Column, Integer, Text, delete, select
+from sqlalchemy import Integer, Text, delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -54,13 +54,17 @@ def content_to_text(content: Any) -> str:
     return str(content)
 
 
-class ChatMessageRecord(declarative_base()):
+class ChatMessageBase(DeclarativeBase):
+    pass
+
+
+class ChatMessageRecord(ChatMessageBase):
     __tablename__ = TABLE_NAME
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    session_id = Column(Text, index=True, nullable=False)
-    role = Column(Text, nullable=False)
-    content = Column(Text, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(Text, index=True, nullable=False)
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class MessageConverter(BaseMessageConverter):
@@ -69,11 +73,11 @@ class MessageConverter(BaseMessageConverter):
 
     @override
     def from_sql_model(self, sql_message: ChatMessageRecord) -> BaseMessage:
-        role = cast("str", sql_message.role)
+        role = sql_message.role
         if role == "human":
-            return HumanMessage(content=cast("str", sql_message.content))
+            return HumanMessage(content=sql_message.content)
         if role == "ai":
-            return AIMessage(content=cast("str", sql_message.content))
+            return AIMessage(content=sql_message.content)
         raise ValueError(f"Unknown message role: {role}")
 
     @override
@@ -189,10 +193,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:
 
         return {
             **prompt_variables,
-            "current_messages": [
-                HumanMessage(content=message)
-                for message in messages
-            ],
+            "current_messages": [HumanMessage(content=message) for message in messages],
             "thinking": bool(payload.get("thinking", False)),
             "reasoning_effort": reasoning_effort,
         }

@@ -9,7 +9,7 @@ adapter_max_retries = 30
 
 [bot.log]
 # 这里是 KafuBot 自身日志相关的配置
-level = "DEBUG"
+level = "INFO"
 verbose_exception = true
 
 [adapter.cqhttp]
@@ -31,6 +31,8 @@ auto_reply_groups=[
     954012874,
     897593721,
     1048490205,
+    172844144,
+    565525468,
 ]
 interval_seconds=40
 activity_limits=[

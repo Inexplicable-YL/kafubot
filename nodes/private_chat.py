@@ -6,12 +6,17 @@ from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 import anyio
-from _image import get_image_analyzer, read_image_as_base64
-from _private_chat import (
+import imagehash
+from _image import ImageReadResult, get_image_analyzer, read_image
+from nodes._private import (
     clear_session_history,
     get_chat_app,
+    get_session_history,
 )
 from _prompt import get_extra_prompt
+from anyio.abc import TaskGroup
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+from langchain_core.messages import HumanMessage
 from langchain_core.runnables import Runnable
 from pydantic import model_validator
 from sekaibot import Node
@@ -28,6 +33,8 @@ class PrivateChatConfig(ConfigModel):
 
     __config_name__ = "private_chat"
     merge_window_seconds: float = 5
+    image_analyzer_workers: int = 10
+    image_hash_similarity_threshold: int = 5
     activity_day: tuple[int, int] = (8, 20)  # 8:00-20:00 is considered day time
     # (window_seconds, threshold)
     activity_limits: tuple[tuple[int, int], ...] = (
@@ -46,6 +53,10 @@ class PrivateChatConfig(ConfigModel):
             raise ValueError(
                 "activity limits must have non-negative window and threshold"
             )
+        if self.image_analyzer_workers < 1:
+            raise ValueError("image_analyzer_workers must be positive")
+        if not 0 <= self.image_hash_similarity_threshold <= 64:  # noqa: PLR2004
+            raise ValueError("image_hash_similarity_threshold must be between 0 and 64")
         return self
 
     @property
@@ -63,23 +74,84 @@ class ActivityRecord:
 
 
 @dataclass
+class QueuedMessage:
+    content: str | None = None
+    has_text: bool = False
+    timestamp_text: str = ""
+    image_hash: imagehash.ImageHash | None = None
+    pending_image: bool = False
+    dropped: bool = False
+
+
+@dataclass
 class SessionQueueState:
     running: bool = False
-    pending_messages: list[str] = field(default_factory=list)
+    pending_messages: list[QueuedMessage] = field(default_factory=list)
     latest_waiter_id: int = 0
     last_enqueue_time: float | None = None
     merge_window_seconds: float = 5
+    pending_image_count: int = 0
     activites: list[ActivityRecord] = field(default_factory=list)
     condition: anyio.Condition = field(default_factory=anyio.Condition)
 
-    async def enqueue(self, message: str) -> int:
+    async def enqueue_text(self, message: str) -> int:
         async with self.condition:
-            self.pending_messages.append(message)
+            self.pending_messages.append(QueuedMessage(content=message, has_text=True))
             self.latest_waiter_id += 1
             self.last_enqueue_time = anyio.current_time()
             waiter_id = self.latest_waiter_id
             self.condition.notify_all()
             return waiter_id
+
+    async def enqueue_image_if_unique(
+        self,
+        timestamp_text: str,
+        image_hash: imagehash.ImageHash,
+        similarity_threshold: int,
+    ) -> tuple[int, QueuedMessage] | None:
+        async with self.condition:
+            if self.has_similar_image_locked(image_hash, similarity_threshold):
+                return None
+            message = QueuedMessage(
+                timestamp_text=timestamp_text,
+                image_hash=image_hash,
+                pending_image=True,
+            )
+            self.pending_messages.append(message)
+            self.pending_image_count += 1
+            self.latest_waiter_id += 1
+            self.last_enqueue_time = anyio.current_time()
+            waiter_id = self.latest_waiter_id
+            self.condition.notify_all()
+            return waiter_id, message
+
+    def has_similar_image_locked(
+        self,
+        image_hash: imagehash.ImageHash,
+        similarity_threshold: int,
+    ) -> bool:
+        return any(
+            message.image_hash is not None
+            and not message.dropped
+            and message.image_hash - image_hash <= similarity_threshold
+            for message in self.pending_messages
+        )
+
+    async def finish_image(
+        self,
+        message: QueuedMessage,
+        abstract: str | None,
+    ) -> None:
+        async with self.condition:
+            if message.pending_image:
+                message.pending_image = False
+                self.pending_image_count = max(0, self.pending_image_count - 1)
+            if abstract:
+                message.content = f"{message.timestamp_text}[图片: {abstract}]"
+            else:
+                message.dropped = True
+                message.content = None
+            self.condition.notify_all()
 
     async def wait_and_claim(self, waiter_id: int) -> list[str] | None:
         async with self.condition:
@@ -100,11 +172,31 @@ class SessionQueueState:
                             await self.condition.wait()
                         # Recalculate on next iteration if timeout fired
                         continue
+                    if self.pending_image_count > 0:
+                        await self.condition.wait()
+                        continue
 
-                    merged_message = self.pending_messages.copy()
+                    pending_messages = self.pending_messages.copy()
+                    has_text = any(
+                        message.has_text and not message.dropped
+                        for message in pending_messages
+                    )
+                    merged_messages = [
+                        message.content
+                        for message in pending_messages
+                        if not message.dropped and message.content is not None
+                    ]
+                    if not has_text:
+                        if not merged_messages:
+                            self.pending_messages.clear()
+                            self.condition.notify_all()
+                            return []
+                        await self.condition.wait()
+                        continue
+
                     self.pending_messages.clear()
                     self.running = True
-                    return merged_message
+                    return merged_messages
 
                 await self.condition.wait()
 
@@ -112,6 +204,14 @@ class SessionQueueState:
         async with self.condition:
             self.running = False
             self.condition.notify_all()
+
+
+@dataclass(frozen=True)
+class ImageAnalyzeJob:
+    session_state: SessionQueueState
+    message: QueuedMessage
+    image: str
+    phash: imagehash.ImageHash
 
 
 @dataclass
@@ -123,6 +223,20 @@ class PrivateReplyState:
     backup_histories: dict[str, list[str]] = field(default_factory=dict)
     sessions: dict[str, SessionQueueState] = field(default_factory=dict)
     sessions_lock: anyio.Lock = field(default_factory=anyio.Lock)
+    image_worker_lock: anyio.Lock = field(default_factory=anyio.Lock)
+    image_worker_task_group: TaskGroup | None = None
+    image_worker_count: int = 0
+    image_job_send_stream: MemoryObjectSendStream[ImageAnalyzeJob] = field(init=False)
+    image_job_receive_stream: MemoryObjectReceiveStream[ImageAnalyzeJob] = field(
+        init=False
+    )
+
+    def __post_init__(self) -> None:
+        send_stream, receive_stream = anyio.create_memory_object_stream[
+            ImageAnalyzeJob
+        ](100)
+        self.image_job_send_stream = send_stream
+        self.image_job_receive_stream = receive_stream
 
 
 class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig]):  # type: ignore
@@ -130,6 +244,51 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
 
     def __init_state__(self) -> PrivateReplyState:
         return PrivateReplyState()
+
+    def _event_timestamp_text(self) -> str:
+        return f"[{datetime.fromtimestamp(self.event.time, tz=UTC).astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')}]"
+
+    async def _get_session_state(self, session_id: str) -> SessionQueueState:
+        async with self.node_state.sessions_lock:
+            if session_id not in self.node_state.sessions:
+                self.node_state.sessions[session_id] = SessionQueueState(
+                    merge_window_seconds=self.config.merge_window_seconds
+                )
+            return self.node_state.sessions[session_id]
+
+    @staticmethod
+    async def _image_worker(node_state: PrivateReplyState) -> None:
+        async with node_state.image_job_receive_stream.clone() as receive_stream:
+            async for job in receive_stream:
+                abstract: str | None = None
+                try:
+                    result = await node_state.image_analyzer.ainvoke(
+                        {
+                            "image": job.image,
+                            "phash": job.phash,
+                            "detail": False,
+                        }
+                    )
+                    abstract = result or None
+                except Exception:
+                    abstract = None
+                await job.session_state.finish_image(job.message, abstract)
+
+    async def _ensure_image_workers(self) -> None:
+        async with self.node_state.image_worker_lock:
+            if self.node_state.image_worker_task_group is None:
+                self.node_state.image_worker_task_group = anyio.create_task_group()
+                await self.node_state.image_worker_task_group.__aenter__()
+                self.node_state.image_worker_count = 0
+
+            for _ in range(
+                self.config.image_analyzer_workers - self.node_state.image_worker_count
+            ):
+                self.node_state.image_worker_task_group.start_soon(
+                    self._image_worker,
+                    self.node_state,
+                )
+                self.node_state.image_worker_count += 1
 
     def _activity_weight(self, event_time: int) -> float:
         background_time = datetime.fromtimestamp(
@@ -166,11 +325,23 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
                 del self.node_state.sessions[session_id]
         await self.reply("[SYSTEM]已清除对话历史。")
 
+    async def _record_user_context(self, messages: list[str], session_id: str) -> None:
+        self.node_state.backup_histories.setdefault(session_id, [])
+        joined_messages = "\n".join(messages)
+        self.node_state.backup_histories[session_id].append(joined_messages)
+        self.node_state.backup_histories[session_id] = self.node_state.backup_histories[
+            session_id
+        ][-BACKUP_MESSAGES_LIMIT:]
+        await get_session_history(session_id).aadd_messages(
+            [HumanMessage(content=message) for message in messages]
+        )
+
     async def _run_chat(self, messages: list[str], name: str, session_id: str) -> bool:
         self.node_state.backup_histories.setdefault(session_id, [])
         self.node_state.backup_histories[session_id].append("\n".join(messages))
         replied = False
         answer = ""
+        print(f"Invoking: {messages}")
         async for reply in self.node_state.chat_app.astream(
             {
                 "messages": messages,
@@ -191,6 +362,7 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
             config={"configurable": {"session_id": session_id}},
         ):
             if reply is not None:
+                print(f"Reply-Private: {reply}")
                 await self.reply(reply)
                 answer += reply
                 replied = True
@@ -201,44 +373,50 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
         ][-BACKUP_MESSAGES_LIMIT:]
         return replied
 
-    async def get_image(self, file: str) -> str | None:
+    async def get_image(self, file: str) -> ImageReadResult | None:
         try:
             result: dict[str, str] = await self.event.adapter.call_api(
                 "get_image", file=file
             )
             path, url = result.get("file"), result.get("url")
             if path is not None:
-                return await read_image_as_base64(path, url)
+                return await read_image(path, url)
         except Exception:
             return None
         return None
 
     @override
     async def handle(self) -> None:
-        text = self.event.get_plain_text()
-        if not text:
+        raw_text = self.event.get_plain_text()
+        timestamp_text = self._event_timestamp_text()
+        session_id = self.event.get_session_id()
+        text: str | None = None
+        image: ImageReadResult | None = None
+
+        if raw_text:
+            text = timestamp_text + raw_text
+
+            keyws = [
+                "clear",
+                "清除",
+                "清空",
+                "清理",
+                "删除",
+                "重置",
+                "重新开始",
+                "重启",
+            ]
+            if any(keyw in text for keyw in keyws):
+                await self._delete_chat(session_id=session_id)
+                return
+        else:
             file: str | None = None
             if len(self.event.message) == 1 and self.event.message[0].type == "image":
                 file = self.event.message[0].data.get("file")
             if file is not None:
-                base64 = await self.get_image(file)
-                print(
-                    f"base64: {base64[:100]}..."
-                    if base64
-                    else "No image found or failed to read image."
-                )
-            return
-        text = (
-            f"[{datetime.fromtimestamp(self.event.time, tz=UTC).astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')}]"
-            + text
-        )
-
-        session_id = self.event.get_session_id()
-
-        keyws = ["clear", "清除", "清空", "清理", "删除", "重置", "重新开始", "重启"]
-        if any(keyw in text for keyw in keyws):
-            await self._delete_chat(session_id=session_id)
-            return
+                image = await self.get_image(file)
+            if image is None:
+                return
 
         name_map: dict[str, str] = {
             "shiroko": "白子小姐",
@@ -248,23 +426,46 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
         name: str = self.event.sender.nickname or ""
         name = name_map.get(name, name)
 
-        async with self.node_state.sessions_lock:
-            if session_id not in self.node_state.sessions:
-                self.node_state.sessions[session_id] = SessionQueueState(
-                    merge_window_seconds=self.config.merge_window_seconds
-                )
-            session_state = self.node_state.sessions[session_id]
+        session_state = await self._get_session_state(session_id)
 
-        if self._is_activity_limited(session_state.activites, self.event.time):
+        if text is not None:
+            decision = await session_state.enqueue_text(text)
+        elif image is not None:
+            await self._ensure_image_workers()
+            image_enqueue_result = await session_state.enqueue_image_if_unique(
+                timestamp_text=timestamp_text,
+                image_hash=image.phash,
+                similarity_threshold=self.config.image_hash_similarity_threshold,
+            )
+            if image_enqueue_result is None:
+                return
+            decision, image_message = image_enqueue_result
+            try:
+                await self.node_state.image_job_send_stream.send(
+                    ImageAnalyzeJob(
+                        session_state=session_state,
+                        message=image_message,
+                        image=image.base64,
+                        phash=image.phash,
+                    )
+                )
+            except Exception:
+                await session_state.finish_image(image_message, None)
+        else:
             return
 
-        decision = await session_state.enqueue(text)
-
         messages = await session_state.wait_and_claim(decision)
-        if messages is None:
+        if not messages:
             return
 
         try:
+            if self._is_activity_limited(session_state.activites, self.event.time):
+                await self._record_user_context(
+                    messages=messages,
+                    session_id=session_id,
+                )
+                return
+
             replied = await self._run_chat(
                 messages=messages,
                 name=name,

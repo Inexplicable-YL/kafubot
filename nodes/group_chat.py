@@ -6,7 +6,7 @@ from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 import anyio
-from _group_chat import (
+from nodes._group import (
     AssistantReply,
     get_agent_app,
 )
@@ -198,7 +198,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             config={"configurable": {"session_id": session_id}},
         ):
             if reply is not None:
-                print(f"Agent reply: {reply.text}")
+                print(f"Reply-Group: {reply.text}")
                 name, time, text = extract(reply.text)
                 user_id: int | None = None
                 message_id: int | None = None
