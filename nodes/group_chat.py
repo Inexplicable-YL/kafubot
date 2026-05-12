@@ -6,10 +6,6 @@ from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 import anyio
-from nodes._group import (
-    AssistantReply,
-    get_agent_app,
-)
 from _prompt import (
     MORE_SENTENCE_REPLY_PROMPT,
     ONE_SENTENCE_REPLY_PROMPT,
@@ -19,8 +15,13 @@ from langchain_core.runnables import Runnable
 from pydantic import model_validator
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent
-from sekaibot.adapter.cqhttp.message import CQHTTPMessageSegment
+from sekaibot.adapter.cqhttp.message import CQHTTPMessage, CQHTTPMessageSegment
 from sekaibot.config import ConfigModel
+
+from nodes._group import (
+    AssistantReply,
+    get_agent_app,
+)
 
 BASE_AUTO_REPLY_GROUPS = {
     596488203,
@@ -34,6 +35,42 @@ BASE_AUTO_REPLY_GROUPS = {
 BACKUP_MESSAGES_LIMIT = 20
 
 EXTRA_PROMPT_MAX_HISTORY = 5
+
+
+@dataclass
+class Segment:
+    type: str
+    data: dict[str, Any] = field(default_factory=dict)  # 修正为 dict
+
+
+def parse_message(text: str) -> tuple[list[Segment], str]:
+    segments = []
+    pattern = re.compile(r"\[MSG:[^\]]*\]")
+
+    def replacer(match: re.Match) -> str:
+        block = match.group(0)
+        inner = block[5:-1]
+        if "," in inner:
+            type_part, params_str = inner.split(",", 1)
+        else:
+            type_part = inner
+            params_str = ""
+        typ = type_part.strip()
+        if not typ:
+            seg = None
+        data = {}
+        if params_str:
+            params_with_end = params_str.strip() + ","
+            pairs = re.findall(r"([^\s,=]+)\s*=\s*([^,]*?)\s*(?=,)", params_with_end)
+            data = {k.strip(): v.strip() for k, v in pairs}
+        seg = Segment(type=typ, data=data)
+        if seg:
+            segments.append(seg)
+            return ""
+        return block
+
+    clean_text = pattern.sub(replacer, text)
+    return segments, clean_text
 
 
 class GroupChatConfig(ConfigModel):
@@ -76,24 +113,6 @@ class GroupChatState:
     )
     storages: dict[str, Histories] = field(default_factory=dict)
     storages_lock: anyio.Lock = field(default_factory=anyio.Lock)
-
-
-def extract(text: str) -> tuple[str | None, str | None, str]:
-    at_pattern = re.compile(r"\[MSG:at\b[^\]]*?\bname=([^,\]]+)")
-    reply_pattern = re.compile(r"\[MSG:reply\b[^\]]*?\btime=([^,\]]+)")
-    at_remove = re.compile(r"\[MSG:at\b[^\]]*\]")
-    reply_remove = re.compile(r"\[MSG:reply\b[^\]]*\]")
-    name = None
-    at_match = at_pattern.search(text)
-    if at_match:
-        name = str(at_match.group(1)).strip()
-    time = None
-    reply_match = reply_pattern.search(text)
-    if reply_match:
-        time = str(reply_match.group(1)).strip()
-    clean_text = at_remove.sub("", text)
-    clean_text = reply_remove.sub("", clean_text)
-    return name, time, clean_text.strip()
 
 
 class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
@@ -199,27 +218,37 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         ):
             if reply is not None:
                 print(f"Reply-Group: {reply.text}")
-                name, time, text = extract(reply.text)
-                user_id: int | None = None
-                message_id: int | None = None
-                if name:
-                    for item in current_messages:
-                        if item["user"] == name:
-                            user_id = int(item["user_id"])
-                            break
-                if time:
-                    for item in current_messages:
-                        t = cast("datetime", item["timestamp"]).astimezone(
-                            ZoneInfo("Asia/Shanghai")
-                        )
-                        if t.strftime("%H:%M:%S") in time:
-                            message_id = int(item["message_id"])
-                            break
-                message = ""
-                if user_id:
-                    message += CQHTTPMessageSegment.at(user_id) + " "
-                if message_id:
-                    message += CQHTTPMessageSegment.reply(message_id)
+                segments, text = parse_message(reply.text)
+                message: CQHTTPMessage | str = ""
+                for seg in segments:
+                    if seg.type == "at" and "name" in seg.data:
+                        if name := seg.data["name"]:
+                            for item in current_messages:
+                                if item["user"] == name:
+                                    user_id = int(item["user_id"])
+                                    message += CQHTTPMessageSegment.at(user_id) + " "
+                                    break
+                    elif seg.type == "reply" and "time" in seg.data:
+                        have_reply = False
+                        if isinstance(message, CQHTTPMessage):
+                            for item in message:
+                                if (
+                                    isinstance(item, CQHTTPMessageSegment)
+                                    and item.type == "reply"
+                                ):
+                                    have_reply = True
+                                    break
+                        if not have_reply and (time := seg.data["time"]):
+                            for item in current_messages:
+                                t = cast("datetime", item["timestamp"]).astimezone(
+                                    ZoneInfo("Asia/Shanghai")
+                                )
+                                if t.strftime("%H:%M:%S") in time:
+                                    message_id = int(item["message_id"])
+                                    message += CQHTTPMessageSegment.reply(message_id)
+                                    break
+                    else:
+                        continue
                 await self.reply(message + text)
                 replied = True
         return replied

@@ -8,11 +8,6 @@ from zoneinfo import ZoneInfo
 import anyio
 import imagehash
 from _image import ImageReadResult, get_image_analyzer, read_image
-from nodes._private import (
-    clear_session_history,
-    get_chat_app,
-    get_session_history,
-)
 from _prompt import get_extra_prompt
 from anyio.abc import TaskGroup
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -22,6 +17,12 @@ from pydantic import model_validator
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 from sekaibot.config import ConfigModel
+
+from nodes._private import (
+    clear_session_history,
+    get_chat_app,
+    get_session_history,
+)
 
 BACKUP_MESSAGES_LIMIT = 10
 
