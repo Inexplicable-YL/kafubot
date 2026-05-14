@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -6,11 +5,6 @@ from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 import anyio
-from _prompt import (
-    MORE_SENTENCE_REPLY_PROMPT,
-    ONE_SENTENCE_REPLY_PROMPT,
-    get_extra_prompt,
-)
 from langchain_core.runnables import Runnable
 from pydantic import model_validator
 from sekaibot import Node
@@ -23,6 +17,13 @@ from nodes._group import (
     AssistantReply,
     get_agent_app,
 )
+from nodes._image import search_meme
+from nodes._prompt import (
+    MORE_SENTENCE_REPLY_PROMPT,
+    ONE_SENTENCE_REPLY_PROMPT,
+    get_extra_prompt,
+)
+from nodes._public_tools import parse_message
 
 BASE_AUTO_REPLY_GROUPS = {
     596488203,
@@ -36,42 +37,6 @@ BASE_AUTO_REPLY_GROUPS = {
 BACKUP_MESSAGES_LIMIT = 20
 
 EXTRA_PROMPT_MAX_HISTORY = 5
-
-
-@dataclass
-class Segment:
-    type: str
-    data: dict[str, Any] = field(default_factory=dict)  # 修正为 dict
-
-
-def parse_message(text: str) -> tuple[list[Segment], str]:
-    segments = []
-    pattern = re.compile(r"\[MSG:[^\]]*\]")
-
-    def replacer(match: re.Match) -> str:
-        block = match.group(0)
-        inner = block[5:-1]
-        if "," in inner:
-            type_part, params_str = inner.split(",", 1)
-        else:
-            type_part = inner
-            params_str = ""
-        typ = type_part.strip()
-        if not typ:
-            seg = None
-        data = {}
-        if params_str:
-            params_with_end = params_str.strip() + ","
-            pairs = re.findall(r"([^\s,=]+)\s*=\s*([^,]*?)\s*(?=,)", params_with_end)
-            data = {k.strip(): v.strip() for k, v in pairs}
-        seg = Segment(type=typ, data=data)
-        if seg:
-            segments.append(seg)
-            return ""
-        return block
-
-    clean_text = pattern.sub(replacer, text)
-    return segments, clean_text
 
 
 class GroupChatConfig(ConfigModel):
@@ -152,7 +117,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 -BACKUP_MESSAGES_LIMIT:
             ]
 
-            if await self._is_activity_limited(session_id, self.event.time):
+            if session_id not in BASE_AUTO_REPLY_GROUPS and (
+                await self._is_activity_limited(session_id, self.event.time)
+            ):
                 return None
 
             if history_storage.on_handle:
@@ -207,7 +174,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         ):
             if reply is not None:
                 print(f"Reply-Group: {reply.text}")
-                segments, text = parse_message(reply.text)
+                segments, text = parse_message(reply.text.strip())
                 message: CQHTTPMessage | str = ""
                 for seg in segments:
                     if seg.type == "at" and "name" in seg.data:
@@ -236,9 +203,22 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                                     message_id = int(item["message_id"])
                                     message += CQHTTPMessageSegment.reply(message_id)
                                     break
+                    elif seg.type == "meme" and "content" in seg.data:
+                        content = seg.data["content"]
+                        meme_result = await search_meme(
+                            content, temperature=0, max_score=1.5
+                        )
+                        if meme_result:
+                            message += CQHTTPMessageSegment.image(
+                                meme_result.base64, sub_type=1
+                            )
+                            await self.reply(message)
+                            message = ""
                     else:
                         continue
-                await self.reply(message + text)
+                message += text
+                if message:
+                    await self.reply(message)
                 replied = True
         return replied
 

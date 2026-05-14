@@ -11,17 +11,22 @@ from typing import Any
 
 import aiofiles  # type: ignore[import-untyped]
 import aiohttp
+import anyio
+import chromadb
 import imagehash
+import numpy as np
 from _prompt import (
     IMAGE_BRIEF_SYSTEM_PROMPT,
     IMAGE_DETAIL_SYSTEM_PROMPT,
 )
 from dotenv import load_dotenv
+from langchain_chroma import Chroma
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableBranch, RunnableLambda
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from PIL import Image, ImageOps
+from pydantic import SecretStr
 from sqlalchemy import DateTime, Integer, Text, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -44,6 +49,17 @@ IMAGE_ANALYSIS_CACHE_MAX_RECORDS = int(
 )
 IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE = int(
     os.getenv("IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE", "5")
+)
+
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./meme_vectordb")
+
+persistent_client = chromadb.PersistentClient(path=CHROMA_PATH)
+vectorstore = Chroma(
+    client=persistent_client,
+    collection_name="meme_analysis",
+    embedding_function=OpenAIEmbeddings(
+        model="text-embedding-3-large", base_url=os.getenv("OPENAI_BASE_URL")
+    ),
 )
 
 
@@ -352,62 +368,35 @@ async def read_image(path: str, url: str | None = None) -> ImageReadResult | Non
     return await asyncio.to_thread(convert)
 
 
-def get_image_analyzer() -> Runnable[dict[str, Any], str]:
-    cache = ImageAnalysisCache(max_records=IMAGE_ANALYSIS_CACHE_MAX_RECORDS)
+def _normalize_phash(value: Any) -> imagehash.ImageHash | None:
+    if isinstance(value, imagehash.ImageHash):
+        return value
+    if isinstance(value, str) and value:
+        with contextlib.suppress(Exception):
+            return imagehash.hex_to_hash(value)
+    return None
 
-    def _normalize_phash(value: Any) -> imagehash.ImageHash | None:
-        if isinstance(value, imagehash.ImageHash):
-            return value
-        if isinstance(value, str) and value:
-            with contextlib.suppress(Exception):
-                return imagehash.hex_to_hash(value)
-        return None
 
+def get_image_analyzer(
+    use_cache: bool = True,
+) -> Runnable[dict[str, Any], str]:
     def _prepare_input(x: dict[str, Any]) -> dict[str, Any]:
         image = x.get("image")
         if not image or not isinstance(image, str):
             raise ValueError("Invalid image input")
         if image.startswith("data:image/"):
             image = image.split(",", 1)[1]
+        phash = x.get("phash")
+        if use_cache and phash is None:
+            raise ValueError("phash is required when use_cache=True")
         return {
             "image": image,
-            "phash": _normalize_phash(x.get("phash")),
+            "phash": _normalize_phash(phash),
             "detail": bool(x.get("detail", False)),
         }
 
     def _compact_output(text: str) -> str:
         return " ".join(text.strip().split())
-
-    async def _lookup_cache(x: dict[str, Any]) -> dict[str, Any]:
-        target_field = "detail" if bool(x.get("detail", False)) else "brief"
-        cached_text: str | None = None
-
-        base64_text = str(x["image"])
-        exact_entries = await cache.find_by_base64(base64_text)
-        for entry in exact_entries:
-            value = getattr(entry, target_field)
-            if value:
-                cached_text = value
-                break
-
-        phash = x.get("phash")
-        if cached_text is None and isinstance(phash, imagehash.ImageHash):
-            similar_entries = await cache.find_similar_by_phash(
-                phash,
-                max_distance=IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE,
-                limit=10,
-            )
-            for entry in similar_entries:
-                value = getattr(entry, target_field)
-                if value:
-                    cached_text = value
-                    break
-
-        return {
-            **x,
-            "cache_hit": cached_text,
-            "cache_has_exact_base64": bool(exact_entries),
-        }
 
     def _is_cache_hit(x: dict[str, Any]) -> bool:
         return isinstance(x.get("cache_hit"), str)
@@ -416,15 +405,17 @@ def get_image_analyzer() -> Runnable[dict[str, Any], str]:
         return str(x["cache_hit"])
 
     brief_llm = ChatOpenAI(
-        model="gpt-4.1-mini",
-        base_url=os.getenv("OPENAI_BASE_URL"),
-        temperature=0.3,
+        model="kimi-k2.6",
+        api_key=SecretStr(os.getenv("KIMI_API_KEY", "")),
+        base_url=os.getenv("KIMI_BASE_URL"),
+        temperature=1,
         max_retries=2,
     )
     detail_llm = ChatOpenAI(
-        model="gpt-5.4-mini",
-        base_url=os.getenv("OPENAI_BASE_URL"),
-        temperature=0.3,
+        model="kimi-k2.6",
+        api_key=SecretStr(os.getenv("KIMI_API_KEY", "")),
+        base_url=os.getenv("KIMI_BASE_URL"),
+        temperature=1,
         max_retries=2,
     )
 
@@ -468,6 +459,42 @@ def get_image_analyzer() -> Runnable[dict[str, Any], str]:
         brief_chain,
     )
 
+    if not use_cache:
+        return analyzer_chain
+
+    cache = ImageAnalysisCache(max_records=IMAGE_ANALYSIS_CACHE_MAX_RECORDS)
+
+    async def _lookup_cache(x: dict[str, Any]) -> dict[str, Any]:
+        target_field = "detail" if bool(x.get("detail", False)) else "brief"
+        cached_text: str | None = None
+
+        base64_text = str(x["image"])
+        exact_entries = await cache.find_by_base64(base64_text)
+        for entry in exact_entries:
+            value = getattr(entry, target_field)
+            if value:
+                cached_text = value
+                break
+
+        phash = x.get("phash")
+        if cached_text is None and isinstance(phash, imagehash.ImageHash):
+            similar_entries = await cache.find_similar_by_phash(
+                phash,
+                max_distance=IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE,
+                limit=10,
+            )
+            for entry in similar_entries:
+                value = getattr(entry, target_field)
+                if value:
+                    cached_text = value
+                    break
+
+        return {
+            **x,
+            "cache_hit": cached_text,
+            "cache_has_exact_base64": bool(exact_entries),
+        }
+
     async def _analyze_and_cache(x: dict[str, Any]) -> str:
         abstract = await analyzer_chain.ainvoke(x)
         phash = x.get("phash")
@@ -482,6 +509,7 @@ def get_image_analyzer() -> Runnable[dict[str, Any], str]:
                     phash=phash,
                     **values,
                 )
+        await add_memes([str(x["image"])], [abstract])
         return abstract
 
     return (
@@ -492,3 +520,152 @@ def get_image_analyzer() -> Runnable[dict[str, Any], str]:
             RunnableLambda(_analyze_and_cache),
         )
     )
+
+
+async def add_memes(
+    base64s: list[str],
+    analyses: list[str],
+) -> None:
+    if len(base64s) != len(analyses):
+        raise ValueError("base64s and analyses must have the same length")
+    base64s = [b if b.startswith("base64://") else "base64://" + b for b in base64s]
+
+    await vectorstore.aadd_texts(
+        texts=analyses,
+        metadatas=[{"base64": base64} for base64 in base64s],
+    )
+
+
+async def meme_analysis(urls: list[str]) -> None:
+    image_analyzer = get_image_analyzer(use_cache=False)
+    analysis_results: list[dict[str, Any]] = []
+    failed_urls: list[str] = []
+    semaphore = anyio.Semaphore(5)
+
+    async def _handle_url(url: str) -> None:
+        async with semaphore:
+            try:
+                result = await read_image(
+                    path="",
+                    url=url,
+                )
+                if result is None:
+                    failed_urls.append(url)
+                    return
+                analysis = await image_analyzer.ainvoke(
+                    {
+                        "image": result.base64,
+                        "phash": result.phash,
+                        "detail": True,
+                    }
+                )
+                analysis_results.append(
+                    {
+                        "base64": "base64://" + result.base64,
+                        "analysis": analysis,
+                    }
+                )
+            except Exception:
+                failed_urls.append(url)
+
+    async with anyio.create_task_group() as tg:
+        for url in urls:
+            tg.start_soon(_handle_url, url)
+
+    if analysis_results:
+        texts = [r["analysis"] for r in analysis_results]
+        metadatas = [{"base64": r["base64"]} for r in analysis_results]
+
+        await vectorstore.aadd_texts(
+            texts=texts,
+            metadatas=metadatas,
+        )
+    if failed_urls:
+        print(f"以下 {len(failed_urls)} 个 URL 分析失败：{failed_urls}")
+
+
+@dataclass
+class SearchResult:
+    base64: str
+    analysis: str
+
+
+async def search_meme(
+    query: str,
+    temperature: float = 0.0,
+    max_score: float | None = None,
+) -> SearchResult | None:
+    results = await vectorstore.asimilarity_search_with_score(query, k=20)
+    candidates = [
+        (doc, score)
+        for doc, score in results
+        if max_score is None or score <= max_score
+    ]
+    if not candidates:
+        return None
+
+    if temperature == 0.0:
+        best_doc, _ = min(candidates, key=lambda x: x[1])
+    else:
+        scores = np.array([s for _, s in candidates])
+        neg_scores = -scores
+        neg_scores -= np.max(neg_scores)
+        exp_scores = np.exp(neg_scores / temperature)
+        probs = exp_scores / np.sum(exp_scores)
+        rng = np.random.default_rng()
+        chosen_idx = rng.choice(len(candidates), p=probs)
+        best_doc = candidates[chosen_idx][0]
+
+    return SearchResult(
+        base64=best_doc.metadata.get("base64", ""),
+        analysis=best_doc.page_content,
+    )
+
+
+if __name__ == "__main__":
+
+    async def main() -> None:
+        cache = ImageAnalysisCache(max_records=IMAGE_ANALYSIS_CACHE_MAX_RECORDS)
+        batch_size = 100
+        total_records = 0
+        total_memes = 0
+
+        try:
+            await cache._ensure_schema()
+            async with cache.sessionmaker() as session:
+                result = await session.execute(
+                    select(ImageAnalysisRecord).order_by(
+                        ImageAnalysisRecord.record_id.asc()
+                    )
+                )
+                records = list(result.scalars())
+
+            pending_base64s: list[str] = []
+            pending_analyses: list[str] = []
+
+            async def flush() -> None:
+                nonlocal total_memes
+                if not pending_base64s:
+                    return
+                await add_memes(pending_base64s, pending_analyses)
+                total_memes += len(pending_base64s)
+                pending_base64s.clear()
+                pending_analyses.clear()
+
+            for record in records:
+                total_records += 1
+                if not record.brief:
+                    continue
+                pending_base64s.append(record.base64)
+                pending_analyses.append(record.brief)
+                if len(pending_base64s) >= batch_size:
+                    await flush()
+
+            await flush()
+            print(
+                f"Copied {total_memes} analyses from {total_records} cache records to {CHROMA_PATH}"
+            )
+        finally:
+            await cache.close()
+
+    anyio.run(main)

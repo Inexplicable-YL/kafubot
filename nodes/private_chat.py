@@ -6,8 +6,6 @@ from zoneinfo import ZoneInfo
 
 import anyio
 import imagehash
-from _image import ImageReadResult, get_image_analyzer, read_image
-from _prompt import get_extra_prompt
 from anyio.abc import TaskGroup
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from langchain_core.messages import HumanMessage
@@ -15,14 +13,23 @@ from langchain_core.runnables import Runnable
 from pydantic import model_validator
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
+from sekaibot.adapter.cqhttp.message import CQHTTPMessage, CQHTTPMessageSegment
 from sekaibot.config import ConfigModel
 
 from nodes._activity import get_activity_store
+from nodes._image import (
+    ImageReadResult,
+    get_image_analyzer,
+    read_image,
+    search_meme,
+)
 from nodes._private import (
     clear_session_history,
     get_chat_app,
     get_session_history,
 )
+from nodes._prompt import get_extra_prompt
+from nodes._public_tools import parse_message
 
 BACKUP_MESSAGES_LIMIT = 10
 
@@ -338,13 +345,31 @@ class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfi
                 ),
                 "user_name": name,
                 "thinking": True,
-                "reasoning_effort": "high",
+                "reasoning_effort": "max",
             },
             config={"configurable": {"session_id": session_id}},
         ):
             if reply is not None:
                 print(f"Reply-Private: {reply}")
-                await self.reply(reply)
+                segments, text = parse_message(reply.strip())
+                message: CQHTTPMessage | str = ""
+                for seg in segments:
+                    if seg.type == "meme" and "content" in seg.data:
+                        content = seg.data["content"]
+                        meme_result = await search_meme(
+                            content, temperature=0, max_score=1.5
+                        )
+                        if meme_result:
+                            message += CQHTTPMessageSegment.image(
+                                meme_result.base64, sub_type=1
+                            )
+                            await self.reply(message)
+                            message = ""
+                    else:
+                        continue
+                message += text
+                if message:
+                    await self.reply(message)
                 answer += reply
                 replied = True
         if replied:
