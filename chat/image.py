@@ -544,21 +544,33 @@ async def add_memes(
     )
 
 
-async def meme_analysis(urls: list[str]) -> None:
+@dataclass
+class SearchResult:
+    base64: str
+    analysis: str
+
+
+async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
     image_analyzer = get_image_analyzer(use_cache=False)
-    analysis_results: list[dict[str, Any]] = []
-    failed_urls: list[str] = []
+    analysis_results: list[tuple[str, SearchResult]] = []
+    failed_files: list[str] = []
     semaphore = anyio.Semaphore(5)
 
-    async def _handle_url(url: str) -> None:
+    async def _handle_url(file: str) -> None:
         async with semaphore:
             try:
-                result = await read_image(
-                    path="",
-                    url=url,
-                )
+                if file.startswith(("http://", "https://")):
+                    result = await read_image(
+                        path="",
+                        url=file,
+                    )
+                else:
+                    result = await read_image(
+                        path=file,
+                        url=None,
+                    )
                 if result is None:
-                    failed_urls.append(url)
+                    failed_files.append(file)
                     return
                 analysis = await image_analyzer.ainvoke(
                     {
@@ -568,34 +580,32 @@ async def meme_analysis(urls: list[str]) -> None:
                     }
                 )
                 analysis_results.append(
-                    {
-                        "base64": "base64://" + result.base64,
-                        "analysis": analysis,
-                    }
+                    (
+                        file,
+                        SearchResult(
+                            base64="base64://" + result.base64,
+                            analysis=analysis,
+                        ),
+                    )
                 )
             except Exception:
-                failed_urls.append(url)
+                failed_files.append(file)
 
     async with anyio.create_task_group() as tg:
-        for url in urls:
-            tg.start_soon(_handle_url, url)
+        for file in files:
+            tg.start_soon(_handle_url, file)
 
     if analysis_results:
-        texts = [r["analysis"] for r in analysis_results]
-        metadatas = [{"base64": r["base64"]} for r in analysis_results]
+        texts = [r[1].analysis for r in analysis_results]
+        metadatas = [{"base64": r[1].base64} for r in analysis_results]
 
         await get_vectorstore().aadd_texts(
             texts=texts,
             metadatas=metadatas,
         )
-    if failed_urls:
-        print(f"以下 {len(failed_urls)} 个 URL 分析失败：{failed_urls}")
-
-
-@dataclass
-class SearchResult:
-    base64: str
-    analysis: str
+    if failed_files:
+        print(f"以下 {len(failed_files)} 个 FILE 分析失败：{failed_files}")
+    return analysis_results
 
 
 async def search_meme(
@@ -633,47 +643,7 @@ async def search_meme(
 if __name__ == "__main__":
 
     async def main() -> None:
-        cache = ImageAnalysisCache(max_records=IMAGE_ANALYSIS_CACHE_MAX_RECORDS)
-        batch_size = 100
-        total_records = 0
-        total_memes = 0
-
-        try:
-            await cache._ensure_schema()
-            async with cache.sessionmaker() as session:
-                result = await session.execute(
-                    select(ImageAnalysisRecord).order_by(
-                        ImageAnalysisRecord.record_id.asc()
-                    )
-                )
-                records = list(result.scalars())
-
-            pending_base64s: list[str] = []
-            pending_analyses: list[str] = []
-
-            async def flush() -> None:
-                nonlocal total_memes
-                if not pending_base64s:
-                    return
-                await add_memes(pending_base64s, pending_analyses)
-                total_memes += len(pending_base64s)
-                pending_base64s.clear()
-                pending_analyses.clear()
-
-            for record in records:
-                total_records += 1
-                if not record.brief:
-                    continue
-                pending_base64s.append(record.base64)
-                pending_analyses.append(record.brief)
-                if len(pending_base64s) >= batch_size:
-                    await flush()
-
-            await flush()
-            print(
-                f"Copied {total_memes} analyses from {total_records} cache records to {CHROMA_PATH}"
-            )
-        finally:
-            await cache.close()
+        result = await search_meme("花谱呆萌脸", temperature=0.06, max_score=1.5)
+        print(result.analysis if result else "No result")
 
     anyio.run(main)
