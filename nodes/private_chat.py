@@ -357,7 +357,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
                     if seg.type == "meme" and "content" in seg.data:
                         content = seg.data["content"]
                         meme_result = await search_meme(
-                            content, temperature=0, max_score=1.5
+                            content, temperature=0.5, min_score=0.15
                         )
                         if meme_result:
                             message += CQHTTPMessageSegment.image(

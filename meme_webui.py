@@ -1028,7 +1028,7 @@ def create_app() -> web.Application:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Meme manual labeling WebUI")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8008)
     return parser.parse_args()
 
 

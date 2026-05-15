@@ -611,28 +611,30 @@ async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
 async def search_meme(
     query: str,
     temperature: float = 0.0,
-    max_score: float | None = None,
+    min_score: float | None = None,
 ) -> SearchResult | None:
-    results = await get_vectorstore().asimilarity_search_with_score(query, k=20)
-    candidates = [
-        (doc, score)
-        for doc, score in results
-        if max_score is None or score <= max_score
-    ]
-    if not candidates:
+    results = await get_vectorstore().asimilarity_search_with_relevance_scores(
+        query, k=20, score_threshold=min_score or 0.0
+    )
+    print(
+        "\n".join(
+            f"Score: {score:.4f}, Analysis: {doc.page_content}"
+            for doc, score in results
+        )
+    )
+    if not results:
         return None
 
     if temperature == 0.0:
-        best_doc, _ = min(candidates, key=lambda x: x[1])
+        best_doc, _ = max(results, key=lambda x: x[1])
     else:
-        scores = np.array([s for _, s in candidates])
-        neg_scores = -scores
-        neg_scores -= np.max(neg_scores)
-        exp_scores = np.exp(neg_scores / temperature)
+        scores = np.array([s for _, s in results])
+        scores = scores - np.max(scores)
+        exp_scores = np.exp(scores / temperature)
         probs = exp_scores / np.sum(exp_scores)
         rng = np.random.default_rng()
-        chosen_idx = rng.choice(len(candidates), p=probs)
-        best_doc = candidates[chosen_idx][0]
+        chosen_idx = rng.choice(len(results), p=probs)
+        best_doc = results[chosen_idx][0]
 
     return SearchResult(
         base64=best_doc.metadata.get("base64", ""),
@@ -643,7 +645,7 @@ async def search_meme(
 if __name__ == "__main__":
 
     async def main() -> None:
-        result = await search_meme("花谱呆萌脸", temperature=0.06, max_score=1.5)
+        result = await search_meme("花谱呆萌脸", temperature=0.5)
         print(result.analysis if result else "No result")
 
     anyio.run(main)
