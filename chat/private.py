@@ -5,7 +5,6 @@ from functools import cache
 from typing import TYPE_CHECKING, Any, cast
 from typing_extensions import override
 
-from _prompt import PRIVATE_SYSTEM_PROMPT
 from langchain_community.chat_message_histories.sql import (
     BaseMessageConverter,
     SQLChatMessageHistory,
@@ -23,6 +22,8 @@ from pydantic import TypeAdapter
 from sqlalchemy import Integer, Text, delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from chat.prompt import PRIVATE_SYSTEM_PROMPT
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence

@@ -12,18 +12,18 @@ from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.adapter.cqhttp.message import CQHTTPMessage, CQHTTPMessageSegment
 from sekaibot.config import ConfigModel
 
-from nodes._activity import get_activity_store
-from nodes._group import (
+from chat.activity import get_activity_store
+from chat.group import (
     AssistantReply,
     get_agent_app,
 )
-from nodes._image import search_meme
-from nodes._prompt import (
+from chat.image import search_meme
+from chat.prompt import (
     MORE_SENTENCE_REPLY_PROMPT,
     ONE_SENTENCE_REPLY_PROMPT,
     get_extra_prompt,
 )
-from nodes._public_tools import parse_message
+from chat.utils import parse_message
 
 BASE_AUTO_REPLY_GROUPS = {
     596488203,

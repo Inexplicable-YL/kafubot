@@ -16,20 +16,20 @@ from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 from sekaibot.adapter.cqhttp.message import CQHTTPMessage, CQHTTPMessageSegment
 from sekaibot.config import ConfigModel
 
-from nodes._activity import get_activity_store
-from nodes._image import (
+from chat.activity import get_activity_store
+from chat.image import (
     ImageReadResult,
     get_image_analyzer,
     read_image,
     search_meme,
 )
-from nodes._private import (
+from chat.private import (
     clear_session_history,
     get_chat_app,
     get_session_history,
 )
-from nodes._prompt import get_extra_prompt
-from nodes._public_tools import parse_message
+from chat.prompt import get_extra_prompt
+from chat.utils import parse_message
 
 BACKUP_MESSAGES_LIMIT = 10
 
@@ -233,7 +233,7 @@ class PrivateReplyState:
         self.image_job_receive_stream = receive_stream
 
 
-class PrivateReply(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig]):  # type: ignore
+class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig]):  # type: ignore
     priority = 1
 
     def __init_state__(self) -> PrivateReplyState:

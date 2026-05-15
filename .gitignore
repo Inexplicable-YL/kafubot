@@ -209,4 +209,4 @@ __marimo__/
 
 .run-bot.ps1
 *.db
-meme_vectordb
+.meme_vectordb

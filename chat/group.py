@@ -10,7 +10,6 @@ from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 import anyio
-from _prompt import DECISION_SYSTEM_PROMPT, GROUP_SYSTEM_PROMPT
 from langchain_community.chat_message_histories.sql import (
     BaseMessageConverter,
     SQLChatMessageHistory,
@@ -30,6 +29,8 @@ from pydantic import BaseModel, TypeAdapter
 from sqlalchemy import DateTime, Integer, Text, delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from chat.prompt import DECISION_SYSTEM_PROMPT, GROUP_SYSTEM_PROMPT
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence

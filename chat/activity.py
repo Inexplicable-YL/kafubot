@@ -35,9 +35,13 @@ class ActivityRecord(ActivityBase):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     scope: Mapped[str] = mapped_column(Text, nullable=False)
     session_id: Mapped[str] = mapped_column(Text, nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False
+    )
     weight: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False
+    )
 
 
 def _utc_naive_from_timestamp(timestamp: int) -> datetime:

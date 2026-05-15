@@ -15,10 +15,6 @@ import anyio
 import chromadb
 import imagehash
 import numpy as np
-from _prompt import (
-    IMAGE_BRIEF_SYSTEM_PROMPT,
-    IMAGE_DETAIL_SYSTEM_PROMPT,
-)
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_core.output_parsers import StrOutputParser
@@ -31,6 +27,11 @@ from sqlalchemy import DateTime, Integer, Text, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import NullPool
+
+from chat.prompt import (
+    IMAGE_BRIEF_SYSTEM_PROMPT,
+    IMAGE_DETAIL_SYSTEM_PROMPT,
+)
 
 load_dotenv()
 
@@ -51,16 +52,23 @@ IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE = int(
     os.getenv("IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE", "5")
 )
 
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./meme_vectordb")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./.meme_vectordb")
 
 persistent_client = chromadb.PersistentClient(path=CHROMA_PATH)
-vectorstore = Chroma(
-    client=persistent_client,
-    collection_name="meme_analysis",
-    embedding_function=OpenAIEmbeddings(
-        model="text-embedding-3-large", base_url=os.getenv("OPENAI_BASE_URL")
-    ),
-)
+_vectorstore: Chroma | None = None
+
+
+def get_vectorstore() -> Chroma:
+    global _vectorstore  # noqa: PLW0603
+    if _vectorstore is None:
+        _vectorstore = Chroma(
+            client=persistent_client,
+            collection_name="meme_analysis",
+            embedding_function=OpenAIEmbeddings(
+                model="text-embedding-3-large", base_url=os.getenv("OPENAI_BASE_URL")
+            ),
+        )
+    return _vectorstore
 
 
 @dataclass(frozen=True)
@@ -530,7 +538,7 @@ async def add_memes(
         raise ValueError("base64s and analyses must have the same length")
     base64s = [b if b.startswith("base64://") else "base64://" + b for b in base64s]
 
-    await vectorstore.aadd_texts(
+    await get_vectorstore().aadd_texts(
         texts=analyses,
         metadatas=[{"base64": base64} for base64 in base64s],
     )
@@ -576,7 +584,7 @@ async def meme_analysis(urls: list[str]) -> None:
         texts = [r["analysis"] for r in analysis_results]
         metadatas = [{"base64": r["base64"]} for r in analysis_results]
 
-        await vectorstore.aadd_texts(
+        await get_vectorstore().aadd_texts(
             texts=texts,
             metadatas=metadatas,
         )
@@ -595,7 +603,7 @@ async def search_meme(
     temperature: float = 0.0,
     max_score: float | None = None,
 ) -> SearchResult | None:
-    results = await vectorstore.asimilarity_search_with_score(query, k=20)
+    results = await get_vectorstore().asimilarity_search_with_score(query, k=20)
     candidates = [
         (doc, score)
         for doc, score in results
