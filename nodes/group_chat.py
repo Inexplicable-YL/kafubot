@@ -15,6 +15,7 @@ from sekaibot.config import ConfigModel
 from chat.activity import get_activity_store
 from chat.group import (
     AssistantReply,
+    clear_session_history,
     get_agent_app,
 )
 from chat.image import search_meme
@@ -209,10 +210,11 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                             content, temperature=0.5, min_score=0.15
                         )
                         if meme_result:
-                            message += CQHTTPMessageSegment.image(
-                                meme_result.base64, sub_type=1
+                            await self.reply(
+                                CQHTTPMessageSegment.image(
+                                    meme_result.base64, sub_type=1
+                                )
                             )
-                            await self.reply(message)
                             message = ""
                     else:
                         continue
@@ -246,6 +248,13 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             finally:
                 history_storage.on_handle = False
 
+    async def _delete_chat(self, session_id: str) -> None:
+        await clear_session_history(session_id=session_id)
+        async with self.node_state.storages_lock:
+            if session_id in self.node_state.storages:
+                del self.node_state.storages[session_id]
+        await self.reply("[SYSTEM]已清除历史", at_sender=True)
+
     @override
     async def handle(self) -> None:
         session_id = str(self.event.group_id)
@@ -256,6 +265,21 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         text = self.event.message.get_plain_text()
         if not text:
             return
+
+        keyws = [
+            "clear",
+            "清除",
+            "清空",
+            "清理",
+            "删除",
+            "重置",
+            "重新开始",
+            "重启",
+        ]
+        if any(keyw in text for keyw in keyws):
+            await self._delete_chat(session_id=session_id)
+            return
+
         is_tome = self.event.is_tome()
         message = {
             "timestamp": timestamp,
@@ -289,3 +313,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 current_messages=current_messages,
                 replied=replied,
             )
+
+    @override
+    async def rule(self) -> bool:
+        return str(self.event.user_id) != "2830758180"

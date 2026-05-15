@@ -613,28 +613,27 @@ async def search_meme(
     temperature: float = 0.0,
     min_score: float | None = None,
 ) -> SearchResult | None:
-    results = await get_vectorstore().asimilarity_search_with_relevance_scores(
-        query, k=20, score_threshold=min_score or 0.0
+    results = await get_vectorstore()._asimilarity_search_with_relevance_scores(
+        query, k=20
     )
-    print(
-        "\n".join(
-            f"Score: {score:.4f}, Analysis: {doc.page_content}"
-            for doc, score in results
-        )
-    )
-    if not results:
+    candidates = [
+        (doc, score)
+        for doc, score in results
+        if min_score is None or score >= min_score
+    ]
+    if not candidates:
         return None
 
     if temperature == 0.0:
-        best_doc, _ = max(results, key=lambda x: x[1])
+        best_doc, _ = max(candidates, key=lambda x: x[1])
     else:
-        scores = np.array([s for _, s in results])
+        scores = np.array([s for _, s in candidates])
         scores = scores - np.max(scores)
         exp_scores = np.exp(scores / temperature)
         probs = exp_scores / np.sum(exp_scores)
         rng = np.random.default_rng()
-        chosen_idx = rng.choice(len(results), p=probs)
-        best_doc = results[chosen_idx][0]
+        chosen_idx = rng.choice(len(candidates), p=probs)
+        best_doc = candidates[chosen_idx][0]
 
     return SearchResult(
         base64=best_doc.metadata.get("base64", ""),

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import importlib
+import json
 import os
 import tempfile
 import threading
@@ -21,6 +22,11 @@ FilterName = Literal["unlabeled", "labeled", "all"]
 _CHROMA_LOCK = threading.RLock()
 _LOCK_FILE_NAME = ".meme_label_webui.lock"
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+PRESET_ANALYSIS_PREFIXES = [
+    "角色是花谱。",
+    "角色是星界。",
+    "角色是异世界情绪，又名情绪、情绪姐姐。",
+]
 
 
 @dataclass(frozen=True)
@@ -253,6 +259,27 @@ HTML = r"""<!doctype html>
       color: var(--muted);
       font-size: 14px;
     }
+    .preset-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .preset-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fffdf8;
+      color: var(--ink);
+      cursor: pointer;
+      user-select: none;
+      font-size: 14px;
+    }
+    .preset-tag input {
+      accent-color: var(--accent);
+    }
     @media (max-width: 860px) {
       header { align-items: flex-start; flex-direction: column; }
       main { grid-template-columns: 1fr; padding: 8px 14px 18px; }
@@ -324,6 +351,7 @@ HTML = r"""<!doctype html>
         <span class="pill" id="manual">-</span>
       </div>
       <div class="editor">
+        <div class="preset-tags" id="preset-tags"></div>
         <textarea id="analysis" placeholder="当前 meme 没有 analysis"></textarea>
         <div class="meta">
           <div>ID: <span id="record-id">-</span></div>
@@ -340,6 +368,7 @@ HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
+    const presetPrefixes = __PRESET_ANALYSIS_PREFIXES__;
     const state = { filter: "unlabeled", index: 0, record: null, total: 0 };
     const el = (id) => document.getElementById(id);
 
@@ -362,6 +391,62 @@ HTML = r"""<!doctype html>
       el("drop-zone").style.opacity = busy ? "0.55" : "";
     }
 
+    function stripPresetPrefixes(text) {
+      let body = text;
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const prefix of presetPrefixes) {
+          if (body.startsWith(prefix)) {
+            body = body.slice(prefix.length);
+            changed = true;
+          }
+        }
+      }
+      return body;
+    }
+
+    function selectedPresetPrefixes() {
+      return Array.from(document.querySelectorAll(".preset-tag input:checked"))
+        .map((input) => input.value);
+    }
+
+    function syncPresetChecks() {
+      let current = el("analysis").value;
+      for (const input of document.querySelectorAll(".preset-tag input")) {
+        if (current.startsWith(input.value)) {
+          input.checked = true;
+          current = current.slice(input.value.length);
+        } else {
+          input.checked = false;
+        }
+      }
+    }
+
+    function applyPresetSelection() {
+      const body = stripPresetPrefixes(el("analysis").value);
+      el("analysis").value = selectedPresetPrefixes().join("") + body;
+      el("analysis").focus();
+    }
+
+    function renderPresetTags() {
+      const wrap = el("preset-tags");
+      wrap.replaceChildren();
+      for (const prefix of presetPrefixes) {
+        const label = document.createElement("label");
+        label.className = "preset-tag";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.value = prefix;
+        input.addEventListener("change", applyPresetSelection);
+        const text = document.createElement("span");
+        text.textContent = prefix;
+        label.appendChild(input);
+        label.appendChild(text);
+        wrap.appendChild(label);
+      }
+    }
+
     function renderEmpty(payload) {
       state.record = null;
       state.total = payload.total;
@@ -372,6 +457,7 @@ HTML = r"""<!doctype html>
       empty.textContent = "当前筛选没有可标注记录";
       wrap.appendChild(empty);
       el("analysis").value = "";
+      syncPresetChecks();
       el("record-id").textContent = "-";
       el("record-url").textContent = "-";
       el("manual").textContent = "-";
@@ -399,6 +485,7 @@ HTML = r"""<!doctype html>
       el("record-url").textContent = payload.record.url || "-";
       el("manual").textContent = payload.record.manually_annotated ? "已人工标注" : "未人工标注";
       el("analysis").value = payload.record.analysis || "";
+      syncPresetChecks();
       const wrap = el("image-wrap");
       wrap.replaceChildren();
       if (payload.record.image_src) {
@@ -562,6 +649,7 @@ HTML = r"""<!doctype html>
       el("drop-zone").classList.remove("dragover");
       addFromFile(event.dataTransfer.files[0]);
     });
+    renderPresetTags();
     loadRecord(0);
   </script>
 </body>
@@ -932,7 +1020,11 @@ def _optional_string(payload: dict[str, Any], key: str) -> str | None:
 
 
 async def index(_: web.Request) -> web.Response:
-    return web.Response(text=HTML, content_type="text/html")
+    html = HTML.replace(
+        "__PRESET_ANALYSIS_PREFIXES__",
+        json.dumps(PRESET_ANALYSIS_PREFIXES, ensure_ascii=False),
+    )
+    return web.Response(text=html, content_type="text/html")
 
 
 async def get_record(request: web.Request) -> web.Response:
