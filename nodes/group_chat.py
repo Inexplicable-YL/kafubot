@@ -117,6 +117,8 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             history_storage.backup_messages = history_storage.backup_messages[
                 -BACKUP_MESSAGES_LIMIT:
             ]
+            if "[MSG:" in text and not is_tome:
+                return None
 
             if session_id not in BASE_AUTO_REPLY_GROUPS and (
                 await self._is_activity_limited(session_id, self.event.time)
@@ -267,18 +269,36 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             return
 
         keyws = [
-            "clear",
-            "清除",
-            "清空",
-            "清理",
-            "删除",
-            "重置",
-            "重新开始",
-            "重启",
+            "/clear",
         ]
         if any(keyw in text for keyw in keyws):
             await self._delete_chat(session_id=session_id)
             return
+
+        for msg in self.event.message:
+            if isinstance(msg, CQHTTPMessageSegment):
+                if msg.type == "at" and (qq_number := str(msg.data.get("qq", ""))):
+                    if qq_number == str(self.event.adapter.self_id):
+                        text = f"[MSG:at, name=可不]{text}"
+                        continue
+                    at_name: str | None = None
+                    for item in history_storage.backup_messages:
+                        if str(item.get("user_id")) == qq_number:
+                            at_name = item.get("user", user)
+                            break
+                    if at_name:
+                        text = f"[MSG:at, name={at_name}]{text}"
+                elif msg.type == "reply" and (reply_id := str(msg.data.get("id", ""))):
+                    reply_time: str | None = None
+                    for item in history_storage.backup_messages:
+                        if str(item.get("message_id")) == reply_id:
+                            t = cast("datetime", item["timestamp"]).astimezone(
+                                ZoneInfo("Asia/Shanghai")
+                            )
+                            reply_time = t.strftime("%Y-%m-%d %H:%M:%S")
+                            break
+                    if reply_time:
+                        text = f"[MSG:reply, time={reply_time}]{text}"
 
         is_tome = self.event.is_tome()
         message = {
