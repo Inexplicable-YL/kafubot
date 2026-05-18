@@ -324,9 +324,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                                     break
                     elif seg.type == "meme" and "content" in seg.data:
                         content = seg.data["content"]
-                        meme_result = await search_meme(
-                            content, temperature=0.5, min_score=0.15
-                        )
+                        meme_result = await search_meme(content, temperature=0.15, min_score=0.05)
                         if meme_result:
                             await self.reply(
                                 CQHTTPMessageSegment.image(
