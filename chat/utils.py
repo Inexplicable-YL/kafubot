@@ -10,6 +10,7 @@ class Segment:
 
 
 def parse_message(text: str) -> tuple[list[Segment], str]:
+    text = text.replace("：", ":").replace("，", ",").strip()
     segments = []
     pattern = re.compile(r"\[MSG:[^\]]*\]")
 
@@ -36,4 +37,4 @@ def parse_message(text: str) -> tuple[list[Segment], str]:
         return block
 
     clean_text = pattern.sub(replacer, text)
-    return segments, clean_text
+    return segments, clean_text.strip()
