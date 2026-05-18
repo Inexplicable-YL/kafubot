@@ -36,6 +36,7 @@ auto_reply_groups=[
     154243984,
     924342546,
 ]
+talk_value=0.8
 interval_seconds=40
 activity_limits=[
     [300, 20],
@@ -43,6 +44,8 @@ activity_limits=[
     [18000, 100],
     [604800, 500],
 ]
+keywords=["可不", "花谱", "星界", "里命"]
+reply_when_keywords=False
 
 [node.private_chat]
 merge_window_seconds=5

@@ -200,12 +200,13 @@ class SessionQueueState:
             self.condition.notify_all()
 
 
-@dataclass(frozen=True)
+@dataclass
 class ImageAnalyzeJob:
     session_state: SessionQueueState
     message: QueuedMessage
     image: str
     phash: imagehash.ImageHash
+    as_meme: bool = False
 
 
 @dataclass
@@ -260,6 +261,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
                         {
                             "image": job.image,
                             "phash": job.phash,
+                            "as_meme": job.as_meme,
                             "detail": False,
                         }
                     )
@@ -379,17 +381,21 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
         ][-BACKUP_MESSAGES_LIMIT:]
         return replied
 
-    async def get_image(self, file: str) -> ImageReadResult | None:
+    async def get_image(self, file: str) -> tuple[ImageReadResult | None, bool]:
         try:
             result: dict[str, str] = await self.event.adapter.call_api(
                 "get_image", file=file
             )
-            path, url = result.get("file"), result.get("url")
+            path, url, sub_type = (
+                result.get("file"),
+                result.get("url"),
+                result.get("sub_type"),
+            )
             if path is not None:
-                return await read_image(path, url)
+                return await read_image(path, url), str(sub_type) == "1"
         except Exception:
-            return None
-        return None
+            return None, False
+        return None, False
 
     @override
     async def handle(self) -> None:
@@ -398,6 +404,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
         session_id = self.event.get_session_id()
         text: str | None = None
         image: ImageReadResult | None = None
+        as_meme: bool = False
 
         if raw_text:
             text = timestamp_text + raw_text
@@ -420,7 +427,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
             if len(self.event.message) == 1 and self.event.message[0].type == "image":
                 file = self.event.message[0].data.get("file")
             if file is not None:
-                image = await self.get_image(file)
+                image, as_meme = await self.get_image(file)
             if image is None:
                 return
 
@@ -453,6 +460,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
                         message=image_message,
                         image=image.base64,
                         phash=image.phash,
+                        as_meme=as_meme,
                     )
                 )
             except Exception:

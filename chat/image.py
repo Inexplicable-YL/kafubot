@@ -392,8 +392,6 @@ def get_image_analyzer(
         image = x.get("image")
         if not image or not isinstance(image, str):
             raise ValueError("Invalid image input")
-        if image.startswith("data:image/"):
-            image = image.split(",", 1)[1]
         phash = x.get("phash")
         if use_cache and phash is None:
             raise ValueError("phash is required when use_cache=True")
@@ -401,6 +399,7 @@ def get_image_analyzer(
             "image": image,
             "phash": _normalize_phash(phash),
             "detail": bool(x.get("detail", False)),
+            "as_meme": bool(x.get("as_meme", False)),
         }
 
     def _compact_output(text: str) -> str:
@@ -517,7 +516,8 @@ def get_image_analyzer(
                     phash=phash,
                     **values,
                 )
-        await add_memes([str(x["image"])], [abstract])
+        if x.get("as_meme", False):
+            await add_memes([str(x["image"])], [abstract])
         return abstract
 
     return (

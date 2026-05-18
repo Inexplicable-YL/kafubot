@@ -4,6 +4,8 @@ import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 from functools import cache
+from typing import Literal, cast
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import DateTime, Float, Index, Integer, Text, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -79,7 +81,7 @@ class ActivityStore:
     async def is_limited(
         self,
         *,
-        scope: str,
+        scope: Literal["group", "private"],
         session_id: str,
         event_time: int,
         activity_limits: tuple[tuple[int, int], ...],
@@ -121,7 +123,7 @@ class ActivityStore:
     async def record(
         self,
         *,
-        scope: str,
+        scope: Literal["group", "private"],
         session_id: str,
         event_time: int,
         weight: float,
@@ -156,7 +158,9 @@ class ActivityStore:
             )
             await session.commit()
 
-    async def clear_session(self, *, scope: str, session_id: str) -> None:
+    async def clear_session(
+        self, *, scope: Literal["group", "private"], session_id: str
+    ) -> None:
         await self._ensure_schema()
         async with self.sessionmaker() as session:
             await session.execute(
@@ -166,6 +170,70 @@ class ActivityStore:
                 )
             )
             await session.commit()
+
+    async def latest_timestamp(
+        self, *, scope: Literal["group", "private"], session_id: str
+    ) -> float | None:
+        await self._ensure_schema()
+        async with self.sessionmaker() as session:
+            result = await session.execute(
+                select(ActivityRecord.timestamp)
+                .where(
+                    ActivityRecord.scope == scope,
+                    ActivityRecord.session_id == session_id,
+                )
+                .order_by(ActivityRecord.timestamp.desc())
+                .limit(1)
+            )
+            row = result.one_or_none()
+            if row is None:
+                return None
+            return cast("datetime", row[0]).replace(tzinfo=ZoneInfo("UTC")).timestamp()
+
+    async def recent_interval(
+        self,
+        *,
+        scope: Literal["group", "private"],
+        session_id: str,
+        window_seconds: int = 600,
+    ) -> list[float] | None:
+        await self._ensure_schema()
+
+        async with self.sessionmaker() as session:
+            latest_result = await session.execute(
+                select(ActivityRecord.timestamp)
+                .where(
+                    ActivityRecord.scope == scope,
+                    ActivityRecord.session_id == session_id,
+                )
+                .order_by(ActivityRecord.timestamp.desc())
+                .limit(1)
+            )
+            latest_row = latest_result.one_or_none()
+            if latest_row is None:
+                return None
+            latest_timestamp: datetime = latest_row[0]
+            window_start = latest_timestamp - timedelta(seconds=window_seconds)
+
+            result = await session.execute(
+                select(ActivityRecord.timestamp)
+                .where(
+                    ActivityRecord.scope == scope,
+                    ActivityRecord.session_id == session_id,
+                    ActivityRecord.timestamp > window_start,
+                    ActivityRecord.timestamp <= latest_timestamp,
+                )
+                .order_by(ActivityRecord.timestamp)
+            )
+            timestamps: list[datetime] = [row[0] for row in result.all()]
+
+            if len(timestamps) <= 1:
+                return None
+
+            return [
+                (timestamps[i + 1] - timestamps[i]).total_seconds()
+                for i in range(len(timestamps) - 1)
+            ]
 
 
 @cache
