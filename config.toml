@@ -44,7 +44,7 @@ activity_limits=[
     [604800, 500],
 ]
 keywords=["可不", "花谱", "星界", "里命"]
-reply_when_keywords=False
+reply_when_keywords=false
 
 [node.private_chat]
 merge_window_seconds=5
