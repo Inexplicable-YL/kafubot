@@ -395,12 +395,15 @@ def get_image_analyzer(
         phash = x.get("phash")
         if use_cache and phash is None:
             raise ValueError("phash is required when use_cache=True")
-        return {
-            "image": image,
-            "phash": _normalize_phash(phash),
-            "detail": bool(x.get("detail", False)),
-            "as_meme": bool(x.get("as_meme", False)),
-        }
+        x.update(
+            {
+                "image": image,
+                "phash": _normalize_phash(phash),
+                "detail": bool(x.get("detail", False)),
+                "as_meme": bool(x.get("as_meme", False)),
+            }
+        )
+        return x
 
     def _compact_output(text: str) -> str:
         return " ".join(text.strip().split())
