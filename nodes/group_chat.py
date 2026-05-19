@@ -277,7 +277,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             sum(isinstance(x, GroupImageMessage) for x in current_messages)
             - self.config.keep_image_limit
         )
-        current_messages = [
+        messages = [
             x
             for x in current_messages
             if not isinstance(x, GroupImageMessage) or (skip := skip - 1) < 0
@@ -289,14 +289,14 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 "as_meme": x.as_meme,
                 "detail": False,
             }
-            for x in current_messages
+            for x in messages
             if isinstance(x, GroupImageMessage)
         ]
         if not image_inputs:
-            return current_messages
+            return messages
         results = await self.node_state.image_analyzer.abatch(image_inputs)
         filled_messages = []
-        for msg in current_messages:
+        for msg in messages:
             if isinstance(msg, GroupImageMessage):
                 filled_messages.append(
                     GroupMessage(
@@ -346,6 +346,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             await fill_event.wait()
             output_messages = current_messages
             if should_reply:
+                print(f"Invoking-Group: {[m.text for m in current_messages]}")
                 output_messages = await self.get_reply(
                     group_event,
                     current_messages=current_messages,

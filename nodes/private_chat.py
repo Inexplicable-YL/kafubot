@@ -331,7 +331,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
         self.node_state.backup_histories[session_id].append("\n".join(messages))
         replied = False
         answer = ""
-        print(f"Invoking: {messages}")
+        print(f"Invoking-Private: {messages}")
         async for reply in self.node_state.chat_app.astream(
             {
                 "messages": messages,
