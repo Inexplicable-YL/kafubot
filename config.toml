@@ -46,7 +46,7 @@ auto_reply_groups=[
 ]
 
 talk_value=0.8
-interval_seconds=40
+interval_seconds=3
 
 reply_keywords=["可不", "花谱", "星界", "里命"]
 reply_when_keywords=false

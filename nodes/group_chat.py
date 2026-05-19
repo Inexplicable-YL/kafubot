@@ -48,7 +48,7 @@ class GroupChatConfig(ConfigModel):
 
     unrestricted_groups: set[int] = set()
     auto_reply_groups: set[int] = set()
-    interval_seconds: int = 15
+    interval_seconds: int = 3
     talk_value: float = 0.8
     reply_keywords: set[str] = set()
     reply_when_keywords: bool = False
@@ -88,12 +88,6 @@ class Histories(BaseModel):
     on_handle: bool = False
     handle_condition: anyio.Condition = Field(default_factory=anyio.Condition)
     lock: anyio.Lock = Field(default_factory=anyio.Lock)
-
-    @property
-    def latest_timestamp(self) -> int:
-        if self.backup_messages:
-            return int(self.backup_messages[-1].timestamp.timestamp())
-        return 0
 
 
 class GroupEvent(BaseModel):
@@ -154,48 +148,56 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         ):
             return True
 
-        if (
-            latest_timestamp := await self.node_state.activity_store.latest_timestamp(
-                scope="group", session_id=session_id
-            )
-        ) and (
-            recent_interval := await self.node_state.activity_store.recent_interval(
-                scope="group", session_id=session_id, window_seconds=600
-            )
+        if latest_timestamp := await self.node_state.activity_store.latest_timestamp(
+            scope="group", session_id=session_id
         ):
-            if len(history_storage.backup_pending_counts) > 1:
-                pending_statistic, _ = cast(
-                    "tuple[Any, Any]",
-                    stats.ttest_1samp(
-                        history_storage.backup_pending_counts,
-                        popmean=len(history_storage.messages),
-                    ),
+            if event_time - latest_timestamp <= self.config.interval_seconds:
+                return True
+            if recent_interval := await self.node_state.activity_store.recent_interval(
+                scope="group", session_id=session_id, window_seconds=600
+            ):
+                if len(history_storage.backup_pending_counts) > 1:
+                    pending_statistic, _ = cast(
+                        "tuple[Any, Any]",
+                        stats.ttest_1samp(
+                            history_storage.backup_pending_counts,
+                            popmean=len(history_storage.messages),
+                        ),
+                    )
+                    pending = _ttest_signal(pending_statistic)
+                else:
+                    pending = 2.0
+                if len(recent_interval) > 1:
+                    interval_statistic, _ = cast(
+                        "tuple[Any, Any]",
+                        stats.ttest_1samp(
+                            recent_interval,
+                            popmean=event_time - latest_timestamp,
+                        ),
+                    )
+                    interval = _ttest_signal(interval_statistic)
+                else:
+                    interval = 2.0
+                equivalent_pending = len(history_storage.messages) + (
+                    7
+                    * math.tanh((pending + interval) / 4)
+                    / (8 * self.config.talk_value)
                 )
-                pending = _ttest_signal(pending_statistic)
-            else:
-                pending = 2.0
-            if len(recent_interval) > 1:
-                interval_statistic, _ = cast(
-                    "tuple[Any, Any]",
-                    stats.ttest_1samp(
-                        recent_interval,
-                        popmean=event_time - latest_timestamp,
-                    ),
-                )
-                interval = _ttest_signal(interval_statistic)
-            else:
-                interval = 2.0
-            equivalent_pending = len(history_storage.messages) + (
-                7 * math.tanh((pending + interval) / 4) / (8 * self.config.talk_value)
-            )
 
-            return equivalent_pending <= 1 / self.config.talk_value
+                return equivalent_pending <= 1 / self.config.talk_value
+            return False
         return False
 
     async def claim_messages(  # noqa: PLR0911
         self,
         group_event: GroupEvent,
     ) -> list[GroupMessage] | None:
+        if (
+            self.event.group_id not in self.config.auto_reply_groups
+            and not group_event.is_tome
+        ):
+            return None
+
         history_storage = group_event.history_storage
         message = group_event.message
         await history_storage.lock.acquire()
@@ -203,7 +205,6 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         try:
             history_storage.messages.append(message)
             len_messages = len(history_storage.messages)
-            latest_timestamp = history_storage.latest_timestamp
             history_storage.backup_messages.append(message)
 
             if history_storage.on_handle:
@@ -235,15 +236,6 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             ):
                 # The message is a reply to someone else, skip.
                 if group_event.to_other:
-                    return None
-                # Group chat is not configured to automatically reply, skip.
-                if self.event.group_id not in self.config.auto_reply_groups:
-                    return None
-                # The message intervals were too short and no keywords were included, skip.
-                if (
-                    self.event.time - latest_timestamp <= self.config.interval_seconds
-                    and not group_event.have_keywords
-                ):
                     return None
                 # Activity is limited, skip.
                 if await self.is_activity_limited(group_event):
