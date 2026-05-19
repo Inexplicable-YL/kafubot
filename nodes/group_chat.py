@@ -66,7 +66,7 @@ class GroupChatConfig(ConfigModel):
     )
 
     @model_validator(mode="after")
-    def _add_default_auto_reply_groups(self):
+    def _add_default(self):
         self.auto_reply_groups = self.auto_reply_groups.union(self.unrestricted_groups)
         self.clear_keywords = self.clear_keywords.union(DEFAULT_CLEAR_KEYWORDS)
         return self
@@ -290,26 +290,16 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 "detail": False,
             }
             for x in messages
-            if isinstance(x, GroupImageMessage)
+            if isinstance(x, GroupImageMessage) and not x.text.strip()
         ]
         if not image_inputs:
             return messages
         results = await self.node_state.image_analyzer.abatch(image_inputs)
         filled_messages = []
         for msg in messages:
-            if isinstance(msg, GroupImageMessage):
-                filled_messages.append(
-                    GroupMessage(
-                        role="user",
-                        timestamp=msg.timestamp,
-                        user=msg.user,
-                        text=f"[图片: {results.pop(0)}]",
-                        user_id=msg.user_id,
-                        message_id=msg.message_id,
-                    )
-                )
-            else:
-                filled_messages.append(msg)
+            if isinstance(msg, GroupImageMessage) and not msg.text.strip():
+                msg.text = results.pop(0)
+            filled_messages.append(msg)
         return filled_messages
 
     async def run_reply(

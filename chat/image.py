@@ -39,14 +39,14 @@ MAX_JPG_SIZE_KB = 512
 USER_AGENT = "Mozilla/5.0"
 
 IMAGE_DB_URL = os.getenv(
-    "IMAGE_DB_URL", "sqlite+aiosqlite:///./image_analysis_cache.db"
+    "IMAGE_DB_URL", "sqlite+aiosqlite:///./.database/image_analysis_cache.db"
 )
 
 IMAGE_MAX_RECORDS = int(os.getenv("IMAGE_MAX_RECORDS", "100"))
 
 IMAGE_PHASH_DISTANCE = int(os.getenv("IMAGE_PHASH_DISTANCE", "5"))
 
-MEME_CHROMA_PATH = os.getenv("MEME_CHROMA_PATH", "./.meme_vectordb")
+MEME_CHROMA_PATH = os.getenv("MEME_CHROMA_PATH", "./.database/meme_vectordb")
 
 MEME_PHASH_DISTANCE = int(os.getenv("MEME_PHASH_DISTANCE", "5"))
 

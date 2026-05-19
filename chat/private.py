@@ -23,7 +23,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from chat.prompt import PRIVATE_SYSTEM_PROMPT
 from chat.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
 
-DB_URL = os.getenv("PRIVATE_HISTORY_DB_URL", "sqlite+aiosqlite:///./private_history.db")
+DB_URL = os.getenv(
+    "PRIVATE_HISTORY_DB_URL", "sqlite+aiosqlite:///./.database/private_history.db"
+)
 TABLE_NAME = os.getenv("PRIVATE_HISTORY_TABLE", "deepseek_chat_messages")
 DEEPSEEK_MODEL = os.getenv("PRIVATE_DEEPSEEK_MODEL", "deepseek-v4-flash")
 CHAT_HISTORY_MAX_MESSAGES = int(os.getenv("PRIVATE_CHAT_HISTORY_MAX_MESSAGES", "500"))

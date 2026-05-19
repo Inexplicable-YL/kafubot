@@ -14,7 +14,7 @@ from sqlalchemy.pool import NullPool
 
 ACTIVITY_DB_URL = os.getenv(
     "ACTIVITY_LIMITS_DB_URL",
-    "sqlite+aiosqlite:///./activity_limits.db",
+    "sqlite+aiosqlite:///./.database/activity_limits.db",
 )
 ACTIVITY_TABLE_NAME = os.getenv("ACTIVITY_LIMITS_TABLE", "activity_records")
 

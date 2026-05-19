@@ -31,7 +31,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 
-DB_URL = os.getenv("CHAT_HISTORY_DB_URL", "sqlite+aiosqlite:///./group_history.db")
+DB_URL = os.getenv(
+    "CHAT_HISTORY_DB_URL", "sqlite+aiosqlite:///./.database/group_history.db"
+)
 TABLE_NAME = os.getenv("CHAT_HISTORY_TABLE", "deepseek_chat_messages")
 
 DECISION_DEEPSEEK_MODEL = os.getenv("DECISION_DEEPSEEK_MODEL", "deepseek-v4-flash")
