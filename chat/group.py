@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import os
 from datetime import UTC, datetime, tzinfo
 from functools import cache
@@ -9,11 +7,7 @@ from typing import TYPE_CHECKING, Any, cast
 from typing_extensions import override
 from zoneinfo import ZoneInfo
 
-import anyio
-from langchain_community.chat_message_histories.sql import (
-    BaseMessageConverter,
-    SQLChatMessageHistory,
-)
+from langchain_community.chat_message_histories.sql import BaseMessageConverter
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import (
@@ -26,16 +20,15 @@ from langchain_core.runnables.branch import RunnableBranch
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_deepseek import ChatDeepSeek
 from pydantic import BaseModel, TypeAdapter
-from sqlalchemy import DateTime, Integer, Text, delete, select
+from sqlalchemy import DateTime, Integer, Text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from chat.prompt import DECISION_SYSTEM_PROMPT, GROUP_SYSTEM_PROMPT
+from chat.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
-
-    from anyio.streams.memory import MemoryObjectSendStream
+    from collections.abc import AsyncIterator
 
 
 DB_URL = os.getenv("CHAT_HISTORY_DB_URL", "sqlite+aiosqlite:///./group_history.db")
@@ -81,21 +74,6 @@ def _get_async_engine() -> AsyncEngine:
     return create_async_engine(DB_URL)
 
 
-def content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            item
-            if isinstance(item, str)
-            else str(item.get("text") or item.get("content") or item)
-            if isinstance(item, dict)
-            else str(item)
-            for item in content
-        )
-    return str(content)
-
-
 class UserMessage(BaseModel):
     timestamp: datetime
     user: str
@@ -108,14 +86,6 @@ class UserMessage(BaseModel):
             self.text,
             timezone=timezone,
         )
-
-
-class AssistantReply(BaseModel):
-    timestamp: datetime
-    text: str
-
-    def __add__(self, other: AssistantReply) -> AssistantReply:
-        return AssistantReply(timestamp=self.timestamp, text=self.text + other.text)
 
 
 class ChatMessageBase(DeclarativeBase):
@@ -233,70 +203,6 @@ class MessageConverter(BaseMessageConverter):
         raise TypeError(f"Unsupported message type: {type(message)}")
 
 
-class LimitedSQLChatMessageHistory(SQLChatMessageHistory):
-    def __init__(
-        self,
-        *args: Any,
-        max_messages: int | None = None,
-        **kwargs: Any,
-    ) -> None:
-        if max_messages is not None and max_messages < 1:
-            raise ValueError("max_messages must be positive or None")
-        self.max_messages = max_messages
-        super().__init__(*args, **kwargs)
-
-    async def aget_messages(self) -> list[BaseMessage]:
-        if self.max_messages is None:
-            return await super().aget_messages()
-
-        await self._acreate_table_if_not_exists()
-        session_id_field = getattr(self.sql_model_class, self.session_id_field_name)
-
-        async with self._make_async_session() as session:
-            stmt = (
-                select(self.sql_model_class)
-                .where(session_id_field == self.session_id)
-                .order_by(self.sql_model_class.id.desc())
-                .limit(self.max_messages)
-            )
-            result = await session.execute(stmt)
-            records = list(result.scalars())
-
-        return [self.converter.from_sql_model(record) for record in reversed(records)]
-
-    async def aadd_message(self, message: BaseMessage) -> None:
-        await super().aadd_message(message)
-        await self._aprune_messages()
-
-    async def aadd_messages(self, messages: Sequence[BaseMessage]) -> None:
-        await super().aadd_messages(messages)
-        await self._aprune_messages()
-
-    async def _aprune_messages(self) -> None:
-        if self.max_messages is None:
-            return
-
-        await self._acreate_table_if_not_exists()
-        session_id_field = getattr(self.sql_model_class, self.session_id_field_name)
-        id_field = self.sql_model_class.id
-
-        async with self._make_async_session() as session:
-            ids_result = await session.execute(
-                select(id_field)
-                .where(session_id_field == self.session_id)
-                .order_by(id_field.desc())
-                .offset(self.max_messages)
-            )
-            ids_to_delete = list(ids_result.scalars())
-            if not ids_to_delete:
-                return
-
-            await session.execute(
-                delete(self.sql_model_class).where(id_field.in_(ids_to_delete))
-            )
-            await session.commit()
-
-
 def get_session_history(session_id: str) -> LimitedSQLChatMessageHistory:
     return LimitedSQLChatMessageHistory(
         session_id=session_id,
@@ -399,7 +305,7 @@ def get_decision_app() -> Runnable[dict[str, Any], bool]:
     )
 
 
-def get_chat_app() -> Runnable[dict[str, Any], AssistantReply]:  # noqa: PLR0915
+def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
     def _normalize_input(payload: dict[str, Any]) -> dict[str, Any]:
         messages = TypeAdapter(list[UserMessage]).validate_python(payload["messages"])
         reasoning_effort = payload.get("reasoning_effort", "high")
@@ -479,71 +385,6 @@ def get_chat_app() -> Runnable[dict[str, Any], AssistantReply]:  # noqa: PLR0915
             extra["assistant_timestamp"] = timestamp
             yield message.model_copy(update={"additional_kwargs": extra})
 
-    async def _to_reply(
-        messages: AsyncIterator[AIMessage],
-    ) -> AsyncIterator[AssistantReply]:
-        input_stream, output_stream = anyio.create_memory_object_stream[AssistantReply](
-            max_buffer_size=10
-        )
-
-        async def trans_and_send(
-            msgs: AsyncIterator[AIMessage],
-            stream: MemoryObjectSendStream[AssistantReply],
-        ) -> None:
-            async def _process_message_chunk(
-                text: str,
-                answer: str,
-            ) -> tuple[str, str | None]:
-                text = text.strip(" ")
-                reply: str | None = None
-                if not text:
-                    return answer, reply
-
-                lines = text.split("\n")
-                for i, line in enumerate(lines):
-                    stripped = line.strip()
-                    if i < len(lines) - 1:
-                        answer += stripped
-                        if answer:
-                            reply = answer
-                        answer = ""
-                    else:
-                        answer += stripped
-                return answer, reply
-
-            answer = ""
-            async for message in msgs:
-                answer, reply = await _process_message_chunk(
-                    content_to_text(message.content),
-                    answer,
-                )
-                if reply is not None:
-                    chunk = AssistantReply(
-                        timestamp=message.additional_kwargs.get(
-                            "assistant_timestamp",
-                            datetime.now(UTC),
-                        ),
-                        text=reply + ("\n" if not reply.endswith("\n") else ""),
-                    )
-                    await stream.send(chunk)
-            if answer.strip():
-                chunk = AssistantReply(
-                    timestamp=datetime.now(UTC),
-                    text=answer.strip(),
-                )
-                await stream.send(chunk)
-            await stream.aclose()
-
-        task = asyncio.create_task(trans_and_send(messages, input_stream))
-        try:
-            async for reply in output_stream:
-                yield reply
-        finally:
-            if not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-
     core_chain = RunnableLambda(_chat_chain_for_payload) | RunnableGenerator(
         _attach_timestamp
     )
@@ -558,11 +399,11 @@ def get_chat_app() -> Runnable[dict[str, Any], AssistantReply]:  # noqa: PLR0915
     return (
         RunnableLambda(_normalize_input)
         | chain_with_history
-        | RunnableGenerator(_to_reply)
+        | RunnableGenerator(to_reply)
     )
 
 
-def get_agent_app() -> Runnable[dict[str, Any], None | AssistantReply]:
+def get_agent_app() -> Runnable[dict[str, Any], None | str]:
     decision_app = get_decision_app()
     chat_app = get_chat_app()
 

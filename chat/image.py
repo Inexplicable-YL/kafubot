@@ -46,15 +46,15 @@ IMAGE_ANALYSIS_CACHE_TABLE = os.getenv(
     "image_analysis_cache",
 )
 IMAGE_ANALYSIS_CACHE_MAX_RECORDS = int(
-    os.getenv("IMAGE_ANALYSIS_CACHE_MAX_RECORDS", "1000")
+    os.getenv("IMAGE_ANALYSIS_CACHE_MAX_RECORDS", "100")
 )
-IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE = int(
-    os.getenv("IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE", "5")
-)
+IMAGE_PHASH_DISTANCE = int(os.getenv("IMAGE_PHASH_DISTANCE", "5"))
 
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./.meme_vectordb")
+MEME_CHROMA_PATH = os.getenv("MEME_CHROMA_PATH", "./.meme_vectordb")
 
-persistent_client = chromadb.PersistentClient(path=CHROMA_PATH)
+MEME_PHASH_DISTANCE = int(os.getenv("MEME_PHASH_DISTANCE", "5"))
+
+persistent_client = chromadb.PersistentClient(path=MEME_CHROMA_PATH)
 _vectorstore: Chroma | None = None
 
 
@@ -245,8 +245,6 @@ class ImageAnalysisCache:
     async def find_similar_by_phash(
         self,
         phash: imagehash.ImageHash | str,
-        *,
-        max_distance: int = 5,
         limit: int | None = None,
     ) -> list[ImageAnalysisCacheEntry]:
         await self._ensure_schema()
@@ -258,7 +256,7 @@ class ImageAnalysisCache:
         similar_records = [
             record
             for record in records
-            if imagehash.hex_to_hash(record.phash) - target <= max_distance
+            if imagehash.hex_to_hash(record.phash) - target <= IMAGE_PHASH_DISTANCE
         ]
         similar_records.sort(
             key=lambda record: (
@@ -339,7 +337,7 @@ async def read_image(path: str, url: str | None = None) -> ImageReadResult | Non
                     img = bg
                 else:
                     img = img.convert("RGB")
-                perceptual_hash = imagehash.dhash(img)
+                perceptual_hash = imagehash.phash(img)
                 while True:
                     best: bytes | None = None
 
@@ -490,7 +488,6 @@ def get_image_analyzer(
         if cached_text is None and isinstance(phash, imagehash.ImageHash):
             similar_entries = await cache.find_similar_by_phash(
                 phash,
-                max_distance=IMAGE_ANALYSIS_CACHE_PHASH_DISTANCE,
                 limit=10,
             )
             for entry in similar_entries:
@@ -519,8 +516,8 @@ def get_image_analyzer(
                     phash=phash,
                     **values,
                 )
-        if x.get("as_meme", False):
-            await add_memes([str(x["image"])], [abstract])
+        if x.get("as_meme", False) and isinstance(phash, imagehash.ImageHash):
+            await add_memes([str(x["image"])], [abstract], [phash])
         return abstract
 
     return (
@@ -533,30 +530,85 @@ def get_image_analyzer(
     )
 
 
+def has_similar_meme_phash(
+    phash: imagehash.ImageHash,
+    *,
+    max_distance: int = MEME_PHASH_DISTANCE,
+) -> bool:
+    collection = get_vectorstore()._collection
+    total = collection.count()
+    batch_size = 500
+    for offset in range(0, total, batch_size):
+        result = collection.get(
+            limit=batch_size,
+            offset=offset,
+            include=["metadatas"],
+        )
+        metadatas = result.get("metadatas") or []
+        for metadata_value in metadatas:
+            metadata = dict(metadata_value or {})
+            existing_phash = metadata.get("phash")
+            if not isinstance(existing_phash, str) or not existing_phash:
+                continue
+            with contextlib.suppress(Exception):
+                if imagehash.hex_to_hash(existing_phash) - phash <= max_distance:
+                    return True
+    return False
+
+
 async def add_memes(
     base64s: list[str],
     analyses: list[str],
-) -> None:
-    if len(base64s) != len(analyses):
-        raise ValueError("base64s and analyses must have the same length")
+    phashs: list[imagehash.ImageHash],
+) -> list[str | None]:
+    if len(base64s) != len(analyses) or len(base64s) != len(phashs):
+        raise ValueError("base64s, analyses and phashs must have the same length")
     base64s = [b if b.startswith("base64://") else "base64://" + b for b in base64s]
 
-    await get_vectorstore().aadd_texts(
-        texts=analyses,
-        metadatas=[{"base64": base64} for base64 in base64s],
+    accepted_indices: list[int] = []
+    accepted_phashs: list[imagehash.ImageHash] = []
+    ids_by_index: list[str | None] = [None] * len(base64s)
+    for index, phash in enumerate(phashs):
+        if has_similar_meme_phash(phash):
+            continue
+        if any(
+            existing_phash - phash < MEME_PHASH_DISTANCE
+            for existing_phash in accepted_phashs
+        ):
+            continue
+        accepted_indices.append(index)
+        accepted_phashs.append(phash)
+
+    if not accepted_indices:
+        return ids_by_index
+
+    added_ids = await get_vectorstore().aadd_texts(
+        texts=[analyses[index] for index in accepted_indices],
+        metadatas=[
+            {
+                "base64": base64s[index],
+                "phash": str(phashs[index]),
+            }
+            for index in accepted_indices
+        ],
     )
+    for index, id_ in zip(accepted_indices, added_ids, strict=False):
+        ids_by_index[index] = id_
+    return ids_by_index
 
 
 @dataclass
 class SearchResult:
     base64: str
     analysis: str
+    phash: imagehash.ImageHash | None = None
 
 
 async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
     image_analyzer = get_image_analyzer(use_cache=False)
     analysis_results: list[tuple[str, SearchResult]] = []
     failed_files: list[str] = []
+    duplicate_files: list[str] = []
     semaphore = anyio.Semaphore(5)
 
     async def _handle_url(file: str) -> None:
@@ -575,6 +627,9 @@ async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
                 if result is None:
                     failed_files.append(file)
                     return
+                if has_similar_meme_phash(result.phash):
+                    duplicate_files.append(file)
+                    return
                 analysis = await image_analyzer.ainvoke(
                     {
                         "image": result.base64,
@@ -588,6 +643,7 @@ async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
                         SearchResult(
                             base64="base64://" + result.base64,
                             analysis=analysis,
+                            phash=result.phash,
                         ),
                     )
                 )
@@ -599,15 +655,32 @@ async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
             tg.start_soon(_handle_url, file)
 
     if analysis_results:
-        texts = [r[1].analysis for r in analysis_results]
-        metadatas = [{"base64": r[1].base64} for r in analysis_results]
-
-        await get_vectorstore().aadd_texts(
-            texts=texts,
-            metadatas=metadatas,
+        ready_results: list[tuple[str, SearchResult]] = []
+        ready_phashs: list[imagehash.ImageHash] = []
+        for file, result in analysis_results:
+            if result.phash is None:
+                failed_files.append(file)
+                continue
+            ready_results.append((file, result))
+            ready_phashs.append(result.phash)
+        added_ids = await add_memes(
+            [result.base64 for _, result in ready_results],
+            [result.analysis for _, result in ready_results],
+            ready_phashs,
         )
+        added_results: list[tuple[str, SearchResult]] = []
+        for (file, result), id_ in zip(ready_results, added_ids, strict=False):
+            if id_ is None:
+                duplicate_files.append(file)
+                continue
+            added_results.append((file, result))
+        analysis_results = added_results
     if failed_files:
         print(f"以下 {len(failed_files)} 个 FILE 分析失败：{failed_files}")
+    if duplicate_files:
+        print(
+            f"以下 {len(duplicate_files)} 个 FILE 已存在相似 meme，跳过入库：{duplicate_files}"
+        )
     return analysis_results
 
 

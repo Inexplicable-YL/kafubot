@@ -17,7 +17,6 @@ from sekaibot.config import ConfigModel
 
 from chat.activity import ActivityStore, get_activity_store
 from chat.group import (
-    AssistantReply,
     clear_session_history,
     get_agent_app,
 )
@@ -27,23 +26,14 @@ from chat.prompt import (
 )
 from chat.utils import parse_message
 
-BASE_AUTO_REPLY_GROUPS = {
-    596488203,
-    1011357049,
-    1058218429,
-    1087911123,
-    834922207,
-    895484096,
-}
-
 BACKUP_MESSAGES_LIMIT = 40
 BACKUP_PENDING_COUNTS_LIMIT = 10
 
 EXTRA_PROMPT_MAX_HISTORY = 5
 
-DEFAULT_USERNAME = "用户"
+DEFAULT_USERNAME = "陌生用户"
 
-DELETE_MESSAGE_KEYWORDS = ["/clear", "/清除"]
+DEFAULT_CLEAR_KEYWORDS = {"/clear", "/清除"}
 
 
 def _ttest_signal(statistic: Any) -> float:
@@ -54,15 +44,15 @@ def _ttest_signal(statistic: Any) -> float:
 
 
 class GroupChatConfig(ConfigModel):
-    """群聊记录节点配置"""
-
     __config_name__ = "group_chat"
 
-    auto_reply_groups: set[int] = BASE_AUTO_REPLY_GROUPS
-    interval_seconds: int = 40
+    unrestricted_groups: set[int] = set()
+    auto_reply_groups: set[int] = set()
+    interval_seconds: int = 15
     talk_value: float = 0.8
-    keywords: set[str] = {"可不", "花谱"}
+    reply_keywords: set[str] = set()
     reply_when_keywords: bool = False
+    clear_keywords: set[str] = set()
     # (window_seconds, threshold)
     activity_limits: tuple[tuple[int, int], ...] = (
         (3600 * 5, 100),
@@ -71,7 +61,8 @@ class GroupChatConfig(ConfigModel):
 
     @model_validator(mode="after")
     def _add_default_auto_reply_groups(self):
-        self.auto_reply_groups = self.auto_reply_groups.union(BASE_AUTO_REPLY_GROUPS)
+        self.auto_reply_groups = self.auto_reply_groups.union(self.unrestricted_groups)
+        self.clear_keywords = self.clear_keywords.union(DEFAULT_CLEAR_KEYWORDS)
         return self
 
 
@@ -105,12 +96,23 @@ class Histories(BaseModel):
         return 0
 
 
+class GroupEvent(BaseModel):
+    session_id: str
+    history_storage: Histories
+    message: GroupMessage
+    is_tome: bool
+    have_keywords: bool
+    to_other: bool
+
+    @property
+    def time(self) -> int:
+        return int(self.message.timestamp.timestamp())
+
+
 class GroupChatState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    agent: Runnable[dict[str, Any], None | AssistantReply] = Field(
-        default_factory=get_agent_app
-    )
+    agent: Runnable[dict[str, Any], None | str] = Field(default_factory=get_agent_app)
     activity_store: ActivityStore = Field(default_factory=get_activity_store)
     storages: dict[str, Histories] = Field(default_factory=dict)
     storages_lock: anyio.Lock = Field(default_factory=anyio.Lock)
@@ -136,19 +138,22 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
 
     async def is_activity_limited(
         self,
-        session_id: str,
-        event_time: int,
-        history_storage: Histories,
+        group_event: GroupEvent,
     ) -> bool:
-        if int(session_id) in BASE_AUTO_REPLY_GROUPS:
-            return False
-        if await self.node_state.activity_store.is_limited(
-            scope="group",
-            session_id=session_id,
-            event_time=event_time,
-            activity_limits=self.config.activity_limits,
+        session_id = group_event.session_id
+        history_storage = group_event.history_storage
+        event_time = group_event.time
+        if (
+            int(session_id) not in self.config.unrestricted_groups
+            and await self.node_state.activity_store.is_limited(
+                scope="group",
+                session_id=session_id,
+                event_time=event_time,
+                activity_limits=self.config.activity_limits,
+            )
         ):
             return True
+
         if (
             latest_timestamp := await self.node_state.activity_store.latest_timestamp(
                 scope="group", session_id=session_id
@@ -189,13 +194,10 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
 
     async def claim_messages(  # noqa: PLR0911
         self,
-        session_id: str,
-        history_storage: Histories,
-        message: GroupMessage,
-        is_tome: bool,
-        have_keywords: bool,
-        to_other: bool,
+        group_event: GroupEvent,
     ) -> list[GroupMessage] | None:
+        history_storage = group_event.history_storage
+        message = group_event.message
         await history_storage.lock.acquire()
         is_released = False
         try:
@@ -227,9 +229,12 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                     return None
 
             # There was no response to the previous incident and the message did not refer to the bot.
-            if len_messages == len(history_storage.messages) and not is_tome:
+            if (
+                len_messages == len(history_storage.messages)
+                and not group_event.is_tome
+            ):
                 # The message is a reply to someone else, skip.
-                if to_other:
+                if group_event.to_other:
                     return None
                 # Group chat is not configured to automatically reply, skip.
                 if self.event.group_id not in self.config.auto_reply_groups:
@@ -237,13 +242,11 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 # The message intervals were too short and no keywords were included, skip.
                 if (
                     self.event.time - latest_timestamp <= self.config.interval_seconds
-                    and not have_keywords
+                    and not group_event.have_keywords
                 ):
                     return None
                 # Activity is limited, skip.
-                if await self.is_activity_limited(
-                    session_id, self.event.time, history_storage
-                ):
+                if await self.is_activity_limited(group_event):
                     return None
             history_storage.on_handle = True
             current_messages = history_storage.messages
@@ -255,11 +258,11 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
 
     async def run_reply(
         self,
-        session_id: str,
-        history_storage: Histories,
+        group_event: GroupEvent,
+        *,
         current_messages: list[GroupMessage],
-        is_tome: bool,
     ) -> bool:
+        history_storage = group_event.history_storage
         history_text = "\n".join(
             [
                 item.text
@@ -284,11 +287,11 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 "extra_prompt": extra_prompt,
                 "thinking": True,
                 "reasoning_effort": "high",
-                "is_tome": is_tome,
+                "is_tome": group_event.is_tome,
             },
-            config={"configurable": {"session_id": session_id}},
+            config={"configurable": {"session_id": group_event.session_id}},
         ):
-            if reply is not None and (reply_msg := reply.text.strip()):
+            if reply is not None and (reply_msg := reply.strip()):
                 print(f"Reply-Group: {reply_msg}")
                 full_text += reply_msg + "\n"
                 segments, text = parse_message(reply_msg)
@@ -360,10 +363,12 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
 
     async def finish_reply(
         self,
-        history_storage: Histories,
+        group_event: GroupEvent,
+        *,
         current_messages: list[GroupMessage],
         replied: bool,
     ) -> None:
+        history_storage = group_event.history_storage
         async with history_storage.lock:
             if not replied:
                 history_storage.messages = current_messages + history_storage.messages
@@ -386,13 +391,13 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 del self.node_state.storages[session_id]
         await self.reply("[SYSTEM]已清除历史", at_sender=True)
 
-    async def get_text(
+    async def get_text_or_clear_chat(
         self, session_id: str, history_storage: Histories, to_me: bool
     ) -> tuple[str | None, bool]:
         text = self.event.message.get_plain_text().strip()
         if not text:
             return None, False
-        if any(keyw in text for keyw in DELETE_MESSAGE_KEYWORDS):
+        if any(keyw in text for keyw in self.config.clear_keywords):
             await self.delete_chat(session_id=session_id)
             return None, False
         to_other = False
@@ -433,53 +438,56 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             + "\n"
             + opencc.OpenCC("t2s").convert(text)
         )
-        return any(keyw in text for keyw in self.config.keywords)
+        return any(keyw in text for keyw in self.config.reply_keywords)
 
-    @override
-    async def handle(self) -> None:
+    async def get_event(self) -> GroupEvent | None:
         session_id = str(self.event.group_id)
         history_storage = await self.get_history_storage(session_id)
         is_tome = self.event.is_tome()
-        text, to_other = await self.get_text(session_id, history_storage, is_tome)
+        text, to_other = await self.get_text_or_clear_chat(
+            session_id, history_storage, is_tome
+        )
         if not text:
-            return
+            return None
         timestamp = datetime.fromtimestamp(self.event.time, tz=UTC)
         user = self.event.sender.nickname or DEFAULT_USERNAME
         have_keywords = self.have_keywords(text)
         if self.config.reply_when_keywords:
             is_tome = is_tome or have_keywords
-
-        message = GroupMessage(
-            role="user",
-            timestamp=timestamp,
-            user=user,
-            text=text,
-            user_id=str(self.event.user_id),
-            message_id=str(self.event.message_id),
-        )
-
-        current_messages = await self.claim_messages(
+        return GroupEvent(
             session_id=session_id,
             history_storage=history_storage,
-            message=message,
+            message=GroupMessage(
+                role="user",
+                timestamp=timestamp,
+                user=user,
+                text=text,
+                user_id=str(self.event.user_id),
+                message_id=str(self.event.message_id),
+            ),
             is_tome=is_tome,
             have_keywords=have_keywords,
             to_other=to_other,
         )
+
+    @override
+    async def handle(self) -> None:
+        group_event = await self.get_event()
+        if group_event is None:
+            return
+        current_messages = await self.claim_messages(group_event)
         if current_messages is None:
             return
 
         replied = False
         try:
             replied = await self.run_reply(
-                session_id=session_id,
-                history_storage=history_storage,
+                group_event,
                 current_messages=current_messages,
-                is_tome=is_tome,
             )
         finally:
             await self.finish_reply(
-                history_storage=history_storage,
+                group_event,
                 current_messages=current_messages,
                 replied=replied,
             )

@@ -24,6 +24,14 @@ api_timeout=10
 superusers = ["2682064633", "3613158872", "2641460187", "group_596488203", "group_1011357049"]
 
 [node.group_chat]
+unrestricted_groups=[
+    596488203,
+    1011357049,
+    1058218429,
+    1087911123,
+    834922207,
+    895484096,
+]
 auto_reply_groups=[
     648749016,
     752699901,
@@ -36,15 +44,20 @@ auto_reply_groups=[
     154243984,
     924342546,
 ]
+
 talk_value=0.8
 interval_seconds=40
+
+reply_keywords=["可不", "花谱", "星界", "里命"]
+reply_when_keywords=false
+clear_keywords=["/clear", "/清除"]
+
 activity_limits=[
     [3600, 30],
     [18000, 90],
     [604800, 500],
 ]
-keywords=["可不", "花谱", "星界", "里命"]
-reply_when_keywords=false
+
 
 [node.private_chat]
 merge_window_seconds=5

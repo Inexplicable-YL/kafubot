@@ -8,20 +8,31 @@ import json
 import os
 import tempfile
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import imagehash
 from aiohttp import web
 from aiohttp.multipart import BodyPartReader
 from langchain_core.documents import Document
 
-from chat.image import CHROMA_PATH, get_vectorstore, meme_analysis
+from chat.image import (
+    MEME_CHROMA_PATH,
+    MEME_PHASH_DISTANCE,
+    add_memes,
+    get_image_analyzer,
+    get_vectorstore,
+    read_image,
+)
 
 FilterName = Literal["unlabeled", "labeled", "all"]
 _CHROMA_LOCK = threading.RLock()
 _LOCK_FILE_NAME = ".meme_label_webui.lock"
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+_DUPLICATE_GROUP_MIN_SIZE = 2
+_PENDING_NEW_ID_PREFIX = "pending-add:"
 PRESET_ANALYSIS_PREFIXES = [
     "角色是花谱。",
     "角色是星界。",
@@ -41,6 +52,25 @@ class MemeRecord:
         if isinstance(value, str):
             return value.lower() in {"1", "true", "yes", "y"}
         return bool(value)
+
+
+@dataclass(frozen=True)
+class DuplicateGroup:
+    records: list[MemeRecord]
+    min_distance: int
+    max_distance: int
+    pending_token: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingDuplicateAdd:
+    base64: str
+    analysis: str
+    phash: imagehash.ImageHash
+    metadata: dict[str, str | bool]
+
+
+_PENDING_DUPLICATE_ADDS: dict[str, PendingDuplicateAdd] = {}
 
 
 HTML = r"""<!doctype html>
@@ -199,6 +229,60 @@ HTML = r"""<!doctype html>
       color: var(--accent);
       background: rgba(47, 107, 95, 0.1);
     }
+    .duplicate-panel {
+      margin: 0 28px 10px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(255, 250, 240, 0.82);
+      box-shadow: 0 12px 30px var(--shadow);
+      overflow: hidden;
+    }
+    .duplicate-panel[hidden] {
+      display: none;
+    }
+    .duplicate-body {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .duplicate-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .duplicate-card {
+      display: grid;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 10px;
+      background: #fffdf8;
+    }
+    .duplicate-card img {
+      width: 100%;
+      height: 180px;
+      object-fit: contain;
+      border-radius: 10px;
+      box-shadow: none;
+    }
+    .duplicate-card .analysis-preview {
+      min-height: 4.6em;
+      max-height: 7em;
+      overflow: auto;
+      color: var(--ink);
+      line-height: 1.45;
+      font-size: 13px;
+    }
+    .keep-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--ink);
+      font-size: 14px;
+    }
+    .keep-toggle input {
+      accent-color: var(--accent);
+    }
     .image-wrap {
       padding: 18px;
       min-height: 440px;
@@ -284,6 +368,7 @@ HTML = r"""<!doctype html>
       header { align-items: flex-start; flex-direction: column; }
       main { grid-template-columns: 1fr; padding: 8px 14px 18px; }
       .add-panel { margin: 0 14px 10px; }
+      .duplicate-panel { margin: 0 14px 10px; }
       .add-grid { grid-template-columns: 1fr; }
       .image-wrap { min-height: 300px; }
     }
@@ -310,6 +395,7 @@ HTML = r"""<!doctype html>
       </label>
       <button class="secondary" id="prev">上一条</button>
       <button class="secondary" id="next">跳过/下一条</button>
+      <button class="secondary" id="dedupe">全库查重</button>
     </div>
   </header>
   <section class="add-panel">
@@ -333,6 +419,22 @@ HTML = r"""<!doctype html>
         <div class="drop-zone" id="drop-zone">拖入图片，或点击选择文件</div>
         <input id="add-file" type="file" accept="image/*" hidden>
       </div>
+    </div>
+  </section>
+  <section class="duplicate-panel" id="duplicate-panel" hidden>
+    <div class="panel-head">
+      <strong>重复表情包审核</strong>
+      <span class="pill" id="duplicate-position">-</span>
+    </div>
+    <div class="duplicate-body">
+      <div class="toolbar">
+        <button class="secondary" id="duplicate-prev">上一组</button>
+        <button class="secondary" id="duplicate-next">下一组</button>
+        <button id="duplicate-resolve">保留勾选并删除其余</button>
+        <button class="secondary" id="duplicate-close">关闭</button>
+      </div>
+      <div class="status" id="duplicate-status"></div>
+      <div class="duplicate-grid" id="duplicate-grid"></div>
     </div>
   </section>
   <main>
@@ -369,7 +471,14 @@ HTML = r"""<!doctype html>
   </main>
   <script>
     const presetPrefixes = __PRESET_ANALYSIS_PREFIXES__;
-    const state = { filter: "unlabeled", index: 0, record: null, total: 0 };
+    const state = {
+      filter: "unlabeled",
+      index: 0,
+      record: null,
+      total: 0,
+      duplicateGroups: [],
+      duplicateIndex: 0,
+    };
     const el = (id) => document.getElementById(id);
 
     function setStatus(text, isError = false) {
@@ -378,9 +487,17 @@ HTML = r"""<!doctype html>
     }
 
     function setBusy(busy) {
-      for (const id of ["prev", "next", "save", "delete", "filter"]) {
+      for (const id of [
+        "prev", "next", "save", "delete", "filter", "dedupe",
+        "duplicate-prev", "duplicate-next", "duplicate-resolve",
+      ]) {
         el(id).disabled = busy;
       }
+    }
+
+    function setDuplicateStatus(text, isError = false) {
+      el("duplicate-status").textContent = text;
+      el("duplicate-status").style.color = isError ? "var(--danger)" : "var(--muted)";
     }
 
     function setAddBusy(busy) {
@@ -501,6 +618,109 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function renderDuplicateGroup() {
+      el("duplicate-panel").hidden = false;
+      const grid = el("duplicate-grid");
+      grid.replaceChildren();
+
+      if (!state.duplicateGroups.length) {
+        el("duplicate-position").textContent = "0 / 0";
+        setDuplicateStatus("没有发现需要审核的重复组");
+        return;
+      }
+
+      state.duplicateIndex = Math.max(
+        0,
+        Math.min(state.duplicateIndex, state.duplicateGroups.length - 1),
+      );
+      const group = state.duplicateGroups[state.duplicateIndex];
+      el("duplicate-position").textContent =
+        `${state.duplicateIndex + 1} / ${state.duplicateGroups.length} · 距离 ${group.min_distance}-${group.max_distance}`;
+      setDuplicateStatus("取消勾选要删除的记录；可保留一个或多个。");
+
+      for (const record of group.records) {
+        const card = document.createElement("article");
+        card.className = "duplicate-card";
+        if (record.image_src) {
+          const img = document.createElement("img");
+          img.src = record.image_src;
+          img.alt = "meme";
+          card.appendChild(img);
+        }
+        const keep = document.createElement("label");
+        keep.className = "keep-toggle";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = true;
+        checkbox.value = record.id;
+        keep.appendChild(checkbox);
+        keep.appendChild(document.createTextNode("保留"));
+        card.appendChild(keep);
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = `${record.pending ? "待新增" : "已有"} · ID: ${record.id} · phash: ${record.phash || "-"}`;
+        card.appendChild(meta);
+
+        const analysis = document.createElement("div");
+        analysis.className = "analysis-preview";
+        analysis.textContent = record.analysis || "";
+        card.appendChild(analysis);
+        grid.appendChild(card);
+      }
+    }
+
+    async function loadDuplicates() {
+      setBusy(true);
+      setDuplicateStatus("查重中...");
+      try {
+        const resp = await fetch("/api/duplicates");
+        const payload = await resp.json();
+        if (!resp.ok) throw new Error(payload.error || "查重失败");
+        state.duplicateGroups = payload.groups || [];
+        state.duplicateIndex = 0;
+        renderDuplicateGroup();
+      } catch (err) {
+        el("duplicate-panel").hidden = false;
+        setDuplicateStatus(err.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function resolveDuplicateGroup() {
+      if (!state.duplicateGroups.length) return;
+      const group = state.duplicateGroups[state.duplicateIndex];
+      const keepIds = Array.from(
+        document.querySelectorAll("#duplicate-grid input[type='checkbox']:checked"),
+      ).map((input) => input.value);
+      if (!keepIds.length) {
+        setDuplicateStatus("至少保留一条记录", true);
+        return;
+      }
+      setBusy(true);
+      setDuplicateStatus("处理中...");
+      try {
+        const resp = await fetch("/api/duplicates/resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            group_ids: group.records.map((record) => record.id),
+            keep_ids: keepIds,
+            pending_token: group.pending_token || null,
+          }),
+        });
+        const payload = await resp.json();
+        if (!resp.ok) throw new Error(payload.error || "处理失败");
+        await loadDuplicates();
+        setDuplicateStatus(`已删除 ${payload.deleted} 条，保留 ${payload.kept} 条`);
+      } catch (err) {
+        setDuplicateStatus(err.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
     async function loadRecord(index = state.index) {
       setBusy(true);
       setStatus("加载中...");
@@ -584,6 +804,13 @@ HTML = r"""<!doctype html>
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || "添加失败");
+        if (data.duplicate_review) {
+          state.duplicateGroups = [data.group];
+          state.duplicateIndex = 0;
+          renderDuplicateGroup();
+          setStatus("发现重复表情包，请在重复审核区选择保留项。");
+          return;
+        }
         state.filter = data.filter;
         el("filter").value = data.filter;
         render(data);
@@ -605,6 +832,13 @@ HTML = r"""<!doctype html>
         const resp = await fetch("/api/add", { method: "POST", body: form });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || "添加失败");
+        if (data.duplicate_review) {
+          state.duplicateGroups = [data.group];
+          state.duplicateIndex = 0;
+          renderDuplicateGroup();
+          setStatus("发现重复表情包，请在重复审核区选择保留项。");
+          return;
+        }
         state.filter = data.filter;
         el("filter").value = data.filter;
         render(data);
@@ -623,8 +857,21 @@ HTML = r"""<!doctype html>
     });
     el("prev").addEventListener("click", () => loadRecord(Math.max(0, state.index - 1)));
     el("next").addEventListener("click", () => loadRecord(state.index + 1));
+    el("dedupe").addEventListener("click", loadDuplicates);
     el("save").addEventListener("click", saveRecord);
     el("delete").addEventListener("click", deleteRecord);
+    el("duplicate-prev").addEventListener("click", () => {
+      state.duplicateIndex -= 1;
+      renderDuplicateGroup();
+    });
+    el("duplicate-next").addEventListener("click", () => {
+      state.duplicateIndex += 1;
+      renderDuplicateGroup();
+    });
+    el("duplicate-resolve").addEventListener("click", resolveDuplicateGroup);
+    el("duplicate-close").addEventListener("click", () => {
+      el("duplicate-panel").hidden = true;
+    });
     el("add-path-btn").addEventListener("click", () => {
       const path = el("add-path").value.trim();
       if (!path) return setStatus("本地路径不能为空", true);
@@ -663,7 +910,7 @@ def _collection():
 
 @contextlib.contextmanager
 def _chroma_operation_lock():
-    lock_path = Path(CHROMA_PATH) / _LOCK_FILE_NAME
+    lock_path = Path(MEME_CHROMA_PATH) / _LOCK_FILE_NAME
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.touch(exist_ok=True)
     with _CHROMA_LOCK, lock_path.open("r+b") as lock_file:
@@ -731,52 +978,6 @@ def _read_records_unlocked() -> list[MemeRecord]:
     return records
 
 
-def _read_record_ids_unlocked() -> set[str]:
-    collection = _collection()
-    total = collection.count()
-    ids: set[str] = set()
-    batch_size = 500
-    for offset in range(0, total, batch_size):
-        result = collection.get(
-            limit=batch_size,
-            offset=offset,
-            include=["documents"],
-        )
-        ids.update(result.get("ids") or [])
-    return ids
-
-
-def _find_added_record_id_unlocked(
-    before_ids: set[str],
-    *,
-    base64_value: str,
-    analysis: str,
-) -> str | None:
-    collection = _collection()
-    total = collection.count()
-    batch_size = 200
-    candidates: list[str] = []
-    for offset in range(0, total, batch_size):
-        result = collection.get(
-            limit=batch_size,
-            offset=offset,
-            include=["documents", "metadatas"],
-        )
-        ids = result.get("ids") or []
-        documents = result.get("documents") or []
-        metadatas = result.get("metadatas") or []
-        for i, id_ in enumerate(ids):
-            if id_ in before_ids:
-                continue
-            metadata = metadatas[i] or {} if i < len(metadatas) else {}
-            document = documents[i] if i < len(documents) else None
-            if metadata.get("base64") == base64_value and document == analysis:
-                candidates.append(id_)
-    if not candidates:
-        return None
-    return candidates[-1]
-
-
 def _record_response_for_id(id_: str) -> dict[str, Any]:
     records = _read_records()
     counts = _counts(records)
@@ -792,25 +993,74 @@ def _record_response_for_id(id_: str) -> dict[str, Any]:
     raise web.HTTPNotFound(text="record not found")
 
 
+def _pending_record_id(token: str) -> str:
+    return _PENDING_NEW_ID_PREFIX + token
+
+
+def _records_similar_to_phash(
+    records: list[MemeRecord],
+    phash: imagehash.ImageHash,
+) -> list[tuple[MemeRecord, int]]:
+    matches: list[tuple[MemeRecord, int]] = []
+    for record in records:
+        existing_phash = _record_phash(record)
+        if existing_phash is None:
+            continue
+        distance = int(existing_phash - phash)
+        if distance < MEME_PHASH_DISTANCE:
+            matches.append((record, distance))
+    matches.sort(key=lambda item: (item[1], item[0].id))
+    return matches
+
+
 async def _analyze_and_add_source(
     source: str,
     *,
     metadata: dict[str, str | bool],
-) -> str:
-    with _chroma_operation_lock():
-        before_ids = _read_record_ids_unlocked()
-        results = await meme_analysis([source])
-        if not results:
-            raise web.HTTPBadRequest(text="image analysis failed")
+) -> dict[str, Any]:
+    if source.startswith(("http://", "https://")):
+        image = await read_image(path="", url=source)
+    else:
+        image = await read_image(path=source, url=None)
+    if image is None:
+        raise web.HTTPBadRequest(text="image analysis failed")
 
-        _, search_result = results[0]
-        record_id = _find_added_record_id_unlocked(
-            before_ids,
-            base64_value=search_result.base64,
-            analysis=search_result.analysis,
-        )
+    analysis = await get_image_analyzer(use_cache=False).ainvoke(
+        {
+            "image": image.base64,
+            "phash": image.phash,
+            "detail": True,
+        }
+    )
+    base64_value = "base64://" + image.base64
+
+    with _chroma_operation_lock():
+        records = _read_records_unlocked()
+        similar_records = _records_similar_to_phash(records, image.phash)
+        if similar_records:
+            token = uuid.uuid4().hex
+            _PENDING_DUPLICATE_ADDS[token] = PendingDuplicateAdd(
+                base64=base64_value,
+                analysis=analysis,
+                phash=image.phash,
+                metadata=metadata,
+            )
+            distances = [distance for _, distance in similar_records]
+            group = DuplicateGroup(
+                records=[record for record, _ in similar_records],
+                min_distance=min(distances),
+                max_distance=max(distances),
+                pending_token=token,
+            )
+            return {
+                "duplicate_review": True,
+                "group": _serialize_duplicate_group(group),
+            }
+
+        added_ids = await add_memes([base64_value], [analysis], [image.phash])
+        record_id = added_ids[0] if added_ids else None
         if record_id is None:
-            raise web.HTTPInternalServerError(text="added record not found")
+            raise web.HTTPConflict(text="similar meme already exists")
 
         record = _get_record_by_id(record_id)
         if record is None:
@@ -820,7 +1070,18 @@ async def _analyze_and_add_source(
         updated_metadata.update(metadata)
         updated_metadata.setdefault("manually_annotated", False)
         _collection().update(ids=[record_id], metadatas=[updated_metadata])
-        return record_id
+        records = _read_records_unlocked()
+        counts = _counts(records)
+        for index, added_record in enumerate(records):
+            if added_record.id == record_id:
+                return {
+                    "filter": "all",
+                    "index": index,
+                    "total": len(records),
+                    "counts": counts,
+                    "record": _serialize_record(added_record),
+                }
+        raise web.HTTPInternalServerError(text="added record not readable")
 
 
 def _validate_url(value: str) -> str:
@@ -874,7 +1135,7 @@ async def _save_upload_to_temp(request: web.Request) -> tuple[str, str]:
     return temp_path, filename
 
 
-async def _add_from_json(request: web.Request) -> str:
+async def _add_from_json(request: web.Request) -> dict[str, Any]:
     payload = await _read_json(request)
     source_type = _required_string(payload, "type")
     value = _required_non_empty_text(payload, "value")
@@ -893,7 +1154,7 @@ async def _add_from_json(request: web.Request) -> str:
     raise web.HTTPBadRequest(text="type must be url or path")
 
 
-async def _add_from_upload(request: web.Request) -> str:
+async def _add_from_upload(request: web.Request) -> dict[str, Any]:
     temp_path, filename = await _save_upload_to_temp(request)
     try:
         return await _analyze_and_add_source(
@@ -924,6 +1185,79 @@ def _counts(records: list[MemeRecord]) -> dict[str, int]:
     }
 
 
+def _record_phash(record: MemeRecord) -> imagehash.ImageHash | None:
+    value = record.metadata.get("phash")
+    if not isinstance(value, str) or not value:
+        return None
+    with contextlib.suppress(Exception):
+        return imagehash.hex_to_hash(value)
+    return None
+
+
+def _dedupe_reviewed(record: MemeRecord) -> bool:
+    value = record.metadata.get("dedupe_reviewed", False)
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _find_duplicate_groups(records: list[MemeRecord]) -> list[DuplicateGroup]:
+    hashed: list[tuple[MemeRecord, imagehash.ImageHash]] = []
+    for record in records:
+        phash = _record_phash(record)
+        if phash is not None:
+            hashed.append((record, phash))
+    parent = list(range(len(hashed)))
+    distances: dict[tuple[int, int], int] = {}
+
+    def root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = root(left)
+        right_root = root(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for i, (_, left_phash) in enumerate(hashed):
+        for j in range(i + 1, len(hashed)):
+            distance = int(left_phash - hashed[j][1])
+            if distance < MEME_PHASH_DISTANCE:
+                distances[(i, j)] = distance
+                union(i, j)
+
+    grouped: dict[int, list[int]] = {}
+    for index in range(len(hashed)):
+        grouped.setdefault(root(index), []).append(index)
+
+    groups: list[DuplicateGroup] = []
+    for indexes in grouped.values():
+        if len(indexes) < _DUPLICATE_GROUP_MIN_SIZE:
+            continue
+        group_records = [hashed[index][0] for index in indexes]
+        if all(_dedupe_reviewed(record) for record in group_records):
+            continue
+        index_set = set(indexes)
+        group_distances = [
+            distance
+            for (left, right), distance in distances.items()
+            if left in index_set and right in index_set
+        ]
+        groups.append(
+            DuplicateGroup(
+                records=group_records,
+                min_distance=min(group_distances),
+                max_distance=max(group_distances),
+            )
+        )
+
+    groups.sort(key=lambda group: (group.min_distance, group.records[0].id))
+    return groups
+
+
 def _serialize_record(record: MemeRecord) -> dict[str, Any]:
     return {
         "id": record.id,
@@ -931,6 +1265,33 @@ def _serialize_record(record: MemeRecord) -> dict[str, Any]:
         "manually_annotated": record.manually_annotated,
         "image_src": _image_src(record.metadata.get("base64")),
         "url": record.metadata.get("url", ""),
+        "phash": record.metadata.get("phash", ""),
+        "dedupe_reviewed": _dedupe_reviewed(record),
+    }
+
+
+def _serialize_duplicate_group(group: DuplicateGroup) -> dict[str, Any]:
+    records = [_serialize_record(record) for record in group.records]
+    if group.pending_token is not None:
+        pending = _PENDING_DUPLICATE_ADDS[group.pending_token]
+        records.insert(
+            0,
+            {
+                "id": _pending_record_id(group.pending_token),
+                "analysis": pending.analysis,
+                "manually_annotated": False,
+                "image_src": _image_src(pending.base64),
+                "url": pending.metadata.get("url", ""),
+                "phash": str(pending.phash),
+                "dedupe_reviewed": False,
+                "pending": True,
+            },
+        )
+    return {
+        "pending_token": group.pending_token,
+        "min_distance": int(group.min_distance),
+        "max_distance": int(group.max_distance),
+        "records": records,
     }
 
 
@@ -980,6 +1341,111 @@ def _delete_record(id_: str, original_analysis: str | None) -> None:
         _collection().delete(ids=[id_])
 
 
+def _resolve_duplicate_group(
+    group_ids: list[str], keep_ids: list[str]
+) -> dict[str, int]:
+    keep_set = set(keep_ids)
+    if not group_ids:
+        raise web.HTTPBadRequest(text="group_ids is required")
+    if not keep_set:
+        raise web.HTTPBadRequest(text="keep_ids is required")
+    if not keep_set.issubset(set(group_ids)):
+        raise web.HTTPBadRequest(text="keep_ids must be part of group_ids")
+
+    with _chroma_operation_lock():
+        records = [record for id_ in group_ids if (record := _get_record_by_id(id_))]
+        existing_ids = {record.id for record in records}
+        if not keep_set.issubset(existing_ids):
+            raise web.HTTPNotFound(text="kept record not found")
+
+        kept_records = [record for record in records if record.id in keep_set]
+        kept_metadatas = []
+        for record in kept_records:
+            metadata = dict(record.metadata)
+            metadata["dedupe_reviewed"] = True
+            kept_metadatas.append(metadata)
+        if kept_records:
+            _collection().update(
+                ids=[record.id for record in kept_records],
+                metadatas=kept_metadatas,
+            )
+
+        delete_ids = [record.id for record in records if record.id not in keep_set]
+        if delete_ids:
+            _collection().delete(ids=delete_ids)
+
+    return {"kept": len(kept_records), "deleted": len(delete_ids)}
+
+
+def _resolve_pending_duplicate_add(
+    token: str,
+    group_ids: list[str],
+    keep_ids: list[str],
+) -> dict[str, int | str | None]:
+    pending_id = _pending_record_id(token)
+    keep_set = set(keep_ids)
+    if pending_id not in group_ids:
+        raise web.HTTPBadRequest(text="pending record is not part of group_ids")
+    if not keep_set:
+        raise web.HTTPBadRequest(text="keep_ids is required")
+    if not keep_set.issubset(set(group_ids)):
+        raise web.HTTPBadRequest(text="keep_ids must be part of group_ids")
+
+    with _chroma_operation_lock():
+        pending = _PENDING_DUPLICATE_ADDS.get(token)
+        if pending is None:
+            raise web.HTTPNotFound(text="pending duplicate add not found")
+
+        existing_group_ids = [id_ for id_ in group_ids if id_ != pending_id]
+        records = [
+            record
+            for id_ in existing_group_ids
+            if (record := _get_record_by_id(id_)) is not None
+        ]
+        existing_ids = {record.id for record in records}
+        keep_existing_ids = keep_set - {pending_id}
+        if not keep_existing_ids.issubset(existing_ids):
+            raise web.HTTPNotFound(text="kept record not found")
+
+        kept_records = [record for record in records if record.id in keep_existing_ids]
+        kept_metadatas = []
+        for record in kept_records:
+            metadata = dict(record.metadata)
+            metadata["dedupe_reviewed"] = True
+            kept_metadatas.append(metadata)
+        if kept_records:
+            _collection().update(
+                ids=[record.id for record in kept_records],
+                metadatas=kept_metadatas,
+            )
+
+        delete_ids = [record.id for record in records if record.id not in keep_set]
+        if delete_ids:
+            _collection().delete(ids=delete_ids)
+
+        new_id: str | None = None
+        if pending_id in keep_set:
+            metadata = dict(pending.metadata)
+            metadata["base64"] = pending.base64
+            metadata["phash"] = str(pending.phash)
+            metadata["dedupe_reviewed"] = True
+            metadata.setdefault("manually_annotated", False)
+            ids = get_vectorstore().add_texts(
+                texts=[pending.analysis],
+                metadatas=[metadata],
+            )
+            new_id = ids[0] if ids else None
+
+        del _PENDING_DUPLICATE_ADDS[token]
+
+    return {
+        "kept": len(keep_set),
+        "deleted": len(delete_ids),
+        "added": 1 if new_id is not None else 0,
+        "new_id": new_id,
+    }
+
+
 def _parse_index(value: str | None) -> int:
     with contextlib.suppress(ValueError, TypeError):
         return max(0, int(value))  # type: ignore[arg-type]
@@ -1016,6 +1482,15 @@ def _optional_string(payload: dict[str, Any], key: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise web.HTTPBadRequest(text=f"{key} must be a string")
+    return value
+
+
+def _required_string_list(payload: dict[str, Any], key: str) -> list[str]:
+    value = payload.get(key)
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise web.HTTPBadRequest(text=f"{key} must be a string list")
     return value
 
 
@@ -1083,10 +1558,9 @@ async def save_record(request: web.Request) -> web.Response:
 async def add_record(request: web.Request) -> web.Response:
     try:
         if request.content_type.startswith("multipart/"):
-            record_id = await _add_from_upload(request)
+            response = await _add_from_upload(request)
         else:
-            record_id = await _add_from_json(request)
-        response = await asyncio.to_thread(_record_response_for_id, record_id)
+            response = await _add_from_json(request)
     except web.HTTPException as exc:
         return web.json_response({"error": exc.text}, status=exc.status)
     except Exception as exc:
@@ -1107,13 +1581,53 @@ async def delete_record(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def get_duplicates(_: web.Request) -> web.Response:
+    try:
+        records = await asyncio.to_thread(_read_records)
+        groups = await asyncio.to_thread(_find_duplicate_groups, records)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response(
+        {
+            "distance": int(MEME_PHASH_DISTANCE),
+            "groups": [_serialize_duplicate_group(group) for group in groups],
+        }
+    )
+
+
+async def resolve_duplicates(request: web.Request) -> web.Response:
+    try:
+        payload = await _read_json(request)
+        group_ids = _required_string_list(payload, "group_ids")
+        keep_ids = _required_string_list(payload, "keep_ids")
+        pending_token = _optional_string(payload, "pending_token")
+        if pending_token:
+            result = await asyncio.to_thread(
+                _resolve_pending_duplicate_add,
+                pending_token,
+                group_ids,
+                keep_ids,
+            )
+        else:
+            result = await asyncio.to_thread(
+                _resolve_duplicate_group, group_ids, keep_ids
+            )
+    except web.HTTPException as exc:
+        return web.json_response({"error": exc.text}, status=exc.status)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response({"ok": True, **result})
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/api/record", get_record)
+    app.router.add_get("/api/duplicates", get_duplicates)
     app.router.add_post("/api/add", add_record)
     app.router.add_post("/api/save", save_record)
     app.router.add_post("/api/delete", delete_record)
+    app.router.add_post("/api/duplicates/resolve", resolve_duplicates)
     return app
 
 
