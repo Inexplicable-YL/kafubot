@@ -5,8 +5,8 @@ import base64
 import contextlib
 import io
 import os
-from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import cache
 from typing import Any
 
 import aiofiles  # type: ignore[import-untyped]
@@ -22,7 +22,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableBranch, RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from PIL import Image, ImageOps
-from pydantic import SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr
 from sqlalchemy import DateTime, Integer, Text, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -37,17 +37,13 @@ load_dotenv()
 
 MAX_JPG_SIZE_KB = 512
 USER_AGENT = "Mozilla/5.0"
-IMAGE_ANALYSIS_CACHE_DB_URL = os.getenv(
-    "IMAGE_ANALYSIS_CACHE_DB_URL",
-    "sqlite+aiosqlite:///./image_analysis_cache.db",
+
+IMAGE_DB_URL = os.getenv(
+    "IMAGE_DB_URL", "sqlite+aiosqlite:///./image_analysis_cache.db"
 )
-IMAGE_ANALYSIS_CACHE_TABLE = os.getenv(
-    "IMAGE_ANALYSIS_CACHE_TABLE",
-    "image_analysis_cache",
-)
-IMAGE_ANALYSIS_CACHE_MAX_RECORDS = int(
-    os.getenv("IMAGE_ANALYSIS_CACHE_MAX_RECORDS", "100")
-)
+
+IMAGE_MAX_RECORDS = int(os.getenv("IMAGE_MAX_RECORDS", "100"))
+
 IMAGE_PHASH_DISTANCE = int(os.getenv("IMAGE_PHASH_DISTANCE", "5"))
 
 MEME_CHROMA_PATH = os.getenv("MEME_CHROMA_PATH", "./.meme_vectordb")
@@ -55,30 +51,27 @@ MEME_CHROMA_PATH = os.getenv("MEME_CHROMA_PATH", "./.meme_vectordb")
 MEME_PHASH_DISTANCE = int(os.getenv("MEME_PHASH_DISTANCE", "5"))
 
 persistent_client = chromadb.PersistentClient(path=MEME_CHROMA_PATH)
-_vectorstore: Chroma | None = None
 
 
+@cache
 def get_vectorstore() -> Chroma:
-    global _vectorstore  # noqa: PLW0603
-    if _vectorstore is None:
-        _vectorstore = Chroma(
-            client=persistent_client,
-            collection_name="meme_analysis",
-            embedding_function=OpenAIEmbeddings(
-                model="text-embedding-3-large", base_url=os.getenv("OPENAI_BASE_URL")
-            ),
-        )
-    return _vectorstore
+    return Chroma(
+        client=persistent_client,
+        collection_name="meme_analysis",
+        embedding_function=OpenAIEmbeddings(
+            model="text-embedding-3-large", base_url=os.getenv("OPENAI_BASE_URL")
+        ),
+    )
 
 
-@dataclass(frozen=True)
-class ImageReadResult:
+class ImageReadResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     base64: str
     phash: imagehash.ImageHash
 
 
-@dataclass(frozen=True)
-class ImageAnalysisCacheEntry:
+class ImageAnalysisCacheEntry(BaseModel):
     record_id: int
     base64: str
     phash: imagehash.ImageHash
@@ -89,12 +82,20 @@ class ImageAnalysisCacheEntry:
     accessed_at: datetime
 
 
+class MemeResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    base64: str
+    analysis: str
+    phash: imagehash.ImageHash | None = None
+
+
 class ImageAnalysisBase(DeclarativeBase):
     pass
 
 
 class ImageAnalysisRecord(ImageAnalysisBase):
-    __tablename__ = IMAGE_ANALYSIS_CACHE_TABLE
+    __tablename__ = "image_analysis_cache"
 
     record_id: Mapped[int] = mapped_column(
         Integer,
@@ -124,7 +125,7 @@ class ImageAnalysisCache:
     def __init__(
         self,
         *,
-        db_url: str = IMAGE_ANALYSIS_CACHE_DB_URL,
+        db_url: str = IMAGE_DB_URL,
         max_records: int = 1000,
     ) -> None:
         if max_records < 1:
@@ -383,7 +384,7 @@ def _normalize_phash(value: Any) -> imagehash.ImageHash | None:
     return None
 
 
-def get_image_analyzer(
+def get_image_analyzer(  # noqa: PLR0915
     use_cache: bool = True,
 ) -> Runnable[dict[str, Any], str]:
     def _prepare_input(x: dict[str, Any]) -> dict[str, Any]:
@@ -470,7 +471,7 @@ def get_image_analyzer(
     if not use_cache:
         return analyzer_chain
 
-    cache = ImageAnalysisCache(max_records=IMAGE_ANALYSIS_CACHE_MAX_RECORDS)
+    cache = ImageAnalysisCache(max_records=IMAGE_MAX_RECORDS)
 
     async def _lookup_cache(x: dict[str, Any]) -> dict[str, Any]:
         target_field = "detail" if bool(x.get("detail", False)) else "brief"
@@ -495,7 +496,12 @@ def get_image_analyzer(
                 if value:
                     cached_text = value
                     break
-
+        if (
+            x.get("as_meme", False)
+            and cached_text
+            and isinstance(phash, imagehash.ImageHash)
+        ):
+            await add_memes([str(x["image"])], [cached_text], [phash])
         return {
             **x,
             "cache_hit": cached_text,
@@ -597,16 +603,9 @@ async def add_memes(
     return ids_by_index
 
 
-@dataclass
-class SearchResult:
-    base64: str
-    analysis: str
-    phash: imagehash.ImageHash | None = None
-
-
-async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
+async def meme_analysis(files: list[str]) -> list[tuple[str, MemeResult]]:
     image_analyzer = get_image_analyzer(use_cache=False)
-    analysis_results: list[tuple[str, SearchResult]] = []
+    analysis_results: list[tuple[str, MemeResult]] = []
     failed_files: list[str] = []
     duplicate_files: list[str] = []
     semaphore = anyio.Semaphore(5)
@@ -640,7 +639,7 @@ async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
                 analysis_results.append(
                     (
                         file,
-                        SearchResult(
+                        MemeResult(
                             base64="base64://" + result.base64,
                             analysis=analysis,
                             phash=result.phash,
@@ -655,7 +654,7 @@ async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
             tg.start_soon(_handle_url, file)
 
     if analysis_results:
-        ready_results: list[tuple[str, SearchResult]] = []
+        ready_results: list[tuple[str, MemeResult]] = []
         ready_phashs: list[imagehash.ImageHash] = []
         for file, result in analysis_results:
             if result.phash is None:
@@ -668,7 +667,7 @@ async def meme_analysis(files: list[str]) -> list[tuple[str, SearchResult]]:
             [result.analysis for _, result in ready_results],
             ready_phashs,
         )
-        added_results: list[tuple[str, SearchResult]] = []
+        added_results: list[tuple[str, MemeResult]] = []
         for (file, result), id_ in zip(ready_results, added_ids, strict=False):
             if id_ is None:
                 duplicate_files.append(file)
@@ -696,7 +695,7 @@ async def search_meme(
     min_score: float | None = None,
     *,
     log: bool = False,
-) -> SearchResult | None:
+) -> MemeResult | None:
     for k, v in EXTEND_PAIRS:
         if k in query:
             query = f"{query}。{v}"
@@ -734,7 +733,7 @@ async def search_meme(
         chosen_idx = rng.choice(len(candidates), p=probs)
         best_doc = candidates[chosen_idx][0]
 
-    return SearchResult(
+    return MemeResult(
         base64=best_doc.metadata.get("base64", ""),
         analysis=best_doc.page_content,
     )

@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-table",
         default=None,
-        help="Override IMAGE_ANALYSIS_CACHE_TABLE for this run.",
+        help="Override IMAGE_ANAL for this run.",
     )
     parser.add_argument(
         "--batch-size",
@@ -137,12 +137,11 @@ def _backfill_chroma(args: argparse.Namespace) -> None:
 
 def _backfill_cache(args: argparse.Namespace) -> None:
     from chat.image import (  # noqa: PLC0415
-        IMAGE_ANALYSIS_CACHE_DB_URL,
-        IMAGE_ANALYSIS_CACHE_TABLE,
+        IMAGE_DB_URL,
     )
 
-    db_url = args.cache_db_url or IMAGE_ANALYSIS_CACHE_DB_URL
-    table = args.cache_table or IMAGE_ANALYSIS_CACHE_TABLE
+    db_url = args.cache_db_url or IMAGE_DB_URL
+    table = args.cache_table or "image_analysis_cache"
     db_path = _sqlite_path(db_url)
     if not db_path.exists():
         print(f"cache skipped: db does not exist: {db_path}")
@@ -192,7 +191,7 @@ def main() -> None:
     if args.cache_db_url:
         os.environ["IMAGE_ANALYSIS_CACHE_DB_URL"] = args.cache_db_url
     if args.cache_table:
-        os.environ["IMAGE_ANALYSIS_CACHE_TABLE"] = args.cache_table
+        os.environ["IMAGE_ANAL"] = args.cache_table
 
     _backfill_chroma(args)
     _backfill_cache(args)
