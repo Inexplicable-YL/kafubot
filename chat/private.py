@@ -123,6 +123,12 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:
             MessagesPlaceholder("current_messages"),
         ]
     )
+    model = ChatDeepSeek(
+        model=DEEPSEEK_MODEL,
+        base_url=os.getenv("DEEPSEEK_BASE_URL"),
+        temperature=1.2,
+        max_retries=2,
+    )
 
     def _chat_chain_for_payload(
         payload: dict[str, Any],
@@ -147,13 +153,9 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:
                 },
             }
 
-        model = ChatDeepSeek(
-            model=DEEPSEEK_MODEL,
-            base_url=os.getenv("DEEPSEEK_BASE_URL"),
-            temperature=1.2,
-            max_retries=2,
-        ).bind(**runtime_kwargs)
-        return cast("Runnable[dict[str, Any], AIMessage]", prompt | model)
+        return cast(
+            "Runnable[dict[str, Any], AIMessage]", prompt | model.bind(**runtime_kwargs)
+        )
 
     core_chain = RunnableLambda(_chat_chain_for_payload)
 
