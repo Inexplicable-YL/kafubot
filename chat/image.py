@@ -605,6 +605,7 @@ async def add_memes(
             {
                 "base64": base64s[index],
                 "phash": str(phashs[index]),
+                "manually_annotated": False,
             }
             for index in accepted_indices
         ],
@@ -711,7 +712,7 @@ async def search_meme(
         if k in query:
             query = f"{query}。{v}"
     results = await get_vectorstore()._asimilarity_search_with_relevance_scores(
-        query, k=20
+        query, k=20, filter={"manually_annotated": True}
     )
     candidates = [
         (doc, score)

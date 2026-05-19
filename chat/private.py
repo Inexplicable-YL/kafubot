@@ -28,7 +28,7 @@ DB_URL = os.getenv(
 )
 TABLE_NAME = os.getenv("PRIVATE_HISTORY_TABLE", "deepseek_chat_messages")
 DEEPSEEK_MODEL = os.getenv("PRIVATE_DEEPSEEK_MODEL", "deepseek-v4-flash")
-CHAT_HISTORY_MAX_MESSAGES = int(os.getenv("PRIVATE_CHAT_HISTORY_MAX_MESSAGES", "500"))
+CHAT_HISTORY_MAX_MESSAGES = int(os.getenv("PRIVATE_CHAT_HISTORY_MAX_MESSAGES", "100"))
 
 
 @cache

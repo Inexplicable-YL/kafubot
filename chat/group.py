@@ -16,7 +16,6 @@ from langchain_core.runnables import (
     RunnableGenerator,
     RunnableLambda,
 )
-from langchain_core.runnables.branch import RunnableBranch
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_deepseek import ChatDeepSeek
 from pydantic import BaseModel, TypeAdapter
@@ -402,18 +401,4 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
         RunnableLambda(_normalize_input)
         | chain_with_history
         | RunnableGenerator(to_reply)
-    )
-
-
-def get_agent_app() -> Runnable[dict[str, Any], None | str]:
-    decision_app = get_decision_app()
-    chat_app = get_chat_app()
-
-    def is_tome(_input: dict[str, Any]) -> bool:
-        return _input.get("is_tome", False)
-
-    return RunnableBranch(
-        (is_tome, chat_app),
-        (decision_app, chat_app),
-        lambda _: None,
     )

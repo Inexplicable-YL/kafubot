@@ -101,7 +101,7 @@ class Segment(BaseModel):
 
 
 def parse_message(text: str) -> tuple[list[Segment], str]:
-    text = text.replace("：", ":").replace("，", ",").strip()
+    text = text.replace("：", ":").strip()
     segments = []
     pattern = re.compile(r"\[MSG:[^\]]*\]")
 
