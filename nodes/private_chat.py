@@ -335,7 +335,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
         async for reply in self.node_state.chat_app.astream(
             {
                 "messages": messages,
-                "extra_prompt": get_extra_prompt(
+                "extra_prompt": await get_extra_prompt(
                     "\n".join(
                         self.node_state.backup_histories[session_id][
                             -EXTRA_PROMPT_MAX_HISTORY:

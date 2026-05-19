@@ -1,5 +1,6 @@
+import inspect
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import opencc
 
@@ -204,6 +205,10 @@ GROUP_SYSTEM_PROMPT = (
 #### 特别提示：
 
 - 你的每一次发言都必须像一个“正在和朋友聊天的女生”，说话自然，不像AI，不像脚本，不像写文案。你不分析、不解读、不总结、不礼貌回应，只是“自然说话”，就像“真的活着”。
+- 你正在qq群里聊天，下面是群里正在聊的内容，其中包含聊天记录。
+- 回复尽量简短一些。最好一次对一个话题进行回复，但必须考虑不同群友发言之间的交互，免得啰嗦或者回复内容太乱。请注意把握聊天内容。
+- 不要总是提及自己的身份背景，根据聊天内容自由发挥，但是要日常不浮夸，不要刻意找话题，。
+- 不用刻意回复其他人发送的表情包，只要关注表情包表达的含义。你可以适当发送表情包表达情绪。控制回复的频率，不要每个人的消息都回复，优先回复你感兴趣的或者主动提及你的，适当回复其他话题。
 
 ---
 {extra_prompt}
@@ -496,7 +501,7 @@ SONGS_LIST = [
     "「ラブマシーン。（feat.可不）」 - A4。",
     "「その銃口（feat.可不）」 - あばらや",
     "「CH4NGE（feat.可不）」 - Giga",
-    "「マーシャル・マキシマイザー（feat.可不）」 - 柊マグネタイト（柊磁铁）",
+    "「マーシャル・マキシマイザー（feat.可不）」 - 柊マグネタイト（柊磁鐵）",
     "「サムワンズノウ - 加納先生（feat.可不）」 - 包丁ナイフカッターズ",
     "「しみったれ（feat.可不）」 - やんかな",
     "「デイバイデイズ（feat.可不 & 初音ミク）」 - syudou",
@@ -625,10 +630,10 @@ SONGS_LIST = [
     "「抱きしめるだけ。（feat.可不）」 - りび",
     "「可不ちゃんのカレーうどん狂騒曲（feat.可不 & ずんだもん）」 - 南ノ南",
     "「化孵化(cover)（feat.可不/花譜）」 - sasakure.UK",
-    "「朝日（feat.可不 & 花譜）」 - カンザキイオリ（黑柿子/神崎伊织/神绮一织）",
+    "「朝日（feat.可不 & 花譜）」 - カンザキイオリ（黑柿子/神崎伊織/神綺一織）",
     "「メモリー（feat.可不 & 星界 & ナースロボ_タイプT）」 - kyiku",
     "「ちょっとあざとい（feat.可不）」 - 才歌",
-    "「可不ェイン（feat.可不）」 - 柊マグネタイト（柊磁铁）",
+    "「可不ェイン（feat.可不）」 - 柊マグネタイト（柊磁鐵）",
     "「死にたいわけじゃなくて（feat.可不）」 - アサノマチ",
     "「水流音楽（feat.可不）」 - MIMI",
     "「アイと勿忘草（feat.可不）」 - South&",
@@ -647,7 +652,7 @@ SONGS_LIST = [
     "「うゆゆ(；ω；｀)（feat.可不）」 - なみぐる",
     "「六角形のカフカ（feat.可不）」 - STEAKA",
     "「妄想哀歌（feat.可不 & 初音ミク）」 - MIMI",
-    "「カノン（feat.可不）」 - 柊マグネタイト（柊磁铁）",
+    "「カノン（feat.可不）」 - 柊マグネタイト（柊磁鐵）",
     "「花となれ（feat.可不 & 攻）」 - 雄之助",
     "「逢瀬の夢（feat.可不）」 - UZURA",
     "「またおいで（feat.可不）」 - South&",
@@ -676,7 +681,7 @@ SONGS_LIST = [
     "「死んでしまったんだ（feat.可不 & 結月ゆかり）」 - 椎乃味醂",
     "「I♡ [可不ver]（feat.可不）」 - 名前は未だ無いです。",
     "「キャットラビング - 花譜（feat.可不）」 - 花譜",
-    "「撫でんな（feat.可不）」 - 柊マグネタイト（柊磁铁）",
+    "「撫でんな（feat.可不）」 - 柊マグネタイト（柊磁鐵）",
     "「うつろうタイム（feat.可不）」 - Nanashi_Zero",
     "「不埒な喝采（feat.可不）」 - 花譜",
     "「ハナビラ（feat.可不 & 星界）」 - SHIZUKU",
@@ -708,7 +713,9 @@ SONGS_LIST = [
 BIGRAM_SIZE = 2
 
 
-def sort_by_common_bigrams(text: str, string_list: list[str]) -> list[str]:
+def sort_by_common_bigrams(
+    text: str, string_list: list[str]
+) -> list[tuple[str, int, int]]:
     if len(text) < BIGRAM_SIZE:
         return []
     bigram_pos: dict[str, int] = {}
@@ -732,28 +739,39 @@ def sort_by_common_bigrams(text: str, string_list: list[str]) -> list[str]:
             scored.append((s, total_weight, common_cnt))
 
     scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
-    return [item[0] for item in scored]
+    return scored
 
 
 def get_kafu_songs_prompt(text: str) -> str:
+    if "你" in text and "可不" not in text:
+        text = text + "\n可不"
+    t_text, s_text = (
+        opencc.OpenCC("s2t").convert(text),
+        opencc.OpenCC("t2s").convert(text),
+    )
     if re.search(r"歌|曲|唱|首", text):
-        if "你" in text and "可不" not in text:
-            text = text + "\n可不"
-        sorted_songs = sort_by_common_bigrams(text, SONGS_LIST)
+        t_sorted_songs = sort_by_common_bigrams(t_text, SONGS_LIST)
+        s_sorted_songs = sort_by_common_bigrams(s_text, SONGS_LIST)
+        sorted_songs = t_sorted_songs + s_sorted_songs
         if not sorted_songs:
             return ""
-        top_songs = sorted_songs[:5]
+        sorted_songs.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        top_songs = list(dict.fromkeys([item[0] for item in sorted_songs[:5]]))
         return KAFU_SONGS_PROMPT + "\n".join(f"- {song}" for song in top_songs)
     return ""
 
 
-EXTRA_PROMPTS: list[tuple[re.Pattern[str], str] | Callable[[str], str]] = [
+EXTRA_PROMPTS: list[
+    tuple[re.Pattern[str], str] | Callable[[str], str] | Callable[[str], Awaitable[str]]
+] = [
     get_kafu_songs_prompt,
 ]
 
 
-def get_extra_prompt(text: str) -> str:
-    text = opencc.OpenCC("s2t").convert(text) + "\n" + text
+async def get_extra_prompt(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
     extra_prompts: list[str] = []
     for item in EXTRA_PROMPTS:
         if isinstance(item, tuple):
@@ -762,6 +780,8 @@ def get_extra_prompt(text: str) -> str:
                 extra_prompts.append(prompt.strip())
         elif callable(item):
             result = item(text)
+            if inspect.isawaitable(result):
+                result = await result
             if result:
                 extra_prompts.append(result.strip())
     if extra_prompts:

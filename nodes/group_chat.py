@@ -263,7 +263,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 ]
             ]
         )
-        extra_prompt = get_extra_prompt(history_text)
+        extra_prompt = await get_extra_prompt(history_text)
 
         message: CQHTTPMessage | str = ""
         full_text: str = ""

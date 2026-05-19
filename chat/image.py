@@ -72,6 +72,8 @@ class ImageReadResult(BaseModel):
 
 
 class ImageAnalysisCacheEntry(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     record_id: int
     base64: str
     phash: imagehash.ImageHash
