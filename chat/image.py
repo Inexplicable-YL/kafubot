@@ -386,6 +386,7 @@ def _normalize_phash(value: Any) -> imagehash.ImageHash | None:
     return None
 
 
+@cache
 def get_image_analyzer(  # noqa: PLR0915
     use_cache: bool = True,
 ) -> Runnable[dict[str, Any], str]:
@@ -419,8 +420,14 @@ def get_image_analyzer(  # noqa: PLR0915
         model="kimi-k2.6",
         api_key=SecretStr(os.getenv("KIMI_API_KEY", "")),
         base_url=os.getenv("KIMI_BASE_URL"),
-        temperature=1,
+        temperature=0.6,
         max_retries=2,
+    ).bind(
+        extra_body={
+            "thinking": {
+                "type": "disabled",
+            }
+        },
     )
     detail_llm = ChatOpenAI(
         model="kimi-k2.6",
@@ -440,6 +447,7 @@ def get_image_analyzer(  # noqa: PLR0915
                 "human",
                 [
                     {"type": "image", "base64": "{image}", "mime_type": "image/jpeg"},
+                    {"type": "text", "text": "请按要求描述图片。"},
                 ],
             ),
         ]
@@ -455,6 +463,7 @@ def get_image_analyzer(  # noqa: PLR0915
                 "human",
                 [
                     {"type": "image", "base64": "{image}", "mime_type": "image/jpeg"},
+                    {"type": "text", "text": "请按要求理解并描述图片。"},
                 ],
             ),
         ]

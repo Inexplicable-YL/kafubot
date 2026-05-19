@@ -381,21 +381,20 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
         ][-BACKUP_MESSAGES_LIMIT:]
         return replied
 
-    async def get_image(self, file: str) -> tuple[ImageReadResult | None, bool]:
+    async def get_image(self, file: str) -> ImageReadResult | None:
         try:
             result: dict[str, str] = await self.event.adapter.call_api(
                 "get_image", file=file
             )
-            path, url, sub_type = (
+            path, url = (
                 result.get("file"),
                 result.get("url"),
-                result.get("sub_type"),
             )
             if path is not None:
-                return await read_image(path, url), str(sub_type) == "1"
+                return await read_image(path, url)
         except Exception:
-            return None, False
-        return None, False
+            return None
+        return None
 
     @override
     async def handle(self) -> None:
@@ -426,8 +425,9 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateReplyState, PrivateChatConfig
             file: str | None = None
             if len(self.event.message) == 1 and self.event.message[0].type == "image":
                 file = self.event.message[0].data.get("file")
+                as_meme = str(self.event.message[0].data.get("sub_type", "0")) == "1"
             if file is not None:
-                image, as_meme = await self.get_image(file)
+                image = await self.get_image(file)
             if image is None:
                 return
 

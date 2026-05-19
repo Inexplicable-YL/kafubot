@@ -18,15 +18,20 @@ from sekaibot.config import ConfigModel
 from chat.activity import ActivityStore, get_activity_store
 from chat.group import (
     clear_session_history,
-    get_agent_app,
+    get_chat_app,
+    get_decision_app,
 )
-from chat.image import search_meme
-from chat.prompt import (
-    get_extra_prompt,
+from chat.image import (
+    ImageReadResult,
+    get_image_analyzer,
+    read_image,
+    search_meme,
 )
+from chat.prompt import get_extra_prompt
 from chat.utils import parse_message
 
-BACKUP_MESSAGES_LIMIT = 40
+MESSAGES_LIMIT = 30
+BACKUP_MESSAGES_LIMIT = 20
 BACKUP_PENDING_COUNTS_LIMIT = 10
 
 EXTRA_PROMPT_MAX_HISTORY = 5
@@ -49,6 +54,7 @@ class GroupChatConfig(ConfigModel):
     unrestricted_groups: set[int] = set()
     auto_reply_groups: set[int] = set()
     interval_seconds: int = 3
+    keep_image_limit: int = 3
     talk_value: float = 0.8
     reply_keywords: set[str] = set()
     reply_when_keywords: bool = False
@@ -75,10 +81,17 @@ class GroupMessage(BaseModel):
     message_id: str | None = None
 
 
+class GroupImageMessage(GroupMessage):
+    image: ImageReadResult
+    as_meme: bool
+
+
 class Histories(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    messages: list[GroupMessage] = Field(default_factory=list)
+    messages: deque[GroupMessage] = Field(
+        default_factory=lambda: deque(maxlen=MESSAGES_LIMIT)
+    )
     backup_messages: deque[GroupMessage] = Field(
         default_factory=lambda: deque(maxlen=BACKUP_MESSAGES_LIMIT)
     )
@@ -106,7 +119,11 @@ class GroupEvent(BaseModel):
 class GroupChatState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    agent: Runnable[dict[str, Any], None | str] = Field(default_factory=get_agent_app)
+    decision: Runnable[dict[str, Any], bool] = Field(default_factory=get_decision_app)
+    chat: Runnable[dict[str, Any], str] = Field(default_factory=get_chat_app)
+    image_analyzer: Runnable[dict[str, Any], str] = Field(
+        default_factory=get_image_analyzer
+    )
     activity_store: ActivityStore = Field(default_factory=get_activity_store)
     storages: dict[str, Histories] = Field(default_factory=dict)
     storages_lock: anyio.Lock = Field(default_factory=anyio.Lock)
@@ -192,20 +209,22 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         self,
         group_event: GroupEvent,
     ) -> list[GroupMessage] | None:
-        if (
-            self.event.group_id not in self.config.auto_reply_groups
-            and not group_event.is_tome
-        ):
-            return None
-
         history_storage = group_event.history_storage
         message = group_event.message
+        current_messages: list[GroupMessage] | None = None
         await history_storage.lock.acquire()
         is_released = False
         try:
             history_storage.messages.append(message)
             len_messages = len(history_storage.messages)
             history_storage.backup_messages.append(message)
+            if isinstance(group_event.message, GroupImageMessage):
+                return None
+            if (
+                self.event.group_id not in self.config.auto_reply_groups
+                and not group_event.is_tome
+            ):
+                return None
 
             if history_storage.on_handle:
                 history_storage.lock.release()
@@ -241,19 +260,109 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 if await self.is_activity_limited(group_event):
                     return None
             history_storage.on_handle = True
-            current_messages = history_storage.messages
-            history_storage.messages = []
-            return current_messages
+            current_messages = list(history_storage.messages)
+            history_storage.messages.clear()
         finally:
             if not is_released:
                 history_storage.lock.release()
+        return current_messages
+
+    async def filling_images(
+        self,
+        current_messages: list[GroupMessage],
+    ) -> list[GroupMessage]:
+        if not current_messages:
+            return []
+        skip = (
+            sum(isinstance(x, GroupImageMessage) for x in current_messages)
+            - self.config.keep_image_limit
+        )
+        current_messages = [
+            x
+            for x in current_messages
+            if not isinstance(x, GroupImageMessage) or (skip := skip - 1) < 0
+        ]
+        image_inputs = [
+            {
+                "image": x.image.base64,
+                "phash": x.image.phash,
+                "as_meme": x.as_meme,
+                "detail": False,
+            }
+            for x in current_messages
+            if isinstance(x, GroupImageMessage)
+        ]
+        if not image_inputs:
+            return current_messages
+        results = await self.node_state.image_analyzer.abatch(image_inputs)
+        filled_messages = []
+        for msg in current_messages:
+            if isinstance(msg, GroupImageMessage):
+                filled_messages.append(
+                    GroupMessage(
+                        role="user",
+                        timestamp=msg.timestamp,
+                        user=msg.user,
+                        text=f"[图片: {results.pop(0)}]",
+                        user_id=msg.user_id,
+                        message_id=msg.message_id,
+                    )
+                )
+            else:
+                filled_messages.append(msg)
+        return filled_messages
 
     async def run_reply(
         self,
         group_event: GroupEvent,
         *,
         current_messages: list[GroupMessage],
-    ) -> bool:
+    ) -> list[GroupMessage] | None:
+        fill_event = anyio.Event()
+
+        output_messages: list[GroupMessage] | None = current_messages
+
+        async def _fill(fill_event: anyio.Event):
+            nonlocal current_messages
+            try:
+                current_messages = await self.filling_images(current_messages)
+            finally:
+                fill_event.set()
+
+        async def _reply(fill_event: anyio.Event) -> list[GroupMessage] | None:
+            nonlocal output_messages
+            should_reply = (
+                group_event.is_tome
+                or await self.node_state.decision.ainvoke(
+                    {
+                        "messages": [
+                            item.model_dump(include={"timestamp", "user", "text"})
+                            for item in current_messages
+                        ],
+                    },
+                    config={"configurable": {"session_id": group_event.session_id}},
+                )
+            )
+            await fill_event.wait()
+            output_messages = current_messages
+            if should_reply:
+                output_messages = await self.get_reply(
+                    group_event,
+                    current_messages=current_messages,
+                )
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_fill, fill_event)
+            task_group.start_soon(_reply, fill_event)
+
+        return output_messages
+
+    async def get_reply(
+        self,
+        group_event: GroupEvent,
+        *,
+        current_messages: list[GroupMessage],
+    ) -> list[GroupMessage] | None:
         history_storage = group_event.history_storage
         history_text = "\n".join(
             [
@@ -264,10 +373,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             ]
         )
         extra_prompt = await get_extra_prompt(history_text)
-
         message: CQHTTPMessage | str = ""
         full_text: str = ""
-        async for reply in self.node_state.agent.astream(
+        async for reply in self.node_state.chat.astream(
             {
                 "messages": [
                     item.model_dump(include={"timestamp", "user", "text"})
@@ -279,7 +387,6 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 "extra_prompt": extra_prompt,
                 "thinking": True,
                 "reasoning_effort": "high",
-                "is_tome": group_event.is_tome,
             },
             config={"configurable": {"session_id": group_event.session_id}},
         ):
@@ -350,24 +457,23 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 )
             )
             history_storage.backup_pending_counts.append(len(current_messages))
-            return True
-        return False
+            return None
+        return current_messages
 
     async def finish_reply(
         self,
         group_event: GroupEvent,
         *,
-        current_messages: list[GroupMessage],
-        replied: bool,
+        current_messages: list[GroupMessage] | None = None,
     ) -> None:
         history_storage = group_event.history_storage
         async with history_storage.lock:
-            if not replied:
-                history_storage.messages = current_messages + history_storage.messages
+            if current_messages:
+                history_storage.messages.extendleft(current_messages)
             history_storage.on_handle = False
             async with history_storage.handle_condition:
                 history_storage.handle_condition.notify_all()
-        if replied:
+        if current_messages is None:
             await self.node_state.activity_store.record(
                 scope="group",
                 session_id=str(self.event.group_id),
@@ -383,12 +489,28 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 del self.node_state.storages[session_id]
         await self.reply("[SYSTEM]已清除历史", at_sender=True)
 
-    async def get_text_or_clear_chat(
+    async def get_message_or_clear_chat(
         self, session_id: str, history_storage: Histories, to_me: bool
-    ) -> tuple[str | None, bool]:
+    ) -> tuple[tuple[ImageReadResult, bool] | str | None, bool]:
         text = self.event.message.get_plain_text().strip()
         if not text:
-            return None, False
+            image: ImageReadResult | None = None
+            if not text:
+                file: str | None = None
+                as_meme = False
+                if (
+                    len(self.event.message) == 1
+                    and self.event.message[0].type == "image"
+                ):
+                    file = self.event.message[0].data.get("file")
+                    as_meme = (
+                        str(self.event.message[0].data.get("sub_type", "0")) == "1"
+                    )
+                if file is not None:
+                    image = await self.get_image(file)
+                if image is None:
+                    return None, False
+                return (image, as_meme), False
         if any(keyw in text for keyw in self.config.clear_keywords):
             await self.delete_chat(session_id=session_id)
             return None, False
@@ -432,31 +554,60 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         )
         return any(keyw in text for keyw in self.config.reply_keywords)
 
+    async def get_image(self, file: str) -> ImageReadResult | None:
+        try:
+            result: dict[str, str] = await self.event.adapter.call_api(
+                "get_image", file=file
+            )
+            path, url = (
+                result.get("file"),
+                result.get("url"),
+            )
+            if path is not None:
+                return await read_image(path, url)
+        except Exception:
+            return None
+        return None
+
     async def get_event(self) -> GroupEvent | None:
         session_id = str(self.event.group_id)
         history_storage = await self.get_history_storage(session_id)
         is_tome = self.event.is_tome()
-        text, to_other = await self.get_text_or_clear_chat(
+        message, to_other = await self.get_message_or_clear_chat(
             session_id, history_storage, is_tome
         )
-        if not text:
+        if message is None:
             return None
         timestamp = datetime.fromtimestamp(self.event.time, tz=UTC)
         user = self.event.sender.nickname or DEFAULT_USERNAME
-        have_keywords = self.have_keywords(text)
-        if self.config.reply_when_keywords:
-            is_tome = is_tome or have_keywords
-        return GroupEvent(
-            session_id=session_id,
-            history_storage=history_storage,
-            message=GroupMessage(
+        have_keywords = False
+        if isinstance(message, tuple):
+            message = GroupImageMessage(
                 role="user",
                 timestamp=timestamp,
                 user=user,
-                text=text,
+                text="",
+                image=message[0],
+                as_meme=message[1],
                 user_id=str(self.event.user_id),
                 message_id=str(self.event.message_id),
-            ),
+            )
+        else:
+            have_keywords = self.have_keywords(message)
+            if self.config.reply_when_keywords:
+                is_tome = is_tome or have_keywords
+            message = GroupMessage(
+                role="user",
+                timestamp=timestamp,
+                user=user,
+                text=message,
+                user_id=str(self.event.user_id),
+                message_id=str(self.event.message_id),
+            )
+        return GroupEvent(
+            session_id=session_id,
+            history_storage=history_storage,
+            message=message,
             is_tome=is_tome,
             have_keywords=have_keywords,
             to_other=to_other,
@@ -471,9 +622,8 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         if current_messages is None:
             return
 
-        replied = False
         try:
-            replied = await self.run_reply(
+            current_messages = await self.run_reply(
                 group_event,
                 current_messages=current_messages,
             )
@@ -481,7 +631,6 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             await self.finish_reply(
                 group_event,
                 current_messages=current_messages,
-                replied=replied,
             )
 
     @override
