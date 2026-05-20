@@ -380,7 +380,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
                     continue
                 meme_result = await search_meme(
                     seg.data["content"],
-                    temperature=0.15,
+                    temperature=0.5,
                     min_score=0.05,
                 )
                 if meme_result:

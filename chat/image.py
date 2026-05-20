@@ -754,7 +754,7 @@ async def search_meme(
 if __name__ == "__main__":
 
     async def main() -> None:
-        result = await search_meme("生气", temperature=0.15, min_score=0.05, log=True)
+        result = await search_meme("害羞", temperature=0.5, min_score=0.05, log=True)
         print(result.analysis if result else "No result")
 
     anyio.run(main)
