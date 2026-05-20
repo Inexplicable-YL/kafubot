@@ -43,12 +43,6 @@ MODEL_VISIBLE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 CHAT_HISTORY_MAX_MESSAGES = int(os.getenv("CHAT_HISTORY_MAX_MESSAGES", "50"))
 
 
-def _ensure_utc(timestamp: datetime) -> datetime:
-    if timestamp.tzinfo is None:
-        return timestamp.replace(tzinfo=UTC)
-    return timestamp.astimezone(UTC)
-
-
 def _format_message_content(
     timestamp: datetime,
     user: str,
@@ -56,7 +50,7 @@ def _format_message_content(
     *,
     timezone: tzinfo,
 ) -> str:
-    return f"[{_ensure_utc(timestamp).astimezone(timezone).isoformat()}]{user}: {text}"
+    return f"[{timestamp.astimezone(timezone).isoformat()}]{user}: {text}"
 
 
 def _format_model_visible_message_content(
@@ -66,7 +60,7 @@ def _format_model_visible_message_content(
     *,
     timezone: tzinfo,
 ) -> str:
-    visible_timestamp = _ensure_utc(timestamp).astimezone(timezone)
+    visible_timestamp = timestamp.astimezone(timezone)
     return f"[{visible_timestamp.strftime(MODEL_VISIBLE_TIME_FORMAT)}]{user}: {text}"
 
 
@@ -140,11 +134,9 @@ class MessageConverter(BaseMessageConverter):
                         timezone=MODEL_VISIBLE_TZ,
                     ),
                     additional_kwargs={
-                        "raw": {
-                            "timestamp": _ensure_utc(user_timestamp),
-                            "user": user_name,
-                            "text": user_text,
-                        }
+                        "timestamp": user_timestamp,
+                        "user": user_name,
+                        "text": user_text,
                     },
                 )
             return HumanMessage(content=sql_message.content)
@@ -157,20 +149,19 @@ class MessageConverter(BaseMessageConverter):
         now = datetime.now(UTC)
 
         if isinstance(message, HumanMessage):
-            raw = message.additional_kwargs.get("raw", {})
-            raw_timestamp = raw.get("timestamp")
-            raw_user = raw.get("user")
-            raw_text = raw.get("text")
+            timestamp = message.additional_kwargs.get("timestamp")
+            user = message.additional_kwargs.get("user")
+            text = message.additional_kwargs.get("text")
             content = (
                 _format_message_content(
-                    raw_timestamp,
-                    raw_user,
-                    raw_text,
+                    timestamp,
+                    user,
+                    text,
                     timezone=UTC,
                 )
-                if isinstance(raw_timestamp, datetime)
-                and isinstance(raw_user, str)
-                and isinstance(raw_text, str)
+                if isinstance(timestamp, datetime)
+                and isinstance(user, str)
+                and isinstance(text, str)
                 else content_to_text(message.content)
             )
             return ChatMessageRecord(
@@ -178,11 +169,9 @@ class MessageConverter(BaseMessageConverter):
                 role="human",
                 content=content,
                 created_at=now,
-                user_timestamp=_ensure_utc(raw_timestamp)
-                if isinstance(raw_timestamp, datetime)
-                else None,
-                user_name=raw_user,
-                user_text=raw_text,
+                user_timestamp=timestamp if isinstance(timestamp, datetime) else None,
+                user_name=user,
+                user_text=text,
                 assistant_timestamp=None,
             )
 
@@ -196,7 +185,7 @@ class MessageConverter(BaseMessageConverter):
                 user_name=None,
                 user_text=None,
                 assistant_timestamp=message.additional_kwargs.get(
-                    "assistant_timestamp",
+                    "timestamp",
                     now,
                 ),
             )
@@ -231,11 +220,9 @@ def get_decision_app() -> Runnable[dict[str, Any], bool]:
                 HumanMessage(
                     content=item.as_content(timezone=MODEL_VISIBLE_TZ),
                     additional_kwargs={
-                        "raw": {
-                            "timestamp": _ensure_utc(item.timestamp),
-                            "user": item.user,
-                            "text": item.text,
-                        }
+                        "timestamp": item.timestamp,
+                        "user": item.user,
+                        "text": item.text,
                     },
                 )
                 for item in messages
@@ -325,11 +312,9 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
                 HumanMessage(
                     content=item.as_content(timezone=MODEL_VISIBLE_TZ),
                     additional_kwargs={
-                        "raw": {
-                            "timestamp": _ensure_utc(item.timestamp),
-                            "user": item.user,
-                            "text": item.text,
-                        }
+                        "timestamp": item.timestamp,
+                        "user": item.user,
+                        "text": item.text,
                     },
                 )
                 for item in messages
@@ -383,7 +368,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
         timestamp = datetime.now(UTC)
         async for message in messages:
             extra = dict(message.additional_kwargs or {})
-            extra["assistant_timestamp"] = timestamp
+            extra["timestamp"] = timestamp
             yield message.model_copy(update={"additional_kwargs": extra})
 
     core_chain = RunnableLambda(_chat_chain_for_payload) | RunnableGenerator(

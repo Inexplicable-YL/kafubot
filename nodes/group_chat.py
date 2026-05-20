@@ -80,6 +80,9 @@ class GroupMessage(BaseModel):
     text: str
     user_id: str
     message_id: str | None = None
+    is_tome: bool
+    to_other: bool
+    have_keywords: bool
 
 
 class GroupImageMessage(GroupMessage):
@@ -108,9 +111,6 @@ class GroupEvent(BaseModel):
     session_id: str
     history_storage: Histories
     message: GroupMessage
-    is_tome: bool
-    have_keywords: bool
-    to_other: bool
 
     @property
     def time(self) -> int:
@@ -213,6 +213,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         history_storage = group_event.history_storage
         message = group_event.message
         current_messages: list[GroupMessage] | None = None
+        is_tome = message.is_tome or any(
+            msg.is_tome for msg in history_storage.messages
+        )
         await history_storage.lock.acquire()
         is_released = False
         try:
@@ -221,10 +224,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             history_storage.backup_messages.append(message)
             if isinstance(group_event.message, GroupImageMessage):
                 return None
-            if (
-                self.event.group_id not in self.config.auto_reply_groups
-                and not group_event.is_tome
-            ):
+            if self.event.group_id not in self.config.auto_reply_groups and not is_tome:
                 return None
 
             if history_storage.on_handle:
@@ -250,12 +250,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                     return None
 
             # There was no response to the previous incident and the message did not refer to the bot.
-            if (
-                len_messages == len(history_storage.messages)
-                and not group_event.is_tome
-            ):
+            if len_messages == len(history_storage.messages) and not is_tome:
                 # The message is a reply to someone else, skip.
-                if group_event.to_other:
+                if group_event.message.to_other:
                     return None
                 # Activity is limited, skip.
                 if await self.is_activity_limited(group_event):
@@ -310,7 +307,6 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         current_messages: list[GroupMessage],
     ) -> list[GroupMessage] | None:
         fill_event = anyio.Event()
-
         output_messages: list[GroupMessage] | None = current_messages
 
         async def _fill(fill_event: anyio.Event):
@@ -323,7 +319,8 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         async def _reply(fill_event: anyio.Event) -> list[GroupMessage] | None:
             nonlocal output_messages
             should_reply = (
-                group_event.is_tome
+                group_event.message.is_tome
+                or any(msg.is_tome for msg in group_event.history_storage.messages)
                 or await self.node_state.decision.ainvoke(
                     {
                         "messages": [
@@ -446,6 +443,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                     text=full_text,
                     user_id=str(self.event.adapter.self_id),
                     message_id="",
+                    is_tome=False,
+                    to_other=False,
+                    have_keywords=False,
                 )
             )
             history_storage.backup_pending_counts.append(len(current_messages))
@@ -592,6 +592,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 as_meme=message[1],
                 user_id=str(self.event.user_id),
                 message_id=str(self.event.message_id),
+                is_tome=is_tome,
+                have_keywords=have_keywords,
+                to_other=to_other,
             )
         else:
             have_keywords = self.have_keywords(message)
@@ -604,14 +607,14 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 text=message,
                 user_id=str(self.event.user_id),
                 message_id=str(self.event.message_id),
+                is_tome=is_tome,
+                have_keywords=have_keywords,
+                to_other=to_other,
             )
         return GroupEvent(
             session_id=session_id,
             history_storage=history_storage,
             message=message,
-            is_tome=is_tome,
-            have_keywords=have_keywords,
-            to_other=to_other,
         )
 
     @override
