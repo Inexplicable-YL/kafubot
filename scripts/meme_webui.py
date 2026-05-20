@@ -19,12 +19,14 @@ from aiohttp.multipart import BodyPartReader
 from langchain_core.documents import Document
 
 from chat.image import (
+    get_image_analyzer,
+    read_image,
+)
+from chat.meme import (
     MEME_CHROMA_PATH,
     MEME_PHASH_DISTANCE,
     add_memes,
-    get_image_analyzer,
     get_vectorstore,
-    read_image,
 )
 
 FilterName = Literal["unlabeled", "labeled", "all"]

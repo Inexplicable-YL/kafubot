@@ -25,8 +25,8 @@ from chat.image import (
     ImageReadResult,
     get_image_analyzer,
     read_image,
-    search_meme,
 )
+from chat.meme import add_memes, search_meme
 from chat.prompt import get_extra_prompt
 from chat.utils import parse_message
 
@@ -122,7 +122,7 @@ class GroupChatState(BaseModel):
     decision: Runnable[dict[str, Any], bool] = Field(default_factory=get_decision_app)
     chat: Runnable[dict[str, Any], str] = Field(default_factory=get_chat_app)
     image_analyzer: Runnable[dict[str, Any], str] = Field(
-        default_factory=get_image_analyzer
+        default_factory=lambda _: get_image_analyzer(True, add_memes_hook=add_memes)
     )
     activity_store: ActivityStore = Field(default_factory=get_activity_store)
     storages: dict[str, Histories] = Field(default_factory=dict)
@@ -418,7 +418,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                     elif seg.type == "meme" and "content" in seg.data:
                         content = seg.data["content"]
                         meme_result = await search_meme(
-                            content, temperature=0.5, min_score=0.05
+                            content, temperature=0.5, min_score=0.0
                         )
                         if meme_result:
                             await self.reply(
@@ -506,34 +506,29 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
             await self.delete_chat(session_id=session_id)
             return None, False
         to_other = False
+        if to_me:
+            text = f"[MSG:at, name=可不] {text}"
         for msg in self.event.message:
             if (
                 isinstance(msg, CQHTTPMessageSegment)
                 and msg.type == "at"
                 and (qq_number := str(msg.data.get("qq", "")))
             ):
-                if qq_number == str(self.event.adapter.self_id):
-                    text = f"[MSG:at, name=可不]{text}"
-                    continue
                 at_name: str | None = None
                 for item in history_storage.backup_messages:
                     if str(item.user_id) == qq_number:
                         at_name = item.user
                         break
                 if at_name:
-                    text = f"[MSG:at, name={at_name}]{text}"
+                    text = f"[MSG:at, name={at_name}] {text}"
                 to_other = not to_me
-        if self.event.reply and (reply_id := str(self.event.reply.message_id)):
-            reply_time: str | None = None
-            for item in history_storage.backup_messages:
-                if str(item.message_id) == reply_id:
-                    t = cast("datetime", item.timestamp).astimezone(
-                        ZoneInfo("Asia/Shanghai")
-                    )
-                    reply_time = t.strftime("%Y-%m-%d %H:%M:%S")
-                    break
-            if reply_time:
-                text = f"[MSG:reply, time={reply_time}]{text}"
+        if self.event.reply and (reply_time := int(self.event.reply.time)):
+            time_text = (
+                datetime.fromtimestamp(reply_time, tz=UTC)
+                .astimezone(ZoneInfo("Asia/Shanghai"))
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
+            text = f"[MSG:reply, time={time_text}] {text}"
             to_other = not to_me
         return text, to_other
 

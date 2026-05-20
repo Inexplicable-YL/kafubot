@@ -21,8 +21,8 @@ from chat.image import (
     ImageReadResult,
     get_image_analyzer,
     read_image,
-    search_meme,
 )
+from chat.meme import add_memes, search_meme
 from chat.private import (
     clear_session_history,
     get_chat_app,
@@ -240,7 +240,7 @@ class PrivateChatState(BaseModel):
 
     chat: Runnable[dict[str, Any], str] = Field(default_factory=get_chat_app)
     image_analyzer: Runnable[dict[str, Any], str] = Field(
-        default_factory=get_image_analyzer
+        default_factory=lambda _: get_image_analyzer(True, add_memes_hook=add_memes)
     )
     activity_store: ActivityStore = Field(default_factory=get_activity_store)
     backup_histories: dict[str, deque[str]] = Field(default_factory=dict)
@@ -399,7 +399,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
                 meme_result = await search_meme(
                     seg.data["content"],
                     temperature=0.5,
-                    min_score=0.05,
+                    min_score=0.0,
                 )
                 if meme_result:
                     await self.reply(
