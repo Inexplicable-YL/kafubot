@@ -90,22 +90,14 @@ class PrivateEvent(BaseModel):
     def time(self) -> int:
         return int(self.timestamp.timestamp())
 
-    @property
-    def timestamp_text(self) -> str:
-        return f"[{self.timestamp.astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')}]"
-
-    @property
-    def formatted_text(self) -> str | None:
-        return None if self.text is None else self.timestamp_text + self.text
-
 
 class QueuedMessage(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     message_id: int
-    content: str | None = None
+    timestamp: datetime
+    text: str | None = None
     has_text: bool = False
-    timestamp_text: str = ""
     image_hash: imagehash.ImageHash | None = None
     pending_image: bool = False
     dropped: bool = False
@@ -121,13 +113,14 @@ class SessionQueueState(BaseModel):
     condition: anyio.Condition = Field(default_factory=anyio.Condition)
 
     async def enqueue_text(self, private_event: PrivateEvent) -> None:
-        if private_event.formatted_text is None:
+        if private_event.text is None:
             return
         async with self.condition:
             self.pending_messages.append(
                 QueuedMessage(
                     message_id=private_event.message_id,
-                    content=private_event.formatted_text,
+                    timestamp=private_event.timestamp,
+                    text=private_event.text,
                     has_text=True,
                 )
             )
@@ -151,7 +144,7 @@ class SessionQueueState(BaseModel):
                 return None
             message = QueuedMessage(
                 message_id=private_event.message_id,
-                timestamp_text=private_event.timestamp_text,
+                timestamp=private_event.timestamp,
                 image_hash=private_event.image.phash,
                 pending_image=True,
             )
@@ -170,13 +163,13 @@ class SessionQueueState(BaseModel):
                 message.pending_image = False
                 self.pending_image_count = max(0, self.pending_image_count - 1)
             if abstract:
-                message.content = f"{message.timestamp_text}[图片: {abstract}]"
+                message.text = f"[图片: {abstract}]"
             else:
                 message.dropped = True
-                message.content = None
+                message.text = None
             self.condition.notify_all()
 
-    async def wait_and_claim(self, message_id: int) -> list[str] | None:
+    async def wait_and_claim(self, message_id: int) -> list[QueuedMessage] | None:
         async with self.condition:
             deadline = anyio.current_time() + self.merge_window_seconds
             while True:
@@ -202,9 +195,9 @@ class SessionQueueState(BaseModel):
                     for message in pending_messages
                 )
                 messages = [
-                    message.content
+                    message
                     for message in pending_messages
-                    if not message.dropped and message.content is not None
+                    if not message.dropped and message.text is not None
                 ]
                 if not has_text:
                     if not messages:
@@ -343,21 +336,46 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
         self.node_state.backup_histories.pop(session_id, None)
         await self.reply("[SYSTEM]已清除对话历史。")
 
-    async def record_user_context(self, session_id: str, messages: list[str]) -> None:
-        self.history(session_id).append("\n".join(messages))
+    async def record_user_context(
+        self,
+        session_id: str,
+        messages: list[QueuedMessage],
+    ) -> None:
+        texts = [message.text for message in messages if message.text is not None]
+        self.history(session_id).append("\n".join(texts))
         await get_session_history(session_id).aadd_messages(
-            [HumanMessage(content=message) for message in messages]
+            [
+                HumanMessage(
+                    content=message.text,
+                    additional_kwargs={
+                        "raw": {
+                            "timestamp": message.timestamp,
+                            "text": message.text,
+                        }
+                    },
+                )
+                for message in messages
+                if message.text is not None
+            ]
         )
 
-    async def run_chat(self, private_event: PrivateEvent, messages: list[str]) -> bool:
+    async def run_chat(
+        self,
+        private_event: PrivateEvent,
+        messages: list[QueuedMessage],
+    ) -> bool:
         history = self.history(private_event.session_id)
-        history.append("\n".join(messages))
+        texts = [message.text for message in messages if message.text is not None]
+        history.append("\n".join(texts))
         replied = False
         answer = ""
-        print(f"Invoking-Private: {messages}")
+        print(f"Invoking-Private: {texts}")
         async for reply in self.node_state.chat.astream(
             {
-                "messages": messages,
+                "messages": [
+                    message.model_dump(include={"timestamp", "text"})
+                    for message in messages
+                ],
                 "extra_prompt": await get_extra_prompt(
                     "\n".join(list(history)[-EXTRA_PROMPT_MAX_HISTORY:])
                 ),
@@ -441,9 +459,9 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
     async def claim_messages(
         self,
         private_event: PrivateEvent,
-    ) -> tuple[SessionQueueState, list[str]] | None:
+    ) -> tuple[SessionQueueState, list[QueuedMessage]] | None:
         state = await self.session_state(private_event.session_id)
-        if private_event.formatted_text is not None:
+        if private_event.text is not None:
             await state.enqueue_text(private_event)
             messages = await state.wait_and_claim(private_event.message_id)
             if not messages:
@@ -477,7 +495,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
     async def run_reply(
         self,
         private_event: PrivateEvent,
-        messages: list[str],
+        messages: list[QueuedMessage],
     ) -> None:
         if await self.node_state.activity_store.is_limited(
             scope="private",
