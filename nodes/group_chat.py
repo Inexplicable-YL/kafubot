@@ -1,3 +1,4 @@
+import json
 import math
 from collections import deque
 from datetime import UTC, datetime
@@ -484,27 +485,38 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         self, session_id: str, history_storage: Histories, to_me: bool
     ) -> tuple[tuple[ImageReadResult, bool] | str | None, bool]:
         text = self.event.message.get_plain_text().strip()
-        if not text:
-            image: ImageReadResult | None = None
-            if not text:
-                file: str | None = None
-                as_meme = False
-                if (
-                    len(self.event.message) == 1
-                    and self.event.message[0].type == "image"
-                ):
-                    file = self.event.message[0].data.get("file")
-                    as_meme = (
-                        str(self.event.message[0].data.get("sub_type", "0")) == "1"
-                    )
-                if file is not None:
-                    image = await self.get_image(file)
-                if image is None:
-                    return None, False
+        if text:
+            if any(keyw in text for keyw in self.config.clear_keywords):
+                await self.delete_chat(session_id=session_id)
+                return None, False
+        elif (
+            len(self.event.message) == 1
+            and self.event.message[0].type == "image"
+            and (file := self.event.message[0].data.get("file"))
+        ):
+            as_meme = str(self.event.message[0].data.get("sub_type", "0")) == "1"
+            if image := await self.get_image(file):
                 return (image, as_meme), False
-        if any(keyw in text for keyw in self.config.clear_keywords):
-            await self.delete_chat(session_id=session_id)
             return None, False
+        elif (
+            len(self.event.message) == 1
+            and self.event.message[0].type == "file"
+            and (file_name := self.event.message[0].data.get("file"))
+        ):
+            text = f"[文件:{file_name}]"
+        elif (
+            len(self.event.message) == 1
+            and self.event.message[0].type == "json"
+            and (
+                prompt := json.loads(self.event.message[0].data.get("data", "{}")).get(
+                    "prompt"
+                )
+            )
+        ):
+            text = f"[小程序:{prompt}]"
+        else:
+            return None, False
+
         to_other = False
         if to_me:
             text = f"[MSG:at, name=可不] {text}"
@@ -522,6 +534,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 if at_name:
                     text = f"[MSG:at, name={at_name}] {text}"
                 to_other = not to_me
+
         if self.event.reply and (reply_time := int(self.event.reply.time)):
             time_text = (
                 datetime.fromtimestamp(reply_time, tz=UTC)
@@ -529,7 +542,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 .strftime("%Y-%m-%d %H:%M:%S")
             )
             text = f"[MSG:reply, time={time_text}] {text}"
-            to_other = not to_me
+            to_other = to_other or (
+                self.event.reply.sender.user_id != self.event.adapter.self_id
+            )
         return text, to_other
 
     def have_keywords(self, text: str) -> bool:

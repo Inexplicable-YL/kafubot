@@ -1,3 +1,4 @@
+import json
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any, TypeAlias
@@ -436,16 +437,41 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
             if any(keyword in text for keyword in self.config.clear_keywords):
                 await self.delete_chat(session_id)
                 return None
-        elif len(self.event.message) == 1 and self.event.message[0].type == "image":
-            image_segment = self.event.message[0]
-            file = image_segment.data.get("file")
-            image = await self.get_image(file) if file else None
-            as_meme = str(image_segment.data.get("sub_type", "0")) == "1"
+        elif (
+            len(self.event.message) == 1
+            and self.event.message[0].type == "image"
+            and (file := self.event.message[0].data.get("file"))
+        ):
+            image = await self.get_image(file)
+            as_meme = str(self.event.message[0].data.get("sub_type", "0")) == "1"
             if image is None:
                 return None
+        elif (
+            len(self.event.message) == 1
+            and self.event.message[0].type == "file"
+            and (file_name := self.event.message[0].data.get("file"))
+        ):
+            text = f"[文件:{file_name}]"
+        elif (
+            len(self.event.message) == 1
+            and self.event.message[0].type == "json"
+            and (
+                prompt := json.loads(self.event.message[0].data.get("data", "{}")).get(
+                    "prompt"
+                )
+            )
+        ):
+            text = f"[{prompt}]"
         else:
             return None
 
+        if self.event.reply and (reply_time := int(self.event.reply.time)):
+            time_text = (
+                datetime.fromtimestamp(reply_time, tz=UTC)
+                .astimezone(ZoneInfo("Asia/Shanghai"))
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
+            text = f"[MSG:reply, time={time_text}] {text}"
         return PrivateEvent(
             session_id=session_id,
             message_id=self.event.message_id,
