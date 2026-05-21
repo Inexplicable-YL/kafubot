@@ -1,9 +1,8 @@
-from __future__ import annotations
-
 import os
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, tzinfo
 from functools import cache
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, Literal, cast
 from typing_extensions import override
 from zoneinfo import ZoneInfo
 
@@ -18,17 +17,15 @@ from langchain_core.runnables import (
 )
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_deepseek import ChatDeepSeek
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from sqlalchemy import DateTime, Integer, Text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from chat.image import ImageReadResult
+from chat.message import QQMessage
 from chat.prompt import DECISION_SYSTEM_PROMPT, GROUP_SYSTEM_PROMPT
 from chat.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
-
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
-
 
 DB_URL = os.getenv(
     "CHAT_HISTORY_DB_URL", "sqlite+aiosqlite:///./.database/group_history.db"
@@ -50,7 +47,7 @@ def _format_message_content(
     *,
     timezone: tzinfo,
 ) -> str:
-    return f"[{timestamp.astimezone(timezone).isoformat()}]{user}: {text}"
+    return f"[{timestamp.astimezone(timezone).strftime('%Y-%m-%d %H:%M:%S')}]{user}: {text}"
 
 
 def _format_model_visible_message_content(
@@ -69,16 +66,24 @@ def _get_async_engine() -> AsyncEngine:
     return create_async_engine(DB_URL)
 
 
-class UserMessage(BaseModel):
+class GroupMessage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    role: Literal["user", "assistant"] = "user"
     timestamp: datetime
     user: str
-    text: str
+    message: QQMessage
+    user_id: str
+    message_id: str
+    is_tome: bool
+    to_other: bool
+    have_keywords: bool
+    images: list[tuple[ImageReadResult, bool]] = Field(default_factory=list)
 
     def as_content(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> str:
         return _format_model_visible_message_content(
             self.timestamp,
             self.user,
-            self.text,
+            self.message.get_msgcode(),
             timezone=timezone,
         )
 
@@ -208,7 +213,7 @@ async def clear_session_history(session_id: str) -> None:
 
 def get_decision_app() -> Runnable[dict[str, Any], bool]:
     def _normalize_input(payload: dict[str, Any]) -> dict[str, Any]:
-        messages = TypeAdapter(list[UserMessage]).validate_python(payload["messages"])
+        messages = TypeAdapter(list[GroupMessage]).validate_python(payload["messages"])
         prompt_variables = {
             key: value
             for key, value in payload.items()
@@ -222,7 +227,7 @@ def get_decision_app() -> Runnable[dict[str, Any], bool]:
                     additional_kwargs={
                         "timestamp": item.timestamp,
                         "user": item.user,
-                        "text": item.text,
+                        "text": item.message.get_msgcode(),
                     },
                 )
                 for item in messages
@@ -295,7 +300,7 @@ def get_decision_app() -> Runnable[dict[str, Any], bool]:
 
 def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
     def _normalize_input(payload: dict[str, Any]) -> dict[str, Any]:
-        messages = TypeAdapter(list[UserMessage]).validate_python(payload["messages"])
+        messages = TypeAdapter(list[GroupMessage]).validate_python(payload["messages"])
         reasoning_effort = payload.get("reasoning_effort", "high")
         prompt_variables = {
             key: value
@@ -314,7 +319,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
                     additional_kwargs={
                         "timestamp": item.timestamp,
                         "user": item.user,
-                        "text": item.text,
+                        "text": item.message.get_msgcode(),
                     },
                 )
                 for item in messages

@@ -1,6 +1,8 @@
+import json
 import math
 from collections import deque
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 from typing_extensions import override
 from zoneinfo import ZoneInfo
@@ -15,12 +17,7 @@ from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.config import ConfigModel
 
 from chat.activity import ActivityStore, get_activity_store
-from chat.group import (
-    GroupMessage,
-    clear_session_history,
-    get_chat_app,
-    get_decision_app,
-)
+from chat.agent import UserMessage, clear_session_history, get_agent
 from chat.image import (
     ImageReadResult,
     get_image_analyzer,
@@ -28,7 +25,6 @@ from chat.image import (
 )
 from chat.meme import add_memes
 from chat.message import QQMessage, QQMessageSegment
-from chat.prompt import get_extra_prompt
 
 MESSAGES_LIMIT = 30
 BACKUP_MESSAGES_LIMIT = 20
@@ -39,6 +35,101 @@ EXTRA_PROMPT_MAX_HISTORY = 5
 DEFAULT_USERNAME = "陌生用户"
 
 DEFAULT_CLEAR_KEYWORDS = {"/clear", "/清除"}
+AGENT_DEBUG_LOG = Path(".database/group_agent_debug.jsonl")
+DEBUG_TEXT_LIMIT = 500
+DEBUG_MAX_DEPTH = 4
+
+
+def _extract_stop_message(agent_output: Any) -> dict[str, Any] | None:
+    candidates = [agent_output]
+    while candidates:
+        candidate = candidates.pop(0)
+        if (
+            isinstance(candidate, dict)
+            and isinstance(candidate.get("type"), str)
+            and isinstance(candidate.get("data"), dict)
+        ):
+            return candidate
+        if isinstance(candidate, dict):
+            candidates.extend(candidate.get(key) for key in ("output", "stop_message"))
+            candidates.extend(candidate.values())
+    return None
+
+
+def _compact_text(text: Any, limit: int = DEBUG_TEXT_LIMIT) -> str:
+    compacted = " ".join(str(text).split())
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[: limit - 3] + "..."
+
+
+def _summarize_user_message(message: UserMessage) -> dict[str, Any]:
+    return {
+        "role": message.role,
+        "time": message.timestamp.astimezone(ZoneInfo("Asia/Shanghai")).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "user": message.user,
+        "user_id": message.user_id,
+        "message_id": message.message_id,
+        "is_tome": message.is_tome,
+        "to_other": message.to_other,
+        "have_keywords": message.have_keywords,
+        "image_count": len(message.images),
+        "text": _compact_text(message.message.get_msgcode()),
+    }
+
+
+def _summarize_debug_value(value: Any, *, depth: int = 0) -> Any:  # noqa: PLR0911
+    if depth > DEBUG_MAX_DEPTH:
+        return _compact_text(type(value).__name__, 80)
+    if isinstance(value, UserMessage):
+        return _summarize_user_message(value)
+    if isinstance(value, QQMessage):
+        return _compact_text(value.get_msgcode())
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value if not isinstance(value, str) else _compact_text(value)
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in {"node", "image", "base64", "phash"}:
+                output[key_text] = f"<{type(item).__name__}>"
+                continue
+            output[key_text] = _summarize_debug_value(item, depth=depth + 1)
+        return output
+    if isinstance(value, list | tuple | deque):
+        return [
+            _summarize_debug_value(item, depth=depth + 1)
+            for item in list(value)[:20]
+        ]
+    if hasattr(value, "type") and hasattr(value, "content"):
+        summary = {
+            "message_type": type(value).__name__,
+            "content": _compact_text(getattr(value, "content", "")),
+        }
+        if tool_calls := getattr(value, "tool_calls", None):
+            summary["tool_calls"] = [
+                {
+                    "name": call.get("name"),
+                    "args": _summarize_debug_value(call.get("args"), depth=depth + 1),
+                    "id": call.get("id"),
+                }
+                for call in tool_calls
+                if isinstance(call, dict)
+            ]
+        return summary
+    return f"<{type(value).__name__}>"
+
+
+async def _write_agent_debug(event: dict[str, Any]) -> None:
+    AGENT_DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "logged_at": datetime.now(tz=UTC).isoformat(),
+        **event,
+    }
+    async with await anyio.open_file(AGENT_DEBUG_LOG, "a", encoding="utf-8") as file:
+        await file.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 def _ttest_signal(statistic: Any) -> float:
@@ -48,8 +139,8 @@ def _ttest_signal(statistic: Any) -> float:
     return -(math.tanh(value) if value > 0 else value)
 
 
-class GroupChatConfig(ConfigModel):
-    __config_name__ = "group_chat"
+class GroupAgentConfig(ConfigModel):
+    __config_name__ = "group_agent"
 
     unrestricted_groups: set[int] = set()
     auto_reply_groups: set[int] = set()
@@ -75,10 +166,10 @@ class GroupChatConfig(ConfigModel):
 class Histories(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    messages: deque[GroupMessage] = Field(
+    messages: deque[UserMessage] = Field(
         default_factory=lambda: deque(maxlen=MESSAGES_LIMIT)
     )
-    backup_messages: deque[GroupMessage] = Field(
+    backup_messages: deque[UserMessage] = Field(
         default_factory=lambda: deque(maxlen=BACKUP_MESSAGES_LIMIT)
     )
     backup_pending_counts: deque[int] = Field(
@@ -92,18 +183,17 @@ class Histories(BaseModel):
 class GroupEvent(BaseModel):
     session_id: str
     history_storage: Histories
-    message: GroupMessage
+    message: UserMessage
 
     @property
     def time(self) -> int:
         return int(self.message.timestamp.timestamp())
 
 
-class GroupChatState(BaseModel):
+class GroupAgentState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    decision: Runnable[dict[str, Any], bool] = Field(default_factory=get_decision_app)
-    chat: Runnable[dict[str, Any], str] = Field(default_factory=get_chat_app)
+    agent: Any = Field(default_factory=get_agent)
     image_analyzer: Runnable[dict[str, Any], str] = Field(
         default_factory=lambda _: get_image_analyzer(True, add_memes_hook=add_memes)
     )
@@ -112,14 +202,14 @@ class GroupChatState(BaseModel):
     storages_lock: anyio.Lock = Field(default_factory=anyio.Lock)
 
 
-class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
+class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
     """群聊记录节点"""
 
     priority = 1
 
     @override
-    def __init_state__(self) -> GroupChatState:
-        return GroupChatState()
+    def __init_state__(self) -> GroupAgentState:
+        return GroupAgentState()
 
     async def get_history_storage(
         self,
@@ -191,10 +281,10 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
     async def claim_messages(  # noqa: PLR0911
         self,
         group_event: GroupEvent,
-    ) -> list[GroupMessage] | None:
+    ) -> list[UserMessage] | None:
         history_storage = group_event.history_storage
         message = group_event.message
-        current_messages: list[GroupMessage] | None = None
+        current_messages: list[UserMessage] | None = None
         is_tome = message.is_tome or any(
             msg.is_tome for msg in history_storage.messages
         )
@@ -249,8 +339,8 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
 
     async def filling_images(
         self,
-        current_messages: list[GroupMessage],
-    ) -> list[GroupMessage]:
+        current_messages: list[UserMessage],
+    ) -> list[UserMessage]:
         if not current_messages:
             return []
         skip = (
@@ -293,91 +383,92 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         self,
         group_event: GroupEvent,
         *,
-        current_messages: list[GroupMessage],
-    ) -> list[GroupMessage] | None:
-        fill_event = anyio.Event()
-        output_messages: list[GroupMessage] | None = current_messages
+        current_messages: list[UserMessage],
+    ) -> list[UserMessage] | None:
+        current_messages = await self.filling_images(current_messages)
 
-        async def _fill(fill_event: anyio.Event):
-            nonlocal current_messages
-            try:
-                current_messages = await self.filling_images(current_messages)
-            finally:
-                fill_event.set()
-
-        async def _reply(fill_event: anyio.Event) -> list[GroupMessage] | None:
-            nonlocal output_messages
-            should_reply = (
-                group_event.message.is_tome
-                or any(msg.is_tome for msg in group_event.history_storage.messages)
-                or await self.node_state.decision.ainvoke(
-                    {"messages": current_messages},
-                    config={"configurable": {"session_id": group_event.session_id}},
-                )
-            )
-            await fill_event.wait()
-            output_messages = current_messages
-            if should_reply:
-                print(f"Invoking-Group: {[m.message for m in current_messages]}")
-                output_messages = await self.get_reply(
-                    group_event,
-                    current_messages=current_messages,
-                )
-
-        async with anyio.create_task_group() as task_group:
-            task_group.start_soon(_fill, fill_event)
-            task_group.start_soon(_reply, fill_event)
-
-        return output_messages
-
-    async def get_reply(
-        self,
-        group_event: GroupEvent,
-        *,
-        current_messages: list[GroupMessage],
-    ) -> list[GroupMessage] | None:
-        history_storage = group_event.history_storage
-        history_text = "\n".join(
-            [
-                item.message.get_plain_text()
-                for item in list(history_storage.backup_messages)[
-                    -EXTRA_PROMPT_MAX_HISTORY:
-                ]
-            ]
+        print(f"Invoking-Group-Agent: {[m.message for m in current_messages]}")
+        run_id = (
+            f"{group_event.session_id}-"
+            f"{group_event.message.message_id or group_event.time}-"
+            f"{datetime.now(tz=UTC).strftime('%Y%m%d%H%M%S%f')}"
         )
-        extra_prompt = await get_extra_prompt(history_text)
-        full_text = QQMessage()
-        async for reply in self.node_state.chat.astream(
+        agent_input = {
+            "messages": [],
+            "inputs": current_messages,
+            "early_messages": [],
+            "full_messages": [],
+            "reasoning_effort": "max",
+            "should_stop": False,
+            "stop_message": None,
+        }
+        agent_context = {
+            "session_id": group_event.session_id,
+            "node": self,
+            "is_tome": group_event.message.is_tome,
+        }
+        await _write_agent_debug(
             {
-                "messages": current_messages,
-                "now_time": datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "extra_prompt": extra_prompt,
-                "thinking": True,
-                "reasoning_effort": "high",
-            },
-            config={"configurable": {"session_id": group_event.session_id}},
-        ):
-            if reply is not None and (reply_msg := reply.strip()):
-                print(f"Reply-Group: {reply_msg}")
-                raw_cq_msg = await QQMessage.from_str(reply_msg).get_cqhttp_message(
-                    current_messages
+                "run_id": run_id,
+                "event": "start",
+                "session_id": group_event.session_id,
+                "current_messages": _summarize_debug_value(current_messages),
+            }
+        )
+
+        agent_output: Any = None
+        chunk_index = 0
+        try:
+            async for chunk in self.node_state.agent.astream(
+                agent_input,
+                context=agent_context,
+                stream_mode="updates",
+            ):
+                agent_output = chunk
+                await _write_agent_debug(
+                    {
+                        "run_id": run_id,
+                        "event": "chunk",
+                        "chunk_index": chunk_index,
+                        "chunk": _summarize_debug_value(chunk),
+                        "stop_message": _summarize_debug_value(
+                            _extract_stop_message(chunk)
+                        ),
+                    }
                 )
-                full_text += reply_msg + "\n"
-                for seg in raw_cq_msg:
-                    if seg.type == "image":
-                        await self.reply(seg)
-                        break
-                else:
-                    await self.reply(raw_cq_msg)
+                chunk_index += 1
+        except Exception as exc:
+            await _write_agent_debug(
+                {
+                    "run_id": run_id,
+                    "event": "error",
+                    "error_type": type(exc).__name__,
+                    "error": _compact_text(exc),
+                }
+            )
+            raise
+
+        stop_message = _extract_stop_message(agent_output)
+        full_text = ""
+        if stop_message and stop_message["type"] == "reply":
+            full_text = str(stop_message["data"].get("full_text") or "").strip()
+        await _write_agent_debug(
+            {
+                "run_id": run_id,
+                "event": "end",
+                "chunks": chunk_index,
+                "stop_message": _summarize_debug_value(stop_message),
+                "full_text": _compact_text(full_text),
+            }
+        )
+
         if full_text:
-            history_storage.backup_messages.append(
-                GroupMessage(
+            group_event.history_storage.backup_messages.append(
+                UserMessage(
                     role="assistant",
                     timestamp=datetime.now(tz=UTC),
                     user="可不",
-                    message=full_text,
+                    message=QQMessage.from_str(full_text),
                     user_id=str(self.event.adapter.self_id),
                     message_id="",
                     is_tome=False,
@@ -385,7 +476,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                     have_keywords=False,
                 )
             )
-            history_storage.backup_pending_counts.append(len(current_messages))
+            group_event.history_storage.backup_pending_counts.append(
+                len(current_messages)
+            )
             return None
         return current_messages
 
@@ -393,7 +486,7 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
         self,
         group_event: GroupEvent,
         *,
-        current_messages: list[GroupMessage] | None = None,
+        current_messages: list[UserMessage] | None = None,
     ) -> None:
         history_storage = group_event.history_storage
         async with history_storage.lock:
@@ -513,9 +606,9 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
                 msg_with_image += seg
 
         msg = (
-            GroupMessage(**(msg_data | {"message": msg_with_image, "images": images}))
+            UserMessage(**(msg_data | {"message": msg_with_image, "images": images}))
             if images
-            else GroupMessage(**msg_data)
+            else UserMessage(**msg_data)
         )
 
         return GroupEvent(
@@ -547,5 +640,5 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
     @override
     async def rule(self) -> bool:
         return (
-            str(self.event.user_id) != "2830758180" and self.event.group_id != 895484096  # noqa: PLR2004
+            str(self.event.user_id) != "2830758180" and self.event.group_id == 895484096  # noqa: PLR2004
         )

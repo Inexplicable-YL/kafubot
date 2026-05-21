@@ -1,20 +1,15 @@
-import json
 from collections import deque
 from datetime import UTC, datetime
-from typing import Any, TypeAlias
+from typing import Any, cast
 from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 import anyio
-import imagehash
 from anyio.abc import TaskGroup
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-from langchain_core.messages import HumanMessage
 from langchain_core.runnables import Runnable
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
-from sekaibot.adapter.cqhttp.message import CQHTTPMessage, CQHTTPMessageSegment
 from sekaibot.config import ConfigModel
 
 from chat.activity import ActivityStore, get_activity_store
@@ -23,18 +18,19 @@ from chat.image import (
     get_image_analyzer,
     read_image,
 )
-from chat.meme import add_memes, search_meme
+from chat.meme import add_memes
+from chat.message import QQMessage, QQMessageSegment
 from chat.private import (
+    IMAGE_SEGMENT_TYPES,
+    PrivateMessage,
     clear_session_history,
     get_chat_app,
     get_session_history,
 )
 from chat.prompt import get_extra_prompt
-from chat.utils import parse_message
 
 BACKUP_MESSAGES_LIMIT = 10
 EXTRA_PROMPT_MAX_HISTORY = 3
-IMAGE_ANALYZE_QUEUE_SIZE = 100
 
 
 DEFAULT_CLEAR_KEYWORDS = {"/clear", "/清除"}
@@ -80,97 +76,63 @@ class PrivateEvent(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     session_id: str
-    message_id: int
-    timestamp: datetime
-    user_name: str
-    text: str | None = None
-    image: ImageReadResult | None = None
-    as_meme: bool = False
+    message: PrivateMessage
 
     @property
     def time(self) -> int:
-        return int(self.timestamp.timestamp())
-
-
-class QueuedMessage(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    message_id: int
-    timestamp: datetime
-    text: str | None = None
-    has_text: bool = False
-    image_hash: imagehash.ImageHash | None = None
-    pending_image: bool = False
-    dropped: bool = False
+        return int(self.message.timestamp.timestamp())
 
 
 class SessionQueueState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     running: bool = False
-    pending_messages: list[QueuedMessage] = Field(default_factory=list)
+    pending_messages: list[PrivateMessage] = Field(default_factory=list)
     merge_window_seconds: float = 5
-    pending_image_count: int = 0
+    pending_image_ids: set[str] = Field(default_factory=set)
+    dropped_message_ids: set[str] = Field(default_factory=set)
     condition: anyio.Condition = Field(default_factory=anyio.Condition)
 
-    async def enqueue_text(self, private_event: PrivateEvent) -> None:
-        if private_event.text is None:
-            return
-        async with self.condition:
-            self.pending_messages.append(
-                QueuedMessage(
-                    message_id=private_event.message_id,
-                    timestamp=private_event.timestamp,
-                    text=private_event.text,
-                    has_text=True,
-                )
-            )
-            self.condition.notify_all()
-
-    async def enqueue_image(
+    async def enqueue(
         self,
-        private_event: PrivateEvent,
+        message: PrivateMessage,
         similarity_threshold: int,
-    ) -> QueuedMessage | None:
-        if private_event.image is None:
+    ) -> PrivateMessage | None:
+        if not message.message:
             return None
+        image_message = message if message.images else None
         async with self.condition:
-            if any(
-                message.image_hash is not None
-                and not message.dropped
-                and message.image_hash - private_event.image.phash
-                <= similarity_threshold
-                for message in self.pending_messages
-            ):
-                return None
-            message = QueuedMessage(
-                message_id=private_event.message_id,
-                timestamp=private_event.timestamp,
-                image_hash=private_event.image.phash,
-                pending_image=True,
-            )
+            if image_message is not None:
+                image_hash = image_message.images[0][0].phash
+                if any(
+                    item.images
+                    and item.message_id not in self.dropped_message_ids
+                    and item.images
+                    and item.images[0][0].phash - image_hash <= similarity_threshold
+                    for item in self.pending_messages
+                ):
+                    return None
+                self.pending_image_ids.add(image_message.message_id)
             self.pending_messages.append(message)
-            self.pending_image_count += 1
             self.condition.notify_all()
-            return message
+            return image_message
 
     async def finish_image(
         self,
-        message: QueuedMessage,
+        message: PrivateMessage,
         abstract: str | None,
     ) -> None:
         async with self.condition:
-            if message.pending_image:
-                message.pending_image = False
-                self.pending_image_count = max(0, self.pending_image_count - 1)
-            if abstract:
-                message.text = f"[图片: {abstract}]"
+            self.pending_image_ids.discard(message.message_id)
+            if abstract or message.has_model_visible_content():
+                message.fill_first_pending_image(abstract)
+                if not message.message:
+                    self.dropped_message_ids.add(message.message_id)
             else:
-                message.dropped = True
-                message.text = None
+                self.dropped_message_ids.add(message.message_id)
             self.condition.notify_all()
 
-    async def wait_and_claim(self, message_id: int) -> list[QueuedMessage] | None:
+    async def wait_and_claim(self, message_id: str) -> list[PrivateMessage] | None:
         async with self.condition:
             deadline = anyio.current_time() + self.merge_window_seconds
             while True:
@@ -186,28 +148,32 @@ class SessionQueueState(BaseModel):
                 while True:
                     if self.latest_message_id != message_id:
                         return None
-                    if not self.running and self.pending_image_count == 0:
+                    if not self.running and not self.pending_image_ids:
                         break
                     await self.condition.wait()
 
                 pending_messages = self.pending_messages.copy()
                 has_text = any(
-                    message.has_text and not message.dropped
+                    message.has_model_visible_content()
+                    and message.message_id not in self.dropped_message_ids
                     for message in pending_messages
                 )
                 messages = [
                     message
                     for message in pending_messages
-                    if not message.dropped and message.text is not None
+                    if message.message_id not in self.dropped_message_ids
+                    and message.message
                 ]
                 if not has_text:
                     if not messages:
                         self.pending_messages.clear()
+                        self.dropped_message_ids.clear()
                         self.condition.notify_all()
                         return []
                     await self.condition.wait()
                     continue
                 self.pending_messages.clear()
+                self.dropped_message_ids.clear()
                 self.condition.notify_all()
                 if not messages:
                     return []
@@ -216,7 +182,7 @@ class SessionQueueState(BaseModel):
                 return messages
 
     @property
-    def latest_message_id(self) -> int | None:
+    def latest_message_id(self) -> str | None:
         if not self.pending_messages:
             return None
         return self.pending_messages[-1].message_id
@@ -225,15 +191,6 @@ class SessionQueueState(BaseModel):
         async with self.condition:
             self.running = False
             self.condition.notify_all()
-
-
-ImageAnalyzeJob: TypeAlias = tuple[
-    SessionQueueState,
-    QueuedMessage,
-    str,
-    imagehash.ImageHash,
-    bool,
-]
 
 
 class PrivateChatState(BaseModel):
@@ -247,11 +204,9 @@ class PrivateChatState(BaseModel):
     backup_histories: dict[str, deque[str]] = Field(default_factory=dict)
     sessions: dict[str, SessionQueueState] = Field(default_factory=dict)
     sessions_lock: anyio.Lock = Field(default_factory=anyio.Lock)
-    image_worker_lock: anyio.Lock = Field(default_factory=anyio.Lock)
-    image_worker_task_group: TaskGroup | None = None
-    image_worker_count: int = 0
-    image_job_send_stream: MemoryObjectSendStream[ImageAnalyzeJob]
-    image_job_receive_stream: MemoryObjectReceiveStream[ImageAnalyzeJob]
+    image_task_group_lock: anyio.Lock = Field(default_factory=anyio.Lock)
+    image_task_group: TaskGroup | None = None
+    image_limiter: anyio.CapacityLimiter | None = None
 
 
 class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]):
@@ -259,13 +214,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
 
     @override
     def __init_state__(self) -> PrivateChatState:
-        send_stream, receive_stream = anyio.create_memory_object_stream[
-            ImageAnalyzeJob
-        ](IMAGE_ANALYZE_QUEUE_SIZE)
-        return PrivateChatState(
-            image_job_send_stream=send_stream,
-            image_job_receive_stream=receive_stream,
-        )
+        return PrivateChatState()
 
     def history(self, session_id: str) -> deque[str]:
         return self.node_state.backup_histories.setdefault(
@@ -282,39 +231,55 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
                 ),
             )
 
-    @staticmethod
-    async def image_worker(node_state: PrivateChatState) -> None:
-        async with node_state.image_job_receive_stream.clone() as receive_stream:
-            async for job in receive_stream:
-                session_state, message, image, phash, as_meme = job
-                abstract: str | None = None
-                try:
-                    abstract = await node_state.image_analyzer.ainvoke(
-                        {
-                            "image": image,
-                            "phash": phash,
-                            "as_meme": as_meme,
-                            "detail": False,
-                        }
-                    )
-                except Exception:
-                    abstract = None
-                await session_state.finish_image(message, abstract)
+    def image_limiter(self) -> anyio.CapacityLimiter:
+        limiter = self.node_state.image_limiter
+        if (
+            limiter is None
+            or limiter.total_tokens != self.config.image_analyzer_workers
+        ):
+            limiter = self.node_state.image_limiter = anyio.CapacityLimiter(
+                self.config.image_analyzer_workers
+            )
+        return limiter
 
-    async def ensure_image_workers(self) -> None:
-        async with self.node_state.image_worker_lock:
-            if self.node_state.image_worker_task_group is None:
-                self.node_state.image_worker_task_group = anyio.create_task_group()
-                await self.node_state.image_worker_task_group.__aenter__()
+    async def ensure_image_task_group(self) -> TaskGroup:
+        async with self.node_state.image_task_group_lock:
+            if self.node_state.image_task_group is None:
+                self.node_state.image_task_group = anyio.create_task_group()
+                await self.node_state.image_task_group.__aenter__()
+            return self.node_state.image_task_group
 
-            while (
-                self.node_state.image_worker_count < self.config.image_analyzer_workers
-            ):
-                self.node_state.image_worker_task_group.start_soon(
-                    self.image_worker,
-                    self.node_state,
+    async def analyze_image_message(self, message: PrivateMessage) -> str | None:
+        image, as_meme = message.images[0]
+        try:
+            async with self.image_limiter():
+                return await self.node_state.image_analyzer.ainvoke(
+                    {
+                        "image": image.base64,
+                        "phash": image.phash,
+                        "as_meme": as_meme,
+                        "detail": False,
+                    }
                 )
-                self.node_state.image_worker_count += 1
+        except Exception:
+            return None
+
+    async def start_image_analysis(
+        self,
+        session_state: SessionQueueState,
+        message: PrivateMessage,
+    ) -> None:
+        async def _finish_image_analysis() -> None:
+            await session_state.finish_image(
+                message,
+                await self.analyze_image_message(message),
+            )
+
+        try:
+            task_group = await self.ensure_image_task_group()
+            task_group.start_soon(_finish_image_analysis)
+        except Exception:
+            await session_state.finish_image(message, None)
 
     def activity_weight(self, event_time: int) -> float:
         hour = (
@@ -340,50 +305,35 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
     async def record_user_context(
         self,
         session_id: str,
-        messages: list[QueuedMessage],
+        messages: list[PrivateMessage],
     ) -> None:
-        texts = [message.text for message in messages if message.text is not None]
+        texts = [message.message.get_msgcode() for message in messages]
         self.history(session_id).append("\n".join(texts))
         await get_session_history(session_id).aadd_messages(
-            [
-                HumanMessage(
-                    content=message.text,
-                    additional_kwargs={
-                        "raw": {
-                            "timestamp": message.timestamp,
-                            "text": message.text,
-                        }
-                    },
-                )
-                for message in messages
-                if message.text is not None
-            ]
+            [message.as_human_message() for message in messages]
         )
 
     async def run_chat(
         self,
         private_event: PrivateEvent,
-        messages: list[QueuedMessage],
+        messages: list[PrivateMessage],
     ) -> bool:
         history = self.history(private_event.session_id)
-        texts = [message.text for message in messages if message.text is not None]
+        texts = [message.message.get_msgcode() for message in messages]
         history.append("\n".join(texts))
         replied = False
         answer = ""
         print(f"Invoking-Private: {texts}")
         async for reply in self.node_state.chat.astream(
             {
-                "messages": [
-                    message.model_dump(include={"timestamp", "text"})
-                    for message in messages
-                ],
+                "messages": messages,
                 "extra_prompt": await get_extra_prompt(
                     "\n".join(list(history)[-EXTRA_PROMPT_MAX_HISTORY:])
                 ),
                 "now_time": datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 ),
-                "user_name": private_event.user_name,
+                "user_name": private_event.message.user,
                 "thinking": True,
                 "reasoning_effort": "max",
             },
@@ -391,25 +341,20 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
         ):
             if reply is None:
                 continue
-            print(f"Reply-Private: {reply}")
-            segments, text = parse_message(reply.strip())
-            message: CQHTTPMessage | str = ""
-            for seg in segments:
-                if seg.type != "meme" or "content" not in seg.data:
-                    continue
-                meme_result = await search_meme(
-                    seg.data["content"],
-                    temperature=0.5,
-                    min_score=0.0,
-                )
-                if meme_result:
-                    await self.reply(
-                        CQHTTPMessageSegment.image(meme_result.base64, sub_type=1)
-                    )
-            message += text
-            if message:
-                await self.reply(message)
-            answer += reply
+            if not (reply_msg := reply.strip()):
+                continue
+            print(f"Reply-Private: {reply_msg}")
+            raw_cq_msg = await QQMessage.from_str(reply_msg).get_cqhttp_message(
+                messages
+            )
+            for seg in raw_cq_msg:
+                if seg.type == "image":
+                    await self.reply(seg)
+                    break
+            else:
+                if raw_cq_msg:
+                    await self.reply(raw_cq_msg)
+            answer += reply_msg + "\n"
             replied = True
         if replied:
             history.append(answer)
@@ -430,40 +375,16 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
     async def get_event(self) -> PrivateEvent | None:
         session_id = self.event.get_session_id()
         text = self.event.get_plain_text()
-        image: ImageReadResult | None = None
-        as_meme = False
 
-        if text:
-            if any(keyword in text for keyword in self.config.clear_keywords):
-                await self.delete_chat(session_id)
-                return None
-        elif (
-            len(self.event.message) == 1
-            and self.event.message[0].type == "image"
-            and (file := self.event.message[0].data.get("file"))
-        ):
-            image = await self.get_image(file)
-            as_meme = str(self.event.message[0].data.get("sub_type", "0")) == "1"
-            if image is None:
-                return None
-        elif (
-            len(self.event.message) == 1
-            and self.event.message[0].type == "file"
-            and (file_name := self.event.message[0].data.get("file"))
-        ):
-            text = f"[文件:{file_name}]"
-        elif (
-            len(self.event.message) == 1
-            and self.event.message[0].type == "json"
-            and (
-                prompt := json.loads(self.event.message[0].data.get("data", "{}")).get(
-                    "prompt"
-                )
-            )
-        ):
-            text = f"[{prompt}]"
-        else:
+        if text and any(keyword in text for keyword in self.config.clear_keywords):
+            await self.delete_chat(session_id)
             return None
+
+        message = await QQMessage.from_cqhttp_message(
+            self.event.message,
+            [],
+            self.get_image,
+        )
 
         if self.event.reply and (reply_time := int(self.event.reply.time)):
             time_text = (
@@ -471,49 +392,56 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
                 .astimezone(ZoneInfo("Asia/Shanghai"))
                 .strftime("%Y-%m-%d %H:%M:%S")
             )
-            text = f"[MSG:reply, time={time_text}] {text}"
+            message = QQMessageSegment.reply(time_text) + message
+        if not message:
+            return None
+
+        msg_data = {
+            "timestamp": datetime.fromtimestamp(self.event.time, tz=UTC),
+            "user": self.event.sender.nickname or "",
+            "user_id": str(self.event.user_id),
+            "message_id": str(self.event.message_id),
+            "message": message,
+        }
+        images: list[tuple[ImageReadResult, bool]] = []
+        msg_with_image = QQMessage()
+        for seg in message:
+            if seg.type in IMAGE_SEGMENT_TYPES and not seg.data.get("content"):
+                image_data = seg.data.get("image")
+                if image_data is not None:
+                    images.append(
+                        (cast("ImageReadResult", image_data), seg.type == "meme")
+                    )
+                    msg_with_image += seg
+            else:
+                msg_with_image += seg
+        msg = (
+            PrivateMessage(**(msg_data | {"message": msg_with_image, "images": images}))
+            if images
+            else PrivateMessage(**msg_data)
+        )
+        if not msg.message:
+            return None
+
         return PrivateEvent(
             session_id=session_id,
-            message_id=self.event.message_id,
-            timestamp=datetime.fromtimestamp(self.event.time, tz=UTC),
-            user_name=self.event.sender.nickname or "",
-            text=text or None,
-            image=image,
-            as_meme=as_meme,
+            message=msg,
         )
 
     async def claim_messages(
         self,
         private_event: PrivateEvent,
-    ) -> tuple[SessionQueueState, list[QueuedMessage]] | None:
+    ) -> tuple[SessionQueueState, list[PrivateMessage]] | None:
         state = await self.session_state(private_event.session_id)
-        if private_event.text is not None:
-            await state.enqueue_text(private_event)
-            messages = await state.wait_and_claim(private_event.message_id)
-            if not messages:
-                return None
-            return state, messages
-        await self.ensure_image_workers()
-        image_result = await state.enqueue_image(
-            private_event,
+        image_message = await state.enqueue(
+            private_event.message,
             self.config.image_hash_similarity_threshold,
         )
-        if image_result is None or private_event.image is None:
+        if private_event.message.images and image_message is None:
             return None
-        queued_message = image_result
-        try:
-            await self.node_state.image_job_send_stream.send(
-                (
-                    state,
-                    queued_message,
-                    private_event.image.base64,
-                    private_event.image.phash,
-                    private_event.as_meme,
-                )
-            )
-        except Exception:
-            await state.finish_image(queued_message, None)
-        messages = await state.wait_and_claim(private_event.message_id)
+        if image_message is not None:
+            await self.start_image_analysis(state, image_message)
+        messages = await state.wait_and_claim(private_event.message.message_id)
         if not messages:
             return None
         return state, messages
@@ -521,7 +449,7 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
     async def run_reply(
         self,
         private_event: PrivateEvent,
-        messages: list[QueuedMessage],
+        messages: list[PrivateMessage],
     ) -> None:
         if await self.node_state.activity_store.is_limited(
             scope="private",

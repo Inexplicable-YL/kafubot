@@ -17,11 +17,13 @@ from langchain_core.runnables import (
 )
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_deepseek import ChatDeepSeek
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from sqlalchemy import DateTime, Integer, Text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from chat.image import ImageReadResult  # noqa: TC001
+from chat.message import QQMessage, QQMessageSegment  # noqa: TC001
 from chat.prompt import PRIVATE_SYSTEM_PROMPT
 from chat.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
 
@@ -37,6 +39,7 @@ DEEPSEEK_MODEL = os.getenv("PRIVATE_DEEPSEEK_MODEL", "deepseek-v4-flash")
 CHAT_HISTORY_MAX_MESSAGES = int(os.getenv("PRIVATE_CHAT_HISTORY_MAX_MESSAGES", "100"))
 MODEL_VISIBLE_TZ = ZoneInfo(os.getenv("MODEL_VISIBLE_TZ", "Asia/Shanghai"))
 MODEL_VISIBLE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+IMAGE_SEGMENT_TYPES = {"image", "meme"}
 
 
 def _ensure_utc(timestamp: datetime) -> datetime:
@@ -69,15 +72,29 @@ def _get_async_engine() -> AsyncEngine:
     return create_async_engine(DB_URL)
 
 
-class UserMessage(BaseModel):
+class PrivateMessage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     timestamp: datetime
-    text: str
+    message: QQMessage
+    message_id: str
+    user: str = ""
+    user_id: str = ""
+    images: list[tuple[ImageReadResult, bool]] = Field(default_factory=list)
 
     def as_content(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> str:
         return _format_model_visible_message_content(
             self.timestamp,
-            self.text,
+            self.message.get_msgcode(),
             timezone=timezone,
+        )
+
+    def has_model_visible_content(self) -> bool:
+        return any(
+            bool(seg.data.get("text", "").strip())
+            if seg.type == "text"
+            else seg.type not in IMAGE_SEGMENT_TYPES or bool(seg.data.get("content"))
+            for seg in self.message
         )
 
     def as_human_message(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> HumanMessage:
@@ -86,10 +103,28 @@ class UserMessage(BaseModel):
             additional_kwargs={
                 "raw": {
                     "timestamp": _ensure_utc(self.timestamp),
-                    "text": self.text,
+                    "text": self.message.get_msgcode(),
                 }
             },
         )
+
+    def fill_first_pending_image(self, content: str | None) -> None:
+        new_message = QQMessage()
+        replaced = False
+        for seg in self.message:
+            if (
+                not replaced
+                and seg.type in IMAGE_SEGMENT_TYPES
+                and not seg.data.get("content")
+            ):
+                replaced = True
+                if content:
+                    data = dict(seg.data)
+                    data["content"] = content
+                    new_message += getattr(QQMessageSegment, seg.type)(**data)
+                continue
+            new_message += seg
+        self.message = new_message
 
 
 class ChatMessageBase(DeclarativeBase):
@@ -215,7 +250,9 @@ async def clear_session_history(session_id: str) -> None:
 
 def get_chat_app() -> Runnable[dict[str, Any], str]:
     def _normalize_input(payload: dict[str, Any]) -> dict[str, Any]:
-        messages = TypeAdapter(list[UserMessage]).validate_python(payload["messages"])
+        messages = TypeAdapter(list[PrivateMessage]).validate_python(
+            payload["messages"]
+        )
         reasoning_effort = payload.get("reasoning_effort", "high")
         prompt_variables = {
             key: value
