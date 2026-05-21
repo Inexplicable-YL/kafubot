@@ -546,6 +546,4 @@ class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
 
     @override
     async def rule(self) -> bool:
-        return (
-            str(self.event.user_id) != "2830758180" and self.event.group_id != 895484096  # noqa: PLR2004
-        )
+        return str(self.event.user_id) != "2830758180"

@@ -100,11 +100,10 @@ def _summarize_debug_value(value: Any, *, depth: int = 0) -> Any:  # noqa: PLR09
         return output
     if isinstance(value, list | tuple | deque):
         return [
-            _summarize_debug_value(item, depth=depth + 1)
-            for item in list(value)[:20]
+            _summarize_debug_value(item, depth=depth + 1) for item in list(value)[:20]
         ]
     if hasattr(value, "type") and hasattr(value, "content"):
-        summary = {
+        summary: dict[str, Any] = {
             "message_type": type(value).__name__,
             "content": _compact_text(getattr(value, "content", "")),
         }
@@ -205,7 +204,9 @@ class GroupAgentState(BaseModel):
 class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
     """群聊记录节点"""
 
-    priority = 1
+    priority = 0
+    block = True
+    load = False
 
     @override
     def __init_state__(self) -> GroupAgentState:
