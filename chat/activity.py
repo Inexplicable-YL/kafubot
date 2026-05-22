@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import UTC, datetime, timedelta
 from functools import cache
 from typing import Literal, cast
@@ -12,11 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import NullPool
 
-ACTIVITY_DB_URL = os.getenv(
-    "ACTIVITY_LIMITS_DB_URL",
-    "sqlite+aiosqlite:///./.database/activity_limits.db",
-)
-ACTIVITY_TABLE_NAME = os.getenv("ACTIVITY_LIMITS_TABLE", "activity_records")
+ACTIVITY_DB_URL = "sqlite+aiosqlite:///./.database/activity_limits.db"
+ACTIVITY_TABLE_NAME = "activity_records"
 
 
 class ActivityBase(DeclarativeBase):

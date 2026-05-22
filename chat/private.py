@@ -24,20 +24,18 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from chat.image import ImageReadResult  # noqa: TC001
 from chat.message import QQMessage, QQMessageSegment  # noqa: TC001
-from chat.prompt import PRIVATE_SYSTEM_PROMPT
+from chat.prompt import PRIVATE_HUMAN_PROMPT, PRIVATE_SYSTEM_PROMPT
 from chat.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 
-DB_URL = os.getenv(
-    "PRIVATE_HISTORY_DB_URL", "sqlite+aiosqlite:///./.database/private_history.db"
-)
-TABLE_NAME = os.getenv("PRIVATE_HISTORY_TABLE", "deepseek_chat_messages")
-DEEPSEEK_MODEL = os.getenv("PRIVATE_DEEPSEEK_MODEL", "deepseek-v4-flash")
-CHAT_HISTORY_MAX_MESSAGES = int(os.getenv("PRIVATE_CHAT_HISTORY_MAX_MESSAGES", "100"))
-MODEL_VISIBLE_TZ = ZoneInfo(os.getenv("MODEL_VISIBLE_TZ", "Asia/Shanghai"))
+DB_URL = "sqlite+aiosqlite:///./.database/private_history.db"
+TABLE_NAME = "deepseek_chat_messages"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+CHAT_HISTORY_MAX_MESSAGES = 100
+MODEL_VISIBLE_TZ = ZoneInfo("Asia/Shanghai")
 MODEL_VISIBLE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 IMAGE_SEGMENT_TYPES = {"image", "meme"}
 
@@ -277,6 +275,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:
             ("system", PRIVATE_SYSTEM_PROMPT),
             MessagesPlaceholder("history"),
             MessagesPlaceholder("current_messages"),
+            ("human", PRIVATE_HUMAN_PROMPT),
         ]
     )
     model = ChatDeepSeek(

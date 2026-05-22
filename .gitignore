@@ -210,3 +210,4 @@ __marimo__/
 *.db
 .meme_vectordb
 .database
+.logs

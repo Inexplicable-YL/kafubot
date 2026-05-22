@@ -18,9 +18,9 @@ from chat.image import get_image_analyzer, read_image
 load_dotenv()
 
 
-MEME_CHROMA_PATH = os.getenv("MEME_CHROMA_PATH", "./.database/meme_vectordb")
+MEME_CHROMA_PATH = "./.database/meme_vectordb"
 
-MEME_PHASH_DISTANCE = int(os.getenv("MEME_PHASH_DISTANCE", "5"))
+MEME_PHASH_DISTANCE = 5
 
 
 @cache
@@ -244,6 +244,34 @@ async def search_meme(
         base64=best_doc.metadata.get("base64", ""),
         analysis=best_doc.page_content,
     )
+
+
+async def search_memes(
+    query: str,
+    limit: int = 10,
+    min_score: float | None = None,
+) -> list[MemeResult] | None:
+    for k, v in EXTEND_PAIRS:
+        if k in query:
+            query = f"{query}。{v}"
+    results = await get_vectorstore()._asimilarity_search_with_relevance_scores(
+        query, k=20, filter={"manually_annotated": True}
+    )
+    candidates = [
+        (doc, score)
+        for doc, score in results
+        if min_score is None or score >= min_score
+    ]
+    if not candidates:
+        return None
+
+    return [
+        MemeResult(
+            base64=doc.metadata.get("base64", ""),
+            analysis=doc.page_content,
+        )
+        for doc, _ in candidates[:limit]
+    ]
 
 
 if __name__ == "__main__":

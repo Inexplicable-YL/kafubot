@@ -41,9 +41,9 @@ IMAGE_DB_URL = os.getenv(
     "IMAGE_DB_URL", "sqlite+aiosqlite:///./.database/image_analysis_cache.db"
 )
 
-IMAGE_MAX_RECORDS = int(os.getenv("IMAGE_MAX_RECORDS", "100"))
+IMAGE_MAX_RECORDS = 100
 
-IMAGE_PHASH_DISTANCE = int(os.getenv("IMAGE_PHASH_DISTANCE", "5"))
+IMAGE_PHASH_DISTANCE = 5
 
 
 class ImageReadResult(BaseModel):

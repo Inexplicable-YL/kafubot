@@ -1,8 +1,6 @@
-import json
 import math
 from collections import deque
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, cast
 from typing_extensions import override
 from zoneinfo import ZoneInfo
@@ -35,100 +33,21 @@ EXTRA_PROMPT_MAX_HISTORY = 5
 DEFAULT_USERNAME = "陌生用户"
 
 DEFAULT_CLEAR_KEYWORDS = {"/clear", "/清除"}
-AGENT_DEBUG_LOG = Path(".database/group_agent_debug.jsonl")
-DEBUG_TEXT_LIMIT = 500
-DEBUG_MAX_DEPTH = 4
 
 
-def _extract_stop_message(agent_output: Any) -> dict[str, Any] | None:
-    candidates = [agent_output]
-    while candidates:
-        candidate = candidates.pop(0)
-        if (
-            isinstance(candidate, dict)
-            and isinstance(candidate.get("type"), str)
-            and isinstance(candidate.get("data"), dict)
-        ):
-            return candidate
-        if isinstance(candidate, dict):
-            candidates.extend(candidate.get(key) for key in ("output", "stop_message"))
-            candidates.extend(candidate.values())
-    return None
-
-
-def _compact_text(text: Any, limit: int = DEBUG_TEXT_LIMIT) -> str:
-    compacted = " ".join(str(text).split())
-    if len(compacted) <= limit:
-        return compacted
-    return compacted[: limit - 3] + "..."
-
-
-def _summarize_user_message(message: UserMessage) -> dict[str, Any]:
-    return {
-        "role": message.role,
-        "time": message.timestamp.astimezone(ZoneInfo("Asia/Shanghai")).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-        "user": message.user,
-        "user_id": message.user_id,
-        "message_id": message.message_id,
-        "is_tome": message.is_tome,
-        "to_other": message.to_other,
-        "have_keywords": message.have_keywords,
-        "image_count": len(message.images),
-        "text": _compact_text(message.message.get_msgcode()),
-    }
-
-
-def _summarize_debug_value(value: Any, *, depth: int = 0) -> Any:  # noqa: PLR0911
-    if depth > DEBUG_MAX_DEPTH:
-        return _compact_text(type(value).__name__, 80)
-    if isinstance(value, UserMessage):
-        return _summarize_user_message(value)
-    if isinstance(value, QQMessage):
-        return _compact_text(value.get_msgcode())
-    if isinstance(value, str | int | float | bool) or value is None:
-        return value if not isinstance(value, str) else _compact_text(value)
-    if isinstance(value, dict):
-        output: dict[str, Any] = {}
-        for key, item in value.items():
-            key_text = str(key)
-            if key_text in {"node", "image", "base64", "phash"}:
-                output[key_text] = f"<{type(item).__name__}>"
-                continue
-            output[key_text] = _summarize_debug_value(item, depth=depth + 1)
-        return output
-    if isinstance(value, list | tuple | deque):
-        return [
-            _summarize_debug_value(item, depth=depth + 1) for item in list(value)[:20]
-        ]
-    if hasattr(value, "type") and hasattr(value, "content"):
-        summary: dict[str, Any] = {
-            "message_type": type(value).__name__,
-            "content": _compact_text(getattr(value, "content", "")),
-        }
-        if tool_calls := getattr(value, "tool_calls", None):
-            summary["tool_calls"] = [
-                {
-                    "name": call.get("name"),
-                    "args": _summarize_debug_value(call.get("args"), depth=depth + 1),
-                    "id": call.get("id"),
-                }
-                for call in tool_calls
-                if isinstance(call, dict)
-            ]
-        return summary
-    return f"<{type(value).__name__}>"
-
-
-async def _write_agent_debug(event: dict[str, Any]) -> None:
-    AGENT_DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
-    event = {
-        "logged_at": datetime.now(tz=UTC).isoformat(),
-        **event,
-    }
-    async with await anyio.open_file(AGENT_DEBUG_LOG, "a", encoding="utf-8") as file:
-        await file.write(json.dumps(event, ensure_ascii=False) + "\n")
+def _extract_reply(agent_output: Any) -> str | None:
+    candidates = agent_output.get("outputs")
+    full_text = ""
+    if isinstance(candidates, list):
+        for item in candidates:
+            if isinstance(item, dict) and isinstance(item.get("data"), dict):
+                if item.get("type") == "reply":
+                    full_text += item["data"].get("full_text") or ""
+                elif item.get("type") == "meme":
+                    full_text += (
+                        f"[MSG:meme, content={item['data'].get('content') or ''}]"
+                    )
+    return full_text or None
 
 
 def _ttest_signal(statistic: Any) -> float:
@@ -206,7 +125,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
 
     priority = 0
     block = True
-    load = False
 
     @override
     def __init_state__(self) -> GroupAgentState:
@@ -388,88 +306,34 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
     ) -> list[UserMessage] | None:
         current_messages = await self.filling_images(current_messages)
 
-        print(f"Invoking-Group-Agent: {[m.message for m in current_messages]}")
-        run_id = (
-            f"{group_event.session_id}-"
-            f"{group_event.message.message_id or group_event.time}-"
-            f"{datetime.now(tz=UTC).strftime('%Y%m%d%H%M%S%f')}"
-        )
-        agent_input = {
-            "messages": [],
-            "inputs": current_messages,
-            "early_messages": [],
-            "full_messages": [],
-            "reasoning_effort": "max",
-            "should_stop": False,
-            "stop_message": None,
-        }
-        agent_context = {
-            "session_id": group_event.session_id,
-            "node": self,
-            "is_tome": group_event.message.is_tome,
-        }
-        await _write_agent_debug(
+        print(f"Group-Agent-Invoking: {[m.message for m in current_messages]}")
+        agent_output = await self.node_state.agent.ainvoke(
             {
-                "run_id": run_id,
-                "event": "start",
+                "messages": [],
+                "inputs": current_messages,
+                "early_messages": [],
+                "full_messages": [],
+                "reasoning_effort": "max",
+                "should_stop": False,
+                "outputs": [],
+                "search_meme_history": {},
+                "meme_id": 1,
+            },
+            context={
                 "session_id": group_event.session_id,
-                "current_messages": _summarize_debug_value(current_messages),
-            }
+                "node": self,
+                "is_tome": group_event.message.is_tome,
+            },
         )
 
-        agent_output: Any = None
-        chunk_index = 0
-        try:
-            async for chunk in self.node_state.agent.astream(
-                agent_input,
-                context=agent_context,
-                stream_mode="updates",
-            ):
-                agent_output = chunk
-                await _write_agent_debug(
-                    {
-                        "run_id": run_id,
-                        "event": "chunk",
-                        "chunk_index": chunk_index,
-                        "chunk": _summarize_debug_value(chunk),
-                        "stop_message": _summarize_debug_value(
-                            _extract_stop_message(chunk)
-                        ),
-                    }
-                )
-                chunk_index += 1
-        except Exception as exc:
-            await _write_agent_debug(
-                {
-                    "run_id": run_id,
-                    "event": "error",
-                    "error_type": type(exc).__name__,
-                    "error": _compact_text(exc),
-                }
-            )
-            raise
-
-        stop_message = _extract_stop_message(agent_output)
-        full_text = ""
-        if stop_message and stop_message["type"] == "reply":
-            full_text = str(stop_message["data"].get("full_text") or "").strip()
-        await _write_agent_debug(
-            {
-                "run_id": run_id,
-                "event": "end",
-                "chunks": chunk_index,
-                "stop_message": _summarize_debug_value(stop_message),
-                "full_text": _compact_text(full_text),
-            }
-        )
-
-        if full_text:
+        if reply_text := _extract_reply(agent_output):
+            print(f"Group-Agent-Reply: {reply_text}")
             group_event.history_storage.backup_messages.append(
                 UserMessage(
                     role="assistant",
                     timestamp=datetime.now(tz=UTC),
                     user="可不",
-                    message=QQMessage.from_str(full_text),
+                    message=QQMessage.from_str(reply_text),
                     user_id=str(self.event.adapter.self_id),
                     message_id="",
                     is_tome=False,
@@ -620,23 +484,26 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
 
     @override
     async def handle(self) -> None:
-        group_event = await self.get_event()
-        if group_event is None:
-            return
-        current_messages = await self.claim_messages(group_event)
-        if current_messages is None:
-            return
-
         try:
-            current_messages = await self.run_reply(
-                group_event,
-                current_messages=current_messages,
-            )
+            group_event = await self.get_event()
+            if group_event is None:
+                return
+            current_messages = await self.claim_messages(group_event)
+            if current_messages is None:
+                return
+
+            try:
+                current_messages = await self.run_reply(
+                    group_event,
+                    current_messages=current_messages,
+                )
+            finally:
+                await self.finish_reply(
+                    group_event,
+                    current_messages=current_messages,
+                )
         finally:
-            await self.finish_reply(
-                group_event,
-                current_messages=current_messages,
-            )
+            self.stop()
 
     @override
     async def rule(self) -> bool:

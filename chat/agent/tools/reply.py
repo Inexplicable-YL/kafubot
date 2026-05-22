@@ -22,7 +22,7 @@ from chat.agent.base import (
     MODEL_VISIBLE_TZ,
     ManagerContext,
     ManagerState,
-    StopMessage,
+    OutputMessage,
     UserMessage,
 )
 from chat.agent.history import get_session_history
@@ -51,7 +51,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
             **prompt_variables,
             "current_messages": [
                 HumanMessage(
-                    content=item.as_content(timezone=MODEL_VISIBLE_TZ),
+                    content=item.as_plain_content(timezone=MODEL_VISIBLE_TZ),
                     additional_kwargs={"raw": item},
                 )
                 for item in TypeAdapter(list[UserMessage]).validate_python(
@@ -138,6 +138,9 @@ class ReplyInput(BaseModel):
     reference_info: str = Field(
         description="有助于回复的信息，之前搜集得到的事实性信息，记忆等，使用平文本格式。"
     )
+    language_style: str = Field(
+        description="你需要指导回复的语言风格，例如是反骨、拌嘴、可爱地攻击（如虾头、变态等）、傲娇属性，或者是温柔的回复或安慰等，使用平文本格式。"
+    )
     runtime: ToolRuntime = Field(exclude=True)
 
 
@@ -145,6 +148,7 @@ class ReplyInput(BaseModel):
 async def reply(
     focus: list[str],
     reference_info: str,
+    language_style: str,
     runtime: ToolRuntime,
 ) -> Any:
     """调用reply工具实现对用户进行回复。"""
@@ -168,6 +172,8 @@ async def reply(
         return "请检查 `focus` 的时间格式是否正确。"
     if not reference_info:
         return "`reply` 工具需要填充 `reference_info` 参数。"
+    if not language_style:
+        return "`reply` 工具需要填充 `language_style` 参数。"
     focus_messages = "\n".join(focus_output)
     full_text = ""
     inputs = _runtime.state["inputs"]
@@ -176,6 +182,7 @@ async def reply(
             "messages": inputs,
             "focus_messages": focus_messages,
             "reference_info": reference_info,
+            "language_style": language_style,
             "time": datetime.now(tz=MODEL_VISIBLE_TZ).strftime("%Y-%m-%d %H:%M:%S"),
             "thinking": True,
             "reasoning_effort": "max",
@@ -183,7 +190,6 @@ async def reply(
         config={"configurable": {"session_id": _runtime.context["session_id"]}},
     ):
         if reply is not None and (reply_msg := reply.strip()):
-            print(f"Reply-Group: {reply_msg}")
             raw_cq_msg = await QQMessage.from_str(reply_msg).get_cqhttp_message(inputs)
             full_text += reply_msg + "\n"
             for seg in raw_cq_msg:
@@ -194,14 +200,16 @@ async def reply(
                 await _runtime.context["node"].reply(raw_cq_msg)
     return Command(
         update={
-            "should_stop": True,
-            "stop_message": StopMessage(
-                type="reply",
-                data={"full_text": full_text},
-            ),
+            "outputs": _runtime.state["outputs"]
+            + [
+                OutputMessage(
+                    type="reply",
+                    data={"full_text": full_text},
+                )
+            ],
             "messages": [
                 ToolMessage(
-                    content="当前 Planner 已结束本轮思考，等待新的群聊消息。",
+                    content="Bot 回复：" + full_text,
                     tool_call_id=_runtime.tool_call_id,
                 )
             ],

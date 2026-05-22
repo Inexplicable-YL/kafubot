@@ -14,6 +14,7 @@ from langchain.agents.middleware import (
     before_model,
     dynamic_prompt,
     wrap_model_call,
+    wrap_tool_call,
 )
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_deepseek import ChatDeepSeek
@@ -23,15 +24,18 @@ from chat.agent.base import (
     MODEL_VISIBLE_TZ,
     ManagerContext,
     ManagerState,
-    StopMessage,
+    OutputMessage,
     UserMessage,
 )
 from chat.agent.builder import create_agent
 from chat.agent.history import get_session_history
+from chat.agent.logs import log_model_response, log_tool_io
 from chat.agent.prompt import (
     IDENTITY,
+    LANGUAGE_STYLE,
     MANAGER_PROMPT,
     MANAGER_WITH_DECISION_PROMPT,
+    MEME_PROMPT,
     SPECIAL_REMINDER,
 )
 from chat.agent.tools import TOOLS
@@ -48,6 +52,7 @@ MAX_TRUNS = 5
 MODEL_NAME = "deepseek-v4-flash"
 HISTORY_WINDOW = 20
 wrap_model_call_async = cast("Any", wrap_model_call)
+wrap_tool_call_async = cast("Any", wrap_tool_call)
 
 
 def manager_dynamic_prompt(
@@ -61,26 +66,31 @@ def final(
     state: ManagerState, runtime: Runtime[ManagerContext]
 ) -> dict[str, Any] | None:
     _ = runtime
-    if state["should_stop"] and state["stop_message"] is not None:
+    if state["should_stop"]:
         return {
-            "output": state["stop_message"],
             "jump_to": "end",
         }
     if len([m for m in state["messages"] if isinstance(m, AIMessage)]) >= MAX_TRUNS:
         return {
-            "output": StopMessage(
-                type="stop",
-                data={},
-            ),
+            "outputs": state["outputs"]
+            + [
+                OutputMessage(
+                    type="stop",
+                    data={},
+                )
+            ],
             "jump_to": "end",
         }
     for msg in state["messages"]:
         if isinstance(msg, AIMessage) and not msg.tool_calls:
             return {
-                "output": StopMessage(
-                    type="stop",
-                    data={},
-                ),
+                "outputs": state["outputs"]
+                + [
+                    OutputMessage(
+                        type="stop",
+                        data={},
+                    )
+                ],
                 "jump_to": "end",
             }
     return None
@@ -104,11 +114,18 @@ async def add_time(request: ModelRequest[ManagerContext], handler) -> ModelRespo
 def generate_prompt(request: ModelRequest[ManagerContext]) -> str:
     is_tome = request.runtime.context["is_tome"]
     if is_tome:
-        return MANAGER_PROMPT.format(bot_name="可不", identity=IDENTITY)
+        return MANAGER_PROMPT.format(
+            bot_name="可不",
+            identity=IDENTITY,
+            language_style=LANGUAGE_STYLE,
+            meme_prompt=MEME_PROMPT,
+        )
     return MANAGER_WITH_DECISION_PROMPT.format(
         bot_name="可不",
         identity=IDENTITY,
         special_reminder=SPECIAL_REMINDER,
+        language_style=LANGUAGE_STYLE,
+        meme_prompt=MEME_PROMPT,
     )
 
 
@@ -211,7 +228,10 @@ def get_agent():
             handle_input,
             generate_prompt,
             dynamic_model_selection,
+            log_model_response,
+            log_tool_io,
             final,
             add_time,
         ],
+        context_schema=ManagerContext,
     )

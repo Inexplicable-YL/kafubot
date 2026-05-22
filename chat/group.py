@@ -24,20 +24,18 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from chat.image import ImageReadResult
 from chat.message import QQMessage
-from chat.prompt import DECISION_SYSTEM_PROMPT, GROUP_SYSTEM_PROMPT
+from chat.prompt import DECISION_SYSTEM_PROMPT, GROUP_HUMAN_PROMPT, GROUP_SYSTEM_PROMPT
 from chat.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
 
-DB_URL = os.getenv(
-    "CHAT_HISTORY_DB_URL", "sqlite+aiosqlite:///./.database/group_history.db"
-)
-TABLE_NAME = os.getenv("CHAT_HISTORY_TABLE", "deepseek_chat_messages")
+DB_URL = "sqlite+aiosqlite:///./.database/group_history.db"
+TABLE_NAME = "deepseek_chat_messages"
 
-DECISION_DEEPSEEK_MODEL = os.getenv("DECISION_DEEPSEEK_MODEL", "deepseek-v4-flash")
-CHAT_DEEPSEEK_MODEL = os.getenv("CHAT_DEEPSEEK_MODEL", "deepseek-v4-pro")
+DECISION_DEEPSEEK_MODEL = "deepseek-v4-flash"
+CHAT_DEEPSEEK_MODEL = "deepseek-v4-pro"
 
-MODEL_VISIBLE_TZ = ZoneInfo(os.getenv("MODEL_VISIBLE_TZ", "Asia/Shanghai"))
+MODEL_VISIBLE_TZ = ZoneInfo("Asia/Shanghai")
 MODEL_VISIBLE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-CHAT_HISTORY_MAX_MESSAGES = int(os.getenv("CHAT_HISTORY_MAX_MESSAGES", "50"))
+CHAT_HISTORY_MAX_MESSAGES = 50
 
 
 def _format_message_content(
@@ -333,6 +331,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
             ("system", GROUP_SYSTEM_PROMPT),
             MessagesPlaceholder("history"),
             MessagesPlaceholder("current_messages"),
+            ("human", GROUP_HUMAN_PROMPT),
         ]
     )
 

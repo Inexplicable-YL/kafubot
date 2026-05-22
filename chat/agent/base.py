@@ -12,6 +12,7 @@ from langchain.agents import AgentState
 from pydantic import BaseModel, ConfigDict, Field
 
 from chat.image import ImageReadResult  # noqa: TC001
+from chat.meme import MemeResult  # noqa: TC001
 from chat.message import QQMessage  # noqa: TC001
 
 if TYPE_CHECKING:
@@ -41,9 +42,12 @@ class UserMessage(BaseModel):
     def as_content(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> str:
         return f"<user-message time={self.timestamp.astimezone(timezone).strftime('%Y-%m-%d %H:%M:%S')}, user={escape(self.user, quote=True)}>\n{self.message.get_msgcode()}\n</user-message>"
 
+    def as_plain_content(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> str:
+        return f"[{self.timestamp.astimezone(timezone).strftime('%Y-%m-%d %H:%M:%S')}]{escape(self.user, quote=True)}: {self.message.get_msgcode()}"
 
-class StopMessage(TypedDict):
-    type: Literal["reply", "finish", "no_action", "stop"]
+
+class OutputMessage(TypedDict):
+    type: Literal["reply", "finish", "no_action", "stop", "meme"]
     data: dict[str, Any]
 
 
@@ -53,7 +57,9 @@ class ManagerState(AgentState):
     full_messages: list[BaseMessage]
     reasoning_effort: Literal["high", "max"]
     should_stop: bool
-    stop_message: StopMessage | None
+    outputs: list[OutputMessage]
+    search_meme_history: dict[int, MemeResult]
+    meme_id: int
 
 
 class ManagerContext(TypedDict):
