@@ -115,7 +115,7 @@ class GroupChatState(BaseModel):
 class GroupChat(Node[GroupMessageEvent, GroupChatState, GroupChatConfig]):
     """群聊记录节点"""
 
-    priority = 1
+    priority = 10
 
     @override
     def __init_state__(self) -> GroupChatState:

@@ -26,8 +26,7 @@ def finish(runtime: ToolRuntime) -> Command:
     return Command(
         update={
             "should_stop": True,
-            "outputs": runtime.state["outputs"]
-            + [OutputMessage(type="finish", data={})],
+            "outputs": [OutputMessage(type="finish", data={})],
             "messages": [
                 ToolMessage(
                     content="当前 Planner 已结束本轮思考，等待新的群聊消息。",

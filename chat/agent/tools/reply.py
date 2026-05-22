@@ -1,7 +1,6 @@
 import os
 from datetime import datetime
 from functools import cache
-from html import escape
 from typing import Any, cast
 
 from langchain.messages import ToolMessage
@@ -17,6 +16,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_deepseek import ChatDeepSeek
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from sekaibot.adapter.cqhttp.message import CQHTTPMessageSegment
 
 from chat.agent.base import (
     MODEL_VISIBLE_TZ,
@@ -61,7 +61,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
             **prompt_variables,
             "current_messages": [
                 HumanMessage(
-                    content=f"[{item.timestamp.astimezone(MODEL_VISIBLE_TZ).strftime('%Y-%m-%d %H:%M:%S')}]{escape(item.user, quote=True)}: {item.message.get_msgcode()}",
+                    content=item.as_plain_content(),
                     additional_kwargs={"raw": item},
                 )
                 for item in TypeAdapter(list[UserMessage]).validate_python(
@@ -140,8 +140,9 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
 class ReplyInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    focus: list[str] = Field(
-        description="要回复的一条或多条目标用户消息的 message_id。"
+    focus: str = Field(description="要回复的目标用户消息的 message_id。")
+    use_reply: bool = Field(
+        description="是否使用引用回复模式。在消息较多时，可以使用引用回复模式。其会自动引用回复focus指向的消息。只在需要时设置为True。"
     )
     reference_info: str = Field(
         description="有助于回复的信息，之前搜集得到的事实性信息，记忆等，使用平文本格式。"
@@ -152,41 +153,51 @@ class ReplyInput(BaseModel):
     runtime: ToolRuntime = Field(exclude=True)
 
 
-@tool(args_schema=ReplyInput, description="根据当前思考生成并发送一条可见回复。")
+@tool(
+    args_schema=ReplyInput,
+    description="根据当前思考生成并发送一条可见回复。每一次只能回复一条消息。",
+)
 async def reply(
-    focus: list[str],
+    focus: str,
+    use_reply: bool,
     reference_info: str,
     language_style: str,
     runtime: ToolRuntime,
 ) -> Any:
     """调用reply工具实现对用户进行回复。"""
     _runtime = cast("ToolRuntime[ManagerContext, ManagerState]", runtime)
-    focus_output: list[str] = []
-    for message_id in focus:
-        for msg in _runtime.state["full_messages"]:
-            if (
-                isinstance(msg, HumanMessage)
-                and (group_msg := msg.additional_kwargs.get("raw"))
-                and isinstance(group_msg, UserMessage)
-                and group_msg.message_id == message_id.strip()
-            ):
-                focus_output.append(
-                    f"<user-message time={group_msg.timestamp.astimezone(MODEL_VISIBLE_TZ).strftime('%Y-%m-%d %H:%M:%S')}, user={escape(group_msg.user, quote=True)}>\n{group_msg.message.get_msgcode()}\n</user-message>"
+    focus_output: str | None = None
+    for msg in _runtime.state["full_messages"]:
+        if (
+            isinstance(msg, HumanMessage)
+            and (group_msg := msg.additional_kwargs.get("raw"))
+            and isinstance(group_msg, UserMessage)
+            and group_msg.message_id == focus.strip()
+        ):
+            focus_output = (
+                f"- 时间：{group_msg.timestamp.astimezone(MODEL_VISIBLE_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "- 发送人：{escape(group_msg.user, quote=True)}>\n"
+                "- 消息内容：{group_msg.message.get_msgcode()}\n"
+            )
+            if use_reply:
+                focus_output += (
+                    "- 是否将被引用：是\n"
+                    "这条消息已经是引用回复的消息。请不要at发送人。以避免重复。"
                 )
-                break
-    if len(focus_output) != len(focus):
-        return "请检查 `focus` 中的 message_id 是否正确。"
+            break
+
+    if not focus_output:
+        return "请检查 `focus` 的 message_id 是否正确。"
     if not reference_info:
         return "`reply` 工具需要填充 `reference_info` 参数。"
     if not language_style:
         return "`reply` 工具需要填充 `language_style` 参数。"
-    focus_messages = "\n".join(focus_output)
     full_text = ""
     inputs = _runtime.state["inputs"]
     async for reply in get_chat_app().astream(
         {
             "messages": inputs,
-            "focus_messages": focus_messages,
+            "focus_message": focus_output,
             "outputs": _runtime.state["outputs"],
             "reference_info": reference_info,
             "language_style": language_style,
@@ -204,11 +215,16 @@ async def reply(
                     await _runtime.context["node"].reply(seg)
                     break
             else:
-                await _runtime.context["node"].reply(raw_cq_msg)
+                if use_reply:
+                    await _runtime.context["node"].reply(
+                        CQHTTPMessageSegment.reply(int(focus.strip())) + raw_cq_msg
+                    )
+                    use_reply = False
+                else:
+                    await _runtime.context["node"].reply(reply_msg)
     return Command(
         update={
-            "outputs": _runtime.state["outputs"]
-            + [
+            "outputs": [
                 OutputMessage(
                     type="reply",
                     data={"full_text": full_text},

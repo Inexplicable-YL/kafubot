@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, tzinfo  # noqa: TC003
+from datetime import datetime  # noqa: TC003
 from html import escape
-from typing import TYPE_CHECKING, Any, Literal
+from operator import add
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 from typing_extensions import TypedDict
 from zoneinfo import ZoneInfo
 
@@ -42,8 +43,8 @@ class UserMessage(BaseModel):
     def as_content(self) -> str:
         return f"<user-message message_id={escape(self.message_id, quote=True)}, user={escape(self.user, quote=True)}>\n{self.message.get_msgcode()}\n</user-message>"
 
-    def as_plain_content(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> str:
-        return f"[{self.timestamp.astimezone(timezone).strftime('%Y-%m-%d %H:%M:%S')}]{escape(self.user, quote=True)}: {self.message.get_msgcode()}"
+    def as_plain_content(self) -> str:
+        return f"{escape(self.user, quote=True)}: {self.message.get_msgcode()}"
 
 
 class OutputMessage(TypedDict):
@@ -57,7 +58,7 @@ class ManagerState(AgentState):
     full_messages: list[BaseMessage]
     reasoning_effort: Literal["high", "max"]
     should_stop: bool
-    outputs: list[OutputMessage]
+    outputs: Annotated[list[OutputMessage], add]
     search_meme_history: dict[int, MemeResult]
     meme_id: int
     deferred_tools: list[Any]

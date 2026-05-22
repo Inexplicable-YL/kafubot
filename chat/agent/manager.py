@@ -34,6 +34,7 @@ from chat.agent.prompt import (
     IDENTITY,
     LANGUAGE_STYLE,
     MANAGER_PROMPT,
+    MANAGER_USER_MESSAGE,
     MANAGER_WITH_DECISION_PROMPT,
     MEME_PROMPT,
     SPECIAL_REMINDER,
@@ -49,7 +50,7 @@ if TYPE_CHECKING:
 
 load_dotenv()
 
-MAX_TRUNS = 5
+MAX_TRUNS = 10
 MODEL_NAME = "deepseek-v4-flash"
 HISTORY_WINDOW = 20
 wrap_model_call_async = cast("Any", wrap_model_call)
@@ -73,8 +74,7 @@ def final(
         }
     if len([m for m in state["messages"] if isinstance(m, AIMessage)]) >= MAX_TRUNS:
         return {
-            "outputs": state["outputs"]
-            + [
+            "outputs": [
                 OutputMessage(
                     type="stop",
                     data={},
@@ -85,8 +85,7 @@ def final(
     for msg in state["messages"]:
         if isinstance(msg, AIMessage) and not msg.tool_calls:
             return {
-                "outputs": state["outputs"]
-                + [
+                "outputs": [
                     OutputMessage(
                         type="stop",
                         data={},
@@ -104,7 +103,11 @@ async def add_time(request: ModelRequest[ManagerContext], handler) -> ModelRespo
             messages=request.messages
             + [
                 HumanMessage(
-                    content=f"<time>\n{datetime.now(tz=MODEL_VISIBLE_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n</time>"
+                    content=MANAGER_USER_MESSAGE.format(
+                        time=datetime.now(tz=MODEL_VISIBLE_TZ).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                    )
                 )
             ]
         )
@@ -231,10 +234,8 @@ async def reject_reply_with_content(
         if not (
             isinstance(response.result[-1], AIMessage) and response.result[-1].content
         ):
-            print("is ok")
             break
         response: ModelResponse = await handler(request)
-        print("retry")
     return response
 
 

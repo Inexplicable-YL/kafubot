@@ -76,7 +76,7 @@ async def send_meme(
     )
     return Command(
         update={
-            "outputs": _runtime.state["outputs"] + [
+            "outputs": [
                 OutputMessage(
                     type="meme",
                     data={"content": result.analysis},

@@ -15,9 +15,10 @@ from chat.agent.base import ManagerContext, ManagerState, UserMessage
 load_dotenv()
 
 
-IMAGE_ASK_SYSTEM_PROMPT = (
-    "你是一个图像分析助手。请根据提供的图片和用户的问题，用简洁准确的语言进行回答。"
-)
+IMAGE_ASK_SYSTEM_PROMPT = """
+你是一个图像分析助手。请根据提供的图片和用户的问题，用简洁准确的平文本语言进行回答。
+不要书写markdown格式，仅用一段凝练但能完美回答用户问题的文本回复。
+"""
 
 
 @cache
@@ -68,9 +69,7 @@ def get_image_analyzer() -> Runnable[dict[str, Any], str]:
 class QueryImageInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    message_id: str = Field(
-        description="要问询的包含图片的目标用户消息的 message_id。"
-    )
+    message_id: str = Field(description="要问询的包含图片的目标用户消息的 message_id。")
     query: str = Field(
         description="对于指定的消息中的图片进行询问的问题，使用平文本格式。"
     )
