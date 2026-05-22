@@ -14,6 +14,7 @@ from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.config import ConfigModel
 from sekaibot.log import logger
+from sekaibot.permission import User
 
 from chat.activity import ActivityStore, get_activity_store
 from chat.agent import UserMessage, clear_session_history, get_agent
@@ -121,11 +122,11 @@ class GroupAgentState(BaseModel):
     storages_lock: anyio.Lock = Field(default_factory=anyio.Lock)
 
 
+@User("group_895484096", "group_834922207", "group_596488203")
 class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
     """群聊记录节点"""
 
     priority = 0
-    block = True
 
     @override
     def __init_state__(self) -> GroupAgentState:
@@ -520,6 +521,4 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
 
     @override
     async def rule(self) -> bool:
-        return (
-            str(self.event.user_id) != "2830758180" and self.event.group_id == 895484096  # noqa: PLR2004
-        )
+        return str(self.event.user_id) != "2830758180"
