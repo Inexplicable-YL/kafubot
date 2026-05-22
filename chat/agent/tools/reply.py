@@ -27,7 +27,7 @@ from chat.agent.base import (
 )
 from chat.agent.history import get_session_history
 from chat.agent.prompt import GROUP_SYSTEM_PROMPT, IDENTITY, REPLY_USER_PROMPT
-from chat.message import QQMessage
+from chat.message import QQMessage, QQMessageSegment
 from chat.utils import to_reply
 
 CHAT_DEEPSEEK_MODEL = "deepseek-v4-flash"
@@ -47,6 +47,16 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
         if reasoning_effort not in {"high", "max"}:
             raise ValueError("reasoning_effort must be 'high' or 'max'")
 
+        sent_meme_messages = [
+            AIMessage(
+                content=QQMessageSegment.meme(
+                    content=cast("str", output["data"]["content"])
+                ).get_msgcode()
+            )
+            for output in payload.get("outputs", [])
+            if output["type"] == "meme"
+        ]
+
         return {
             **prompt_variables,
             "current_messages": [
@@ -57,7 +67,8 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
                 for item in TypeAdapter(list[UserMessage]).validate_python(
                     payload["messages"]
                 )
-            ],
+            ]
+            + sent_meme_messages,
             "thinking": bool(payload.get("thinking", False)),
             "reasoning_effort": reasoning_effort,
         }
@@ -176,6 +187,7 @@ async def reply(
         {
             "messages": inputs,
             "focus_messages": focus_messages,
+            "outputs": _runtime.state["outputs"],
             "reference_info": reference_info,
             "language_style": language_style,
             "time": datetime.now(tz=MODEL_VISIBLE_TZ).strftime("%Y-%m-%d %H:%M:%S"),

@@ -47,7 +47,7 @@ class UserMessage(BaseModel):
 
 
 class OutputMessage(TypedDict):
-    type: Literal["reply", "finish", "no_action", "stop", "meme"]
+    type: Literal["reply", "finish", "stop", "meme"]
     data: dict[str, Any]
 
 
@@ -60,6 +60,7 @@ class ManagerState(AgentState):
     outputs: list[OutputMessage]
     search_meme_history: dict[int, MemeResult]
     meme_id: int
+    deferred_tools: list[Any]
 
 
 class ManagerContext(TypedDict):

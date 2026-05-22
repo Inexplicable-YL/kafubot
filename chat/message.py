@@ -141,6 +141,8 @@ class QQMessageSegment(MessageSegment["QQMessage"]):
                     break
             if at_name:
                 return QQMessageSegment.at(name=at_name)
+        if segment.type == "forward" and (id_ := str(segment.data.get("id", ""))):
+            return QQMessageSegment(type="forward", data={"id": id_})
         return None
 
     async def get_cqhttp_segment(
@@ -226,9 +228,19 @@ class QQMessageSegment(MessageSegment["QQMessage"]):
         return cls(type="at", data={"name": name})
 
     @classmethod
-    def reply(cls, time: str) -> Self:
+    def reply(
+        cls,
+        time: str | None = None,
+        message_id: str | None = None,
+        *,
+        include: set[str] | None = None,
+    ) -> Self:
         """回复"""
-        return cls(type="reply", data={"time": time})
+        return cls(
+            type="reply",
+            data={"time": time, "message_id": message_id},
+            include=include or {"time"},
+        )
 
     @classmethod
     def file(cls, file: str) -> Self:

@@ -80,19 +80,9 @@ unrestricted_groups=[
     895484096,
 ]
 auto_reply_groups=[
-    648749016,
-    752699901,
-    913873554,
-    954012874,
-    897593721,
-    1048490205,
-    172844144,
-    565525468,
-    154243984,
-    924342546,
 ]
 
-talk_value=0.8
+talk_value=0.6
 interval_seconds=3
 
 reply_keywords=["可不", "花谱", "星界", "里命"]

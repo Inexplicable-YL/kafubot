@@ -13,6 +13,7 @@ from scipy import stats  # type: ignore[import-untyped]
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.config import ConfigModel
+from sekaibot.log import logger
 
 from chat.activity import ActivityStore, get_activity_store
 from chat.agent import UserMessage, clear_session_history, get_agent
@@ -215,6 +216,8 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             history_storage.backup_messages.append(message)
             if group_event.message.images:
                 return None
+            if not group_event.message.message.get_plain_text().strip():
+                return None
             if self.event.group_id not in self.config.auto_reply_groups and not is_tome:
                 return None
 
@@ -317,7 +320,8 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 "should_stop": False,
                 "outputs": [],
                 "search_meme_history": {},
-                "meme_id": 1,
+                "meme_id": 0,
+                "deferred_tools": [],
             },
             context={
                 "session_id": group_event.session_id,
@@ -397,7 +401,14 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 .astimezone(ZoneInfo("Asia/Shanghai"))
                 .strftime("%Y-%m-%d %H:%M:%S")
             )
-            message = QQMessageSegment.reply(time_text) + message
+            message = (
+                QQMessageSegment.reply(
+                    time_text,
+                    str(self.event.reply.message_id),
+                    include={"message_id"},
+                )
+                + message
+            )
             to_other = to_other or (
                 self.event.reply.sender.user_id != self.event.adapter.self_id
             )
@@ -502,6 +513,8 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                     group_event,
                     current_messages=current_messages,
                 )
+        except Exception:
+            logger.exception("Failed to handle group event")
         finally:
             self.stop()
 

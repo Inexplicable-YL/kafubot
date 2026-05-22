@@ -37,6 +37,7 @@ from chat.agent.prompt import (
     MANAGER_WITH_DECISION_PROMPT,
     MEME_PROMPT,
     SPECIAL_REMINDER,
+    TOOL_PROMOT,
 )
 from chat.agent.tools import TOOLS
 from chat.utils import content_to_text
@@ -119,6 +120,7 @@ def generate_prompt(request: ModelRequest[ManagerContext]) -> str:
             identity=IDENTITY,
             language_style=LANGUAGE_STYLE,
             meme_prompt=MEME_PROMPT,
+            tool_prompt=TOOL_PROMOT,
         )
     return MANAGER_WITH_DECISION_PROMPT.format(
         bot_name="可不",
@@ -126,6 +128,7 @@ def generate_prompt(request: ModelRequest[ManagerContext]) -> str:
         special_reminder=SPECIAL_REMINDER,
         language_style=LANGUAGE_STYLE,
         meme_prompt=MEME_PROMPT,
+        tool_prompt=TOOL_PROMOT,
     )
 
 
@@ -219,6 +222,22 @@ async def dynamic_model_selection(
     return await handler(request.override(model=model))
 
 
+@wrap_model_call_async(state_schema=ManagerState)
+async def reject_reply_with_content(
+    request: ModelRequest[ManagerContext], handler
+) -> ModelResponse:
+    response = await handler(request)
+    for _ in range(2):
+        if not (
+            isinstance(response.result[-1], AIMessage) and response.result[-1].content
+        ):
+            print("is ok")
+            break
+        response: ModelResponse = await handler(request)
+        print("retry")
+    return response
+
+
 @cache
 def get_agent():
     return create_agent(
@@ -232,6 +251,7 @@ def get_agent():
             log_tool_io,
             final,
             add_time,
+            reject_reply_with_content,
         ],
         context_schema=ManagerContext,
     )
