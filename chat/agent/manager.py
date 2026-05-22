@@ -139,7 +139,7 @@ async def handle_input(
     )
     currents = [
         HumanMessage(
-            content=item.as_content(timezone=MODEL_VISIBLE_TZ),
+            content=item.as_content(),
             additional_kwargs={"raw": item},
         )
         for item in inputs

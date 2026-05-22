@@ -39,8 +39,8 @@ class UserMessage(BaseModel):
     have_keywords: bool
     images: list[tuple[ImageReadResult, bool]] = Field(default_factory=list)
 
-    def as_content(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> str:
-        return f"<user-message time={self.timestamp.astimezone(timezone).strftime('%Y-%m-%d %H:%M:%S')}, user={escape(self.user, quote=True)}>\n{self.message.get_msgcode()}\n</user-message>"
+    def as_content(self) -> str:
+        return f"<user-message message_id={escape(self.message_id, quote=True)}, user={escape(self.user, quote=True)}>\n{self.message.get_msgcode()}\n</user-message>"
 
     def as_plain_content(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> str:
         return f"[{self.timestamp.astimezone(timezone).strftime('%Y-%m-%d %H:%M:%S')}]{escape(self.user, quote=True)}: {self.message.get_msgcode()}"

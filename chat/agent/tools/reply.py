@@ -1,8 +1,8 @@
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 from functools import cache
+from html import escape
 from typing import Any, cast
-from zoneinfo import ZoneInfo
 
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
@@ -51,7 +51,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
             **prompt_variables,
             "current_messages": [
                 HumanMessage(
-                    content=item.as_plain_content(timezone=MODEL_VISIBLE_TZ),
+                    content=f"[{item.timestamp.astimezone(MODEL_VISIBLE_TZ).strftime('%Y-%m-%d %H:%M:%S')}]{escape(item.user, quote=True)}: {item.message.get_msgcode()}",
                     additional_kwargs={"raw": item},
                 )
                 for item in TypeAdapter(list[UserMessage]).validate_python(
@@ -126,14 +126,11 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
     )
 
 
-MIN_FOCUS_LENGTH = 6
-
-
 class ReplyInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     focus: list[str] = Field(
-        description="要回复1或多条目标用户消息的具体发送时间，每一条的格式为“YY-mm-dd HH:MM:SS”。"
+        description="要回复的一条或多条目标用户消息的 message_id。"
     )
     reference_info: str = Field(
         description="有助于回复的信息，之前搜集得到的事实性信息，记忆等，使用平文本格式。"
@@ -154,22 +151,20 @@ async def reply(
     """调用reply工具实现对用户进行回复。"""
     _runtime = cast("ToolRuntime[ManagerContext, ManagerState]", runtime)
     focus_output: list[str] = []
-    for time in focus:
+    for message_id in focus:
         for msg in _runtime.state["full_messages"]:
             if (
                 isinstance(msg, HumanMessage)
                 and (group_msg := msg.additional_kwargs.get("raw"))
                 and isinstance(group_msg, UserMessage)
+                and group_msg.message_id == message_id.strip()
             ):
-                time_text = (
-                    group_msg.timestamp.replace(tzinfo=UTC)
-                    .astimezone(ZoneInfo("Asia/Shanghai"))
-                    .strftime("%H:%M:%S")
+                focus_output.append(
+                    f"<user-message time={group_msg.timestamp.astimezone(MODEL_VISIBLE_TZ).strftime('%Y-%m-%d %H:%M:%S')}, user={escape(group_msg.user, quote=True)}>\n{group_msg.message.get_msgcode()}\n</user-message>"
                 )
-                if len(time.strip()) > MIN_FOCUS_LENGTH and time_text in time.strip():
-                    focus_output.append(group_msg.as_content())
+                break
     if len(focus_output) != len(focus):
-        return "请检查 `focus` 的时间格式是否正确。"
+        return "请检查 `focus` 中的 message_id 是否正确。"
     if not reference_info:
         return "`reply` 工具需要填充 `reference_info` 参数。"
     if not language_style:
