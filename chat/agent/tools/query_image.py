@@ -1,6 +1,6 @@
 import os
 from functools import cache
-from typing import Any, cast
+from typing import Any
 
 from dotenv import load_dotenv
 from langchain.tools import ToolRuntime, tool
@@ -80,10 +80,13 @@ class QueryImageInput(BaseModel):
     args_schema=QueryImageInput,
     description="对于某条消息中的图片进行详细询问。",
 )
-def query_image(message_id: str, query: str, runtime: ToolRuntime) -> str:
-    _runtime = cast("ToolRuntime[ManagerContext, ManagerState]", runtime)
+def query_image(
+    message_id: str,
+    query: str,
+    runtime: ToolRuntime[ManagerContext, ManagerState],
+) -> str:
     message: UserMessage | None = None
-    for msg in _runtime.state["full_messages"]:
+    for msg in runtime.state["full_messages"]:
         if (
             isinstance(msg, HumanMessage)
             and (group_msg := msg.additional_kwargs.get("raw"))
@@ -96,6 +99,6 @@ def query_image(message_id: str, query: str, runtime: ToolRuntime) -> str:
         return "没有找到对应的消息。请检查 message_id 是否正确。"
     if not message.images:
         return "指定 message_id 指向的消息没有图片。"
-    return "对指定消息的图片进行询问的结果为：\n" + get_image_analyzer().invoke(
+    return "对指定消息的图片进行询问的结果为：" + get_image_analyzer().invoke(
         {"images": [img.base64 for img, _ in message.images], "query": query}
     )

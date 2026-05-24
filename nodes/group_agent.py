@@ -9,7 +9,6 @@ import anyio
 import opencc
 from langchain_core.runnables import Runnable
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from scipy import stats  # type: ignore[import-untyped]
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.config import ConfigModel
@@ -18,6 +17,7 @@ from sekaibot.permission import User
 
 from chat.activity import ActivityStore, get_activity_store
 from chat.agent import UserMessage, clear_session_history, get_agent
+from chat.agent.base import ManagerContext, ManagerState
 from chat.image import (
     ImageReadResult,
     get_image_analyzer,
@@ -64,12 +64,13 @@ class GroupAgentConfig(ConfigModel):
 
     unrestricted_groups: set[int] = set()
     auto_reply_groups: set[int] = set()
-    interval_seconds: int = 3
     keep_image_limit: int = 3
     talk_value: float = 0.8
     reply_keywords: set[str] = set()
     reply_when_keywords: bool = False
     clear_keywords: set[str] = set()
+    average_reply_count: float = 1.5
+    meme_reply_ratio: float = 0.6
     # (window_seconds, threshold)
     activity_limits: tuple[tuple[int, int], ...] = (
         (3600 * 5, 100),
@@ -146,9 +147,8 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         group_event: GroupEvent,
     ) -> bool:
         session_id = group_event.session_id
-        history_storage = group_event.history_storage
         event_time = group_event.time
-        if (
+        return bool(
             int(session_id) not in self.config.unrestricted_groups
             and await self.node_state.activity_store.is_limited(
                 scope="group",
@@ -156,48 +156,7 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 event_time=event_time,
                 activity_limits=self.config.activity_limits,
             )
-        ):
-            return True
-
-        if latest_timestamp := await self.node_state.activity_store.latest_timestamp(
-            scope="group", session_id=session_id
-        ):
-            if event_time - latest_timestamp <= self.config.interval_seconds:
-                return True
-            if recent_interval := await self.node_state.activity_store.recent_interval(
-                scope="group", session_id=session_id, window_seconds=600
-            ):
-                if len(history_storage.backup_pending_counts) > 1:
-                    pending_statistic, _ = cast(
-                        "tuple[Any, Any]",
-                        stats.ttest_1samp(
-                            history_storage.backup_pending_counts,
-                            popmean=len(history_storage.messages),
-                        ),
-                    )
-                    pending = _ttest_signal(pending_statistic)
-                else:
-                    pending = 2.0
-                if len(recent_interval) > 1:
-                    interval_statistic, _ = cast(
-                        "tuple[Any, Any]",
-                        stats.ttest_1samp(
-                            recent_interval,
-                            popmean=event_time - latest_timestamp,
-                        ),
-                    )
-                    interval = _ttest_signal(interval_statistic)
-                else:
-                    interval = 2.0
-                equivalent_pending = len(history_storage.messages) + (
-                    7
-                    * math.tanh((pending + interval) / 4)
-                    / (8 * self.config.talk_value)
-                )
-
-                return equivalent_pending <= 1 / self.config.talk_value
-            return False
-        return False
+        )
 
     async def claim_messages(  # noqa: PLR0911
         self,
@@ -312,23 +271,23 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
 
         print(f"Group-Agent-Invoking: {[m.message for m in current_messages]}")
         agent_output = await self.node_state.agent.ainvoke(
-            {
-                "messages": [],
-                "inputs": current_messages,
-                "early_messages": [],
-                "full_messages": [],
-                "reasoning_effort": "max",
-                "should_stop": False,
-                "outputs": [],
-                "search_meme_history": {},
-                "meme_id": 0,
-                "deferred_tools": [],
-            },
-            context={
-                "session_id": group_event.session_id,
-                "node": self,
-                "is_tome": group_event.message.is_tome,
-            },
+            ManagerState(
+                messages=[],
+                inputs=current_messages,
+                early_messages=[],
+                full_messages=[],
+                outputs=[],
+                group_id=str(self.event.group_id),
+                user_map={},
+            ),
+            context=ManagerContext(
+                session_id=group_event.session_id,
+                is_tome=group_event.message.is_tome,
+                node=self,
+                average_reply_count=self.config.average_reply_count,
+                meme_reply_ratio=self.config.meme_reply_ratio,
+                talk_value=self.config.talk_value,
+            ),
         )
 
         if reply_text := _extract_reply(agent_output):

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import opencc
 from langchain.tools import tool
 
@@ -269,6 +267,8 @@ def get_kafu_songs(text: str) -> str:
     return KAFU_SONGS_PROMPT + "\n".join(f"- {song}" for song in top_songs)
 
 
-@tool(description="根据关键词搜索歌曲，请输入关键词，多个关键词用空格或逗号分隔。")
+@tool(
+    description="根据关键词搜索歌曲，请输入关键词，多个关键词用空格或逗号分隔。与歌曲相关的问题，必须要使用此工具。"
+)
 def search_song(keywords: str) -> str:
     return get_kafu_songs(keywords)

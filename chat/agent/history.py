@@ -95,7 +95,10 @@ class MessageConverter(BaseMessageConverter):
                 )
             return HumanMessage(content=sql_message.content)
         if role == "ai":
-            return AIMessage(content=sql_message.content)
+            return AIMessage(
+                content=sql_message.content,
+                additional_kwargs={"created_at": sql_message.created_at},
+            )
         raise ValueError(f"Unknown message role: {role}")
 
     @override

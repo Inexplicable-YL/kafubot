@@ -138,7 +138,6 @@ async def log_tool_io(
         update = cast("dict[str, Any]", result.update)
         tool_return = {
             "type": "command",
-            "should_stop": update.get("should_stop"),
             "stop_message": update.get("stop_message"),
             "messages": [
                 {

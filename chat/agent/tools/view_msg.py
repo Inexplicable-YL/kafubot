@@ -1,22 +1,20 @@
 from contextlib import suppress
 from datetime import UTC, datetime
 from html import escape
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from langchain.tools import ToolRuntime, tool
 from pydantic import BaseModel, ConfigDict, Field
 
-if TYPE_CHECKING:
-    from chat.agent.base import ManagerContext, ManagerState
-    from nodes.group_agent import GroupAgent
+from chat.agent.base import ManagerContext, ManagerState
 
 
 class ViewMessagesInput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     id: str = Field(description="消息ID。注意不是message_id。是转发消息的id。")
-    limit: int = Field(default=10, description="要显示的消息数量。", gt=1, le=40)
+    limit: int = Field(default=10, description="要显示的消息数量。", gt=1, le=20)
     runtime: ToolRuntime = Field(exclude=True)
 
 
@@ -24,12 +22,16 @@ class ViewMessagesInput(BaseModel):
     args_schema=ViewMessagesInput,
     description="获取`forward`（即转发消息）消息的具体内容。",
 )
-async def view_forward_message(id: str, limit: int, runtime: ToolRuntime) -> str:
-    _runtime = cast("ToolRuntime[ManagerContext, ManagerState]", runtime)
-    node: GroupAgent = _runtime.context["node"]
+async def view_forward_message(
+    id: str,
+    limit: int,
+    runtime: ToolRuntime[ManagerContext, ManagerState],
+) -> str:
     try:
         messages: list[dict[str, Any]] = (
-            await node.event.adapter.call_api("get_forward_msg", id=id)
+            await runtime.context["node"].event.adapter.call_api(
+                "get_forward_msg", id=id
+            )
         )["messages"]
     except Exception:
         return "无法获取转发消息，请检查消息ID是否正确。"
