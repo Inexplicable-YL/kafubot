@@ -1,4 +1,3 @@
-import math
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -9,14 +8,14 @@ import anyio
 import opencc
 from langchain_core.runnables import Runnable
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sekaibot import Node
+from sekaibot import Bot, Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.config import ConfigModel
 from sekaibot.log import logger
 from sekaibot.permission import User
 
 from chat.activity import ActivityStore, get_activity_store
-from chat.agent import UserMessage, clear_session_history, get_agent
+from chat.agent import UserMessage, clear_session_history, create_agent_service
 from chat.agent.base import ManagerContext, ManagerState
 from chat.image import (
     ImageReadResult,
@@ -52,13 +51,6 @@ def _extract_reply(agent_output: Any) -> str | None:
     return full_text or None
 
 
-def _ttest_signal(statistic: Any) -> float:
-    value = float(statistic)
-    if math.isnan(value):
-        return 0.0
-    return -(math.tanh(value) if value > 0 else value)
-
-
 class GroupAgentConfig(ConfigModel):
     __config_name__ = "group_agent"
 
@@ -66,6 +58,7 @@ class GroupAgentConfig(ConfigModel):
     auto_reply_groups: set[int] = set()
     keep_image_limit: int = 3
     talk_value: float = 0.8
+    impact_factor: float = 0.5
     reply_keywords: set[str] = set()
     reply_when_keywords: bool = False
     clear_keywords: set[str] = set()
@@ -114,7 +107,7 @@ class GroupEvent(BaseModel):
 class GroupAgentState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    agent: Any = Field(default_factory=get_agent)
+    agent: Any | None = None
     image_analyzer: Runnable[dict[str, Any], str] = Field(
         default_factory=lambda _: get_image_analyzer(True, add_memes_hook=add_memes)
     )
@@ -270,6 +263,11 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         current_messages = await self.filling_images(current_messages)
 
         print(f"Group-Agent-Invoking: {[m.message for m in current_messages]}")
+        if not self.node_state.agent:
+            get_agent, close_agent = await create_agent_service()
+            Bot.bot_exit_hook(close_agent)
+            self.node_state.agent = await get_agent()
+        assert self.node_state.agent
         agent_output = await self.node_state.agent.ainvoke(
             ManagerState(
                 messages=[],
@@ -277,7 +275,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 early_messages=[],
                 full_messages=[],
                 outputs=[],
-                group_id=str(self.event.group_id),
                 user_map={},
             ),
             context=ManagerContext(
@@ -287,6 +284,8 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 average_reply_count=self.config.average_reply_count,
                 meme_reply_ratio=self.config.meme_reply_ratio,
                 talk_value=self.config.talk_value,
+                impact_factor=self.config.impact_factor,
+                group_id=str(self.event.group_id),
             ),
         )
 

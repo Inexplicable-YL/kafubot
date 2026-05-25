@@ -150,7 +150,7 @@ _ORIGINAL_DEEPSEEK_GET_REQUEST_PAYLOAD = cast(
 )
 
 
-def _get_deepseek_request_payload_with_reasoning_content(
+def _get_request_payload_with_reasoning_content(
     self: ChatDeepSeek,
     input_: Any,
     *,
@@ -181,7 +181,7 @@ def _get_deepseek_request_payload_with_reasoning_content(
     return payload
 
 
-ChatDeepSeek._get_request_payload = _get_deepseek_request_payload_with_reasoning_content
+ChatDeepSeek._get_request_payload = _get_request_payload_with_reasoning_content
 
 
 def _scrub_inputs(inputs: dict[str, Any]) -> dict[str, Any]:

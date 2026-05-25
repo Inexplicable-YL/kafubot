@@ -51,7 +51,8 @@ auto_reply_groups=[
     983497050,
 ]
 
-talk_value=0.075
+talk_value=0.15
+impact_factor=0.6
 interval_seconds=3
 
 reply_keywords=["可不", "花谱", "星界", "里命"]
@@ -100,7 +101,8 @@ reply_keywords=["可不", "花谱", "星界", "里命"]
 reply_when_keywords=false
 clear_keywords=["/clear", "/清除"]
 
-talk_value=0.15
+talk_value=0.3
+impact_factor=0.7
 average_reply_count=1.2
 meme_reply_ratio=0.2
 

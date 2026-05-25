@@ -5,7 +5,9 @@ from functools import cache
 from itertools import groupby
 from typing import Any, Literal, cast
 
+import aiosqlite
 import pandas as pd
+from async_lru import alru_cache
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -14,12 +16,13 @@ from langchain.agents.middleware import (
     before_agent,
     dynamic_prompt,
     wrap_model_call,
-    wrap_tool_call,
 )
 from langchain.agents.middleware.types import _CallableReturningSystemMessage
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_deepseek import ChatDeepSeek
+from langchain_openai import OpenAIEmbeddings
 from langgraph.runtime import Runtime
+from langgraph.store.sqlite import AsyncSqliteStore
 from pydantic import TypeAdapter
 from scipy import stats
 
@@ -31,9 +34,11 @@ from chat.agent.base import (
     UserMessage,
 )
 from chat.agent.builder import create_agent
+from chat.agent.get_msgs import ContextAcquisitionMiddleware
 from chat.agent.history import get_session_history
 from chat.agent.interaction import InteractionMiddleware
-from chat.agent.logs import log_model_response, log_tool_io
+from chat.agent.logs import AgentDebugLogMiddleware
+from chat.agent.memory import LongMemoryMiddleware
 from chat.agent.prompt import (
     BOT_NAME,
     IDENTITY,
@@ -56,7 +61,6 @@ MAX_TRUNS = 10
 MODEL_NAME = "deepseek-v4-flash"
 HISTORY_WINDOW = 20
 wrap_model_call_async = cast("Any", wrap_model_call)
-wrap_tool_call_async = cast("Any", wrap_tool_call)
 
 
 def manager_dynamic_prompt(
@@ -206,7 +210,7 @@ async def calculate_params(
         else:
             pending = 2.0
         equivalent_pending = latest_pending + (
-            7
+            21 * runtime.context["impact_factor"]
             * math.tanh((pending + interval) / 4)
             / (16 * runtime.context["talk_value"])
         )
@@ -221,7 +225,7 @@ async def calculate_params(
             }
 
     real_average_count = float(
-        pd.Series(reply_counts).ewm(alpha=0.5).mean().iloc[-1]
+        pd.Series(reply_counts).ewm(alpha=0.2).mean().iloc[-1]
     ) * (1 + 0.5 * terminal_trend(ai_reply))
     print(real_average_count, runtime.context["average_reply_count"])
     real_meme_ratio = (
@@ -293,21 +297,51 @@ def get_model(
     )
 
 
-@cache
-def get_agent(
-    reasoning_effort: Literal["high", "max"] = "max",
-):
-    return create_agent(
-        model=get_model(reasoning_effort),
-        tools=TOOLS,
-        middleware=[
-            handle_input,
-            calculate_params,
-            generate_prompt,
-            log_model_response,
-            log_tool_io,
-            InteractionMiddleware(),
-            add_user_prompt,
-        ],
-        context_schema=ManagerContext,
+async def create_agent_service():
+    conn = await aiosqlite.connect(
+        "./.database/long_memory.db",
+        isolation_level=None,
     )
+    store = AsyncSqliteStore(
+        conn=conn,
+        index={
+            "embed": OpenAIEmbeddings(
+                model="text-embedding-3-large",
+                base_url=os.getenv("OPENAI_BASE_URL"),
+            ),
+            "dims": 3072,
+        },
+    )
+
+    @alru_cache(maxsize=2)
+    async def get_agent(
+        reasoning_effort: Literal["high", "max"] = "max",
+    ):
+        return create_agent(
+            model=get_model(reasoning_effort),
+            tools=TOOLS,
+            middleware=[
+                handle_input,
+                calculate_params,
+                generate_prompt,
+                AgentDebugLogMiddleware(
+                    log_path=".logs/agent_debug.jsonl",
+                    log_text_limit=1000,
+                ),
+                InteractionMiddleware(),
+                ContextAcquisitionMiddleware(),
+                LongMemoryMiddleware(
+                    use_subagent=True,
+                    subagent_model=get_model(reasoning_effort),
+                ),
+                add_user_prompt,
+            ],
+            state_schema=ManagerState,
+            context_schema=ManagerContext,
+            store=store,  # ← 闭包捕获，生命周期与 conn 绑定
+        )
+
+    async def shutdown():
+        await conn.close()
+
+    return get_agent, shutdown

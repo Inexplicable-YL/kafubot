@@ -1,5 +1,6 @@
 import itertools
 import os
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from functools import cache
 from typing import Any, Literal
@@ -10,6 +11,7 @@ from langchain.agents.middleware import (
     ModelResponse,
     hook_config,
 )
+from langchain.agents.middleware.types import ExtendedModelResponse
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage
@@ -130,7 +132,7 @@ class ReplyInput(BaseModel):
         description="是否使用引用回复模式。在消息较多时，可以使用引用回复模式。其会自动引用回复focus指向的消息。只在需要时设置为True。"
     )
     reference_info: str = Field(
-        description="有助于回复的信息，之前搜集得到的事实性信息，记忆等，使用平文本格式。需要较为详细地陈述。"
+        description="有助于回复的信息，之前搜集得到的事实性信息，记忆等，使用平文本格式。需要较为详细地陈述。你需要针对focus指向的消息进行回复。"
     )
     language_style: str = Field(
         description="你需要指导回复的语言风格，例如是反骨、拌嘴、可爱地攻击（如虾头、变态等）、傲娇属性，或者是温柔的回复或安慰等，使用平文本格式。"
@@ -140,7 +142,7 @@ class ReplyInput(BaseModel):
 
 @tool(
     args_schema=ReplyInput,
-    description="根据当前思考生成并发送一条可见回复。每一次只能回复一条消息。",
+    description="根据当前思考生成并发送一条可见回复。每一次只能回复一条消息。你需要针对focus指向的消息进行回复。",
 )
 async def reply(
     focus: str,
@@ -381,7 +383,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         self.mas_retries = mas_retries
 
     @hook_config(can_jump_to=["end"])
-    def before_model(
+    async def abefore_model(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
         _ = runtime
@@ -402,8 +404,12 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         }
 
     async def awrap_model_call(
-        self, request: ModelRequest[ManagerContext], handler
-    ) -> ModelResponse:
+        self,
+        request: ModelRequest[ManagerContext],
+        handler: Callable[
+            [ModelRequest[ManagerContext]], Awaitable[ModelResponse[Any]]
+        ],
+    ) -> ModelResponse[Any] | AIMessage | ExtendedModelResponse[Any]:
         resp = await handler(request)
         for _ in range(self.mas_retries - 1):
             last = resp.result[-1]

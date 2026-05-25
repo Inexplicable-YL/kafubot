@@ -3,21 +3,17 @@ import os
 from datetime import datetime  # noqa: TC003
 from html import escape
 from operator import add
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired
+from typing import Annotated, Any, Literal, NotRequired
 from typing_extensions import TypedDict
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from langchain.agents import AgentState
+from langchain_core.messages import AnyMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from chat.image import ImageReadResult  # noqa: TC001
 from chat.message import QQMessage  # noqa: TC001
-
-if TYPE_CHECKING:
-    from langchain_core.messages import BaseMessage
-else:
-    BaseMessage = Any
 
 load_dotenv()
 
@@ -55,12 +51,11 @@ class ManagerState(AgentState, extra_items=Any):
     inputs: list[UserMessage]
     outputs: Annotated[list[OutputMessage], add]
 
-    early_messages: list[BaseMessage]
-    full_messages: list[BaseMessage]
+    early_messages: list[AnyMessage]
+    full_messages: list[AnyMessage]
 
     meme_id: NotRequired[itertools.count]
 
-    group_id: str
     user_map: dict[str, str]
 
     real_average_count: NotRequired[float]
@@ -70,7 +65,9 @@ class ManagerState(AgentState, extra_items=Any):
 class ManagerContext(TypedDict):
     session_id: str
     talk_value: float
+    impact_factor: float
     average_reply_count: float
     meme_reply_ratio: float
     is_tome: bool
     node: Any
+    group_id: str

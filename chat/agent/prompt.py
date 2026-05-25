@@ -97,6 +97,8 @@ Explicitly write out your entire deliberation process, documenting every interme
 TOOL_PROMOT = """
 - 当你判断现在应该让机器人正式对用户发出一条可见回复时调用reply。调用后生成一条真正展示给用户的回复。你可以针对某个用户回复，也可以对所有用户回复。
 - 你直接输出结果并不能被用户所看到，有且仅有调用具有回复能力的工具，你才能真正回复给用户。不允许你不调用工具就直接回复。
+- query_memory()：当回复明显依赖历史对话、长期偏好、共同经历、人物长期信息或之前约定时使用。适合检索：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不适合检索：寒暄、即时情绪回应、轻松接话、只看最近消息就能回答的内容。群聊里更克制；果对方提到“之前”“上次”“最近”“还记得吗”“我喜欢”“我说过”等类似的信号，可以更积极考虑检索。
+- add_memory()：只用于写入稳定、未来有用、已确认的长期记忆；适合存储：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不要保存玩笑、临时情绪、猜测、被否认内容或机器人自己的误解。若本轮需要调用reply或者send_meme，请先调用这两个工具，最后再调用add_memory。在遇到确定性事实和需要记忆的内容时，尽量使用add_memory。当用户告诉你自己的信息，请使用add_memory记录。
 - You can call multiple tools in a single response. 聚合不同的信息源，进行多种操作来辅助你。If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially.
 - 如果工具执行出现问题，尝试解决或使用替代方案
 - 如果存在工具可以帮助你执行某些动作，完成某些目标，直接使用该工具来完成任务
@@ -105,7 +107,6 @@ TOOL_PROMOT = """
 """
 
 """
-- query_memory()：当回复明显依赖历史对话、长期偏好、共同经历、人物长期信息或之前约定时使用。适合检索：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不适合检索：寒暄、即时情绪回应、轻松接话、只看最近消息就能回答的内容。群聊里更克制；私聊里如果对方提到“之前”“上次”“最近”“还记得吗”“我喜欢”“我说过”等类似的信号，可以更积极考虑检索。
 - tool_search()：当你在deferred tools列表中需要其中某个工具时，先调用它来搜索并发现对应工具；它只负责让工具在后续轮次变为可用，不直接执行业务
 """
 
