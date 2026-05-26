@@ -97,7 +97,13 @@ unrestricted_groups=[
     895484096,
 ]
 auto_reply_groups=[]
-reply_keywords=["可不", "花谱", "星界", "里命"]
+reply_keywords=[
+    ["可不", 0.5],
+    ["星界", 0.4],
+    ["花谱", 0.3],
+    ["里命", 0.2],
+    ["情绪", 0.1],
+]
 reply_when_keywords=false
 clear_keywords=["/clear", "/清除"]
 

@@ -51,6 +51,8 @@ class ManagerState(AgentState, extra_items=Any):
     inputs: list[UserMessage]
     outputs: Annotated[list[OutputMessage], add]
 
+    history_messages: list[AnyMessage]
+    current_messages: list[AnyMessage]
     early_messages: list[AnyMessage]
     full_messages: list[AnyMessage]
 
@@ -64,8 +66,6 @@ class ManagerState(AgentState, extra_items=Any):
 
 class ManagerContext(TypedDict):
     session_id: str
-    talk_value: float
-    impact_factor: float
     average_reply_count: float
     meme_reply_ratio: float
     is_tome: bool

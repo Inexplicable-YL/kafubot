@@ -7,11 +7,11 @@ from typing import Any, Literal
 
 from langchain.agents.middleware import (
     AgentMiddleware,
+    ExtendedModelResponse,
     ModelRequest,
     ModelResponse,
     hook_config,
 )
-from langchain.agents.middleware.types import ExtendedModelResponse
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage

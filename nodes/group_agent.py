@@ -58,8 +58,7 @@ class GroupAgentConfig(ConfigModel):
     auto_reply_groups: set[int] = set()
     keep_image_limit: int = 3
     talk_value: float = 0.8
-    impact_factor: float = 0.5
-    reply_keywords: set[str] = set()
+    reply_keywords: set[tuple[str, float]] = set()
     reply_when_keywords: bool = False
     clear_keywords: set[str] = set()
     average_reply_count: float = 1.5
@@ -266,12 +265,17 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         if not self.node_state.agent:
             get_agent, close_agent = await create_agent_service()
             Bot.bot_exit_hook(close_agent)
-            self.node_state.agent = await get_agent()
+            self.node_state.agent = await get_agent(
+                talk_value=self.config.talk_value,
+                keywords=tuple(self.config.reply_keywords),
+            )
         assert self.node_state.agent
         agent_output = await self.node_state.agent.ainvoke(
             ManagerState(
                 messages=[],
                 inputs=current_messages,
+                history_messages=[],
+                current_messages=[],
                 early_messages=[],
                 full_messages=[],
                 outputs=[],
@@ -283,8 +287,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 node=self,
                 average_reply_count=self.config.average_reply_count,
                 meme_reply_ratio=self.config.meme_reply_ratio,
-                talk_value=self.config.talk_value,
-                impact_factor=self.config.impact_factor,
                 group_id=str(self.event.group_id),
             ),
         )
@@ -379,7 +381,7 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             + "\n"
             + opencc.OpenCC("t2s").convert(text)
         )
-        return any(keyw in text for keyw in self.config.reply_keywords)
+        return any(keyw[0] in text for keyw in self.config.reply_keywords)
 
     async def get_image(self, file: str) -> ImageReadResult | None:
         try:

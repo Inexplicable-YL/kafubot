@@ -1,8 +1,6 @@
-import math
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 from functools import cache
-from itertools import groupby
 from typing import Any, Literal, cast
 
 import aiosqlite
@@ -24,13 +22,11 @@ from langchain_openai import OpenAIEmbeddings
 from langgraph.runtime import Runtime
 from langgraph.store.sqlite import AsyncSqliteStore
 from pydantic import TypeAdapter
-from scipy import stats
 
 from chat.agent.base import (
     MODEL_VISIBLE_TZ,
     ManagerContext,
     ManagerState,
-    OutputMessage,
     UserMessage,
 )
 from chat.agent.builder import create_agent
@@ -52,10 +48,12 @@ from chat.agent.prompt import (
     SPECIAL_REMINDER,
     TOOL_PROMOT,
 )
+from chat.agent.time_gate import TimeGateMiddleware
 from chat.agent.tools import TOOLS
 from chat.utils import content_to_text, terminal_trend
 
 load_dotenv()
+
 
 MAX_TRUNS = 10
 MODEL_NAME = "deepseek-v4-flash"
@@ -135,37 +133,22 @@ async def handle_input(
         **prompt_variables,
         "inputs": inputs,
         "messages": messages,
+        "history_messages": history_messages,
+        "current_messages": currents,
         "early_messages": early_messages,
         "full_messages": history_messages + currents,
         "user_map": user_map,
     }
 
 
-@before_agent(state_schema=ManagerState, can_jump_to=["end"])
-async def calculate_params(
+@before_agent(state_schema=ManagerState)
+async def hardness(
     state: ManagerState,
     runtime: Runtime[ManagerContext],
 ) -> dict[str, Any]:
-    def _ttest_signal(statistic: Any) -> float:
-        value = float(statistic)
-        if math.isnan(value):
-            return 0.0
-        return -(math.tanh(value) if value > 0 else value)
-
-    def get_pending_count(lst: list[bool]) -> tuple[list[int], int]:
-        t = [i for i, v in enumerate(lst) if v]
-        if not t:
-            return [], len(lst)
-        a, b = t[0], t[-1]
-        return [sum(1 for _ in g) for k, g in groupby(lst[a : b + 1]) if not k], len(
-            lst
-        ) - b - 1
-
     ai_reply: list[bool] = []
     meme_reply: list[bool] = []
     reply_counts: list[int] = []
-    msg_times: list[float] = []
-    meme_count: int = 0
     for message in state["full_messages"]:
         if isinstance(message, AIMessage):
             ai_reply.append(True)
@@ -176,56 +159,12 @@ async def calculate_params(
                 )
             else:
                 meme_reply.append(True)
-                meme_count += 1
             if dt := message.additional_kwargs.get("created_at"):
                 dt = cast("datetime", dt)
-                msg_times.append(dt.astimezone(UTC).timestamp())
         else:
             ai_reply.append(False)
-    if not runtime.context["is_tome"]:
-        recent_intervals = [
-            msg_times[i] - msg_times[i - 1] for i in range(1, len(msg_times))
-        ]
-        if len(recent_intervals) > 1:
-            interval_statistic, _ = cast(
-                "tuple[Any, Any]",
-                stats.ttest_1samp(
-                    recent_intervals,
-                    popmean=datetime.now(UTC).timestamp() - msg_times[-1],
-                ),
-            )
-            interval = _ttest_signal(interval_statistic)
-        else:
-            interval = 2.0
-        pending_counts, latest_pending = get_pending_count(ai_reply)
-        if len(pending_counts) > 1:
-            pending_statistic, _ = cast(
-                "tuple[Any, Any]",
-                stats.ttest_1samp(
-                    pending_counts,
-                    popmean=latest_pending,
-                ),
-            )
-            pending = _ttest_signal(pending_statistic)
-        else:
-            pending = 2.0
-        equivalent_pending = latest_pending + (
-            21 * runtime.context["impact_factor"]
-            * math.tanh((pending + interval) / 4)
-            / (16 * runtime.context["talk_value"])
-        )
-        if equivalent_pending <= 1 / runtime.context["talk_value"]:
-            return {
-                "jump_to": "end",
-                "outputs": [
-                    OutputMessage(
-                        type="finish", data={"reason": "restricted by talk_value."}
-                    )
-                ],
-            }
-
     real_average_count = float(
-        pd.Series(reply_counts).ewm(alpha=0.2).mean().iloc[-1]
+        pd.Series(reply_counts).ewm(alpha=0.1).mean().iloc[-1]
     ) * (1 + 0.5 * terminal_trend(ai_reply))
     print(real_average_count, runtime.context["average_reply_count"])
     real_meme_ratio = (
@@ -315,6 +254,8 @@ async def create_agent_service():
 
     @alru_cache(maxsize=2)
     async def get_agent(
+        talk_value: float,
+        keywords: tuple[tuple[str, float]],
         reasoning_effort: Literal["high", "max"] = "max",
     ):
         return create_agent(
@@ -322,7 +263,10 @@ async def create_agent_service():
             tools=TOOLS,
             middleware=[
                 handle_input,
-                calculate_params,
+                TimeGateMiddleware(
+                    config={"talk_value": talk_value, "keywords": list(keywords)}
+                ),
+                hardness,
                 generate_prompt,
                 AgentDebugLogMiddleware(
                     log_path=".logs/agent_debug.jsonl",
