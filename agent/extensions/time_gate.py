@@ -1,6 +1,6 @@
 import math
 from bisect import bisect_left
-from collections import deque
+from collections import defaultdict, deque
 from enum import Enum, auto
 from typing import Any, ClassVar, NotRequired, TypedDict
 
@@ -276,25 +276,19 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         gate_config: TimeGateConfig,
     ) -> None:
-        self.gate_config = gate_config
-        self.time_gates = {}
+        self.time_gates = defaultdict(lambda: TimeGate(**gate_config))
         self.snapshots = {}
-
-    def get_time_gate(self, session_id: str) -> TimeGate:
-        if session_id not in self.time_gates:
-            self.time_gates[session_id] = TimeGate(**self.gate_config)
-        return self.time_gates[session_id]
 
     @hook_config(can_jump_to=["end"])
     async def abefore_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
         session_id = runtime.context["session_id"]
-        time_gate = self.get_time_gate(runtime.context["session_id"])
+        time_gate = self.time_gates[session_id]
         if session_id not in self.snapshots:
             time_gate.clear()
             self.snapshots[session_id] = time_gate.observe(state["history_messages"])
-        self.get_time_gate(session_id).observe(
+        time_gate.observe(
             state["current_messages"], from_snapshot=self.snapshots[session_id]
         )
         if not runtime.context["is_tome"] and (not time_gate.evaluate()):
@@ -319,6 +313,6 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             elif output["type"] == "meme":
                 observe.append(AIMessage(output["data"]["content"]))
         if observe:
-            self.snapshots[runtime.context["session_id"]] = self.get_time_gate(
+            self.snapshots[runtime.context["session_id"]] = self.time_gates[
                 runtime.context["session_id"]
-            ).observe(observe)
+            ].observe(observe)

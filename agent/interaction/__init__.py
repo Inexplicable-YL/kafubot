@@ -61,7 +61,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
         _ = runtime
-        if any(o["type"] in {"finish", "stop"} for o in state["outputs"]):
+        if any(o["type"] in {"finish", "stop", "reply"} for o in state["outputs"]):
             return {"jump_to": "end"}
         messgaes = state["messages"]
         if sum(isinstance(x, AIMessage) for x in messgaes) >= self.max_turns:

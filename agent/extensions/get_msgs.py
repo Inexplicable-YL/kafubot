@@ -1,3 +1,4 @@
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -26,7 +27,7 @@ class GetEarlyMessagesInput(BaseModel):
 
 class ContextAcquisitionMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     def __init__(self):
-        self.display_messages: list[AnyMessage] = []
+        self.display_messages: dict[str, list[AnyMessage]] = defaultdict(list)
         self.tools = [
             tool(
                 "get_early_messages",
@@ -42,16 +43,17 @@ class ContextAcquisitionMiddleware(AgentMiddleware[ManagerState, ManagerContext]
     ) -> Any:
         if not runtime.state["early_messages"]:
             return "没有比当前可见的消息更早的消息。"
+        session_id = runtime.context["session_id"]
         message_count = 0
         for msg in runtime.state["messages"]:
             if isinstance(msg, ToolMessage) and (
                 count := int(msg.additional_kwargs.get("get_message_count", 0))
             ):
                 message_count += count
-        self.display_messages = runtime.state["early_messages"][
+        self.display_messages[session_id] = runtime.state["early_messages"][
             -(limit + message_count) :
         ]
-        get_message_count = len(self.display_messages) - message_count
+        get_message_count = len(self.display_messages[session_id]) - message_count
         return ToolMessage(
             content=f"获取到 {get_message_count} 条比当前可见的消息更早的消息。消息已添加到上下文中。",
             tool_call_id=runtime.tool_call_id,
@@ -66,5 +68,8 @@ class ContextAcquisitionMiddleware(AgentMiddleware[ManagerState, ManagerContext]
         ],
     ) -> ModelResponse[Any] | AIMessage | ExtendedModelResponse[Any]:
         return await handler(
-            request.override(messages=self.display_messages + request.messages)
+            request.override(
+                messages=self.display_messages[request.runtime.context["session_id"]]
+                + request.messages
+            )
         )
