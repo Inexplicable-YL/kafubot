@@ -23,35 +23,16 @@ api_timeout=10
 [permission]
 superusers = ["2682064633", "3613158872", "2641460187", "group_596488203", "group_1011357049"]
 
-[node.private_chat]
-merge_window_seconds=5
-activity_day=[8,20]
-activity_limits=[
-    [3600, 30],
-    [18000, 80],
-    [604800, 400],
-]
-activity_day_multiplier=0.5
-activity_night_multiplier=1.0
-
 [node.private_agent]
 merge_window_seconds=5
-reply_keywords=[
-    ["可不", 0.5],
-    ["星界", 0.4],
-    ["花谱", 0.3],
-    ["里命", 0.2],
-    ["情绪", 0.1],
-]
 clear_keywords=["/clear", "/清除"]
-talk_value=0.3
-average_reply_count=1.2
+average_reply_count=1.3
 meme_reply_ratio=0.2
 rate_limit=[0.2, 2]
 activity_limits=[
     [3600, 20],
-    [18000, 80],
-    [604800, 540],
+    [18000, 60],
+    [604800, 300],
 ]
 
 [node.group_agent]
@@ -79,19 +60,19 @@ auto_reply_groups=[
 ]
 
 reply_keywords=[
-    ["可不", 0.5],
-    ["星界", 0.4],
-    ["花谱", 0.3],
+    ["可不", 0.8],
+    ["星界", 0.6],
+    ["花谱", 0.5],
     ["里命", 0.2],
     ["情绪", 0.1],
 ]
 clear_keywords=["/clear", "/清除"]
 talk_value=0.2
-average_reply_count=1.3
-meme_reply_ratio=0.3
-rate_limit=[0.4, 2]
+average_reply_count=1.2
+meme_reply_ratio=0.2
+rate_limit=[0.2, 2]
 activity_limits=[
-    [3600, 20],
-    [18000, 60],
-    [604800, 500],
+    [3600, 15],
+    [18000, 45],
+    [604800, 225],
 ]
