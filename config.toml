@@ -50,7 +50,7 @@ meme_reply_ratio=0.2
 rate_limit=[0.2, 2]
 activity_limits=[
     [3600, 20],
-    [18000, 90],
+    [18000, 80],
     [604800, 540],
 ]
 

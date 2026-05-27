@@ -63,6 +63,7 @@ class TimeGate(BaseModel):
     human_velocity: float = Field(default=0.5, repr=False)
     last_timestamp: float | None = Field(default=None, repr=False)
 
+    celi_relevance: float = Field(default=0.0, repr=False)
     relevance_maps: dict[str, float] = Field(default_factory=dict, repr=False)
 
     _trans_t2s: ClassVar[OpenCC] = OpenCC("t2s")
@@ -94,7 +95,14 @@ class TimeGate(BaseModel):
                     and (user_msg := msg.additional_kwargs.get("raw"))
                     and isinstance(user_msg, UserMessage)
                 ):
-                    self._update_relevance(user_msg)
+                    relevance = self._update_relevance(user_msg)
+                    self.celi_relevance = max(
+                        relevance,
+                        (
+                            (1 - self.relevance_decay) * self.celi_relevance
+                            + self.relevance_decay * relevance
+                        ),
+                    )
                     self._observe_human_fast(user_msg.timestamp.timestamp())
             self._observe_ai()
             for msg in messages[last_ai_idx + 1 :]:
@@ -135,7 +143,12 @@ class TimeGate(BaseModel):
             and isinstance(user_msg, UserMessage)
         ):
             relevance = self._update_relevance(user_msg)
-            self._observe_human(user_msg.timestamp.timestamp(), relevance)
+            self.celi_relevance = max(
+                relevance,
+                (1 - self.relevance_decay) * self.celi_relevance
+                + self.relevance_decay * relevance,
+            )
+            self._observe_human(user_msg.timestamp.timestamp(), self.celi_relevance)
 
     def _update_relevance(self, user_msg: UserMessage) -> float:
         self._set_relevance()
@@ -150,10 +163,7 @@ class TimeGate(BaseModel):
             for keyword, weight in self.keywords:
                 if keyword in content:
                     _relevance += weight
-            total_weight = sum(weight for _, weight in self.keywords)
-            if total_weight > 0:
-                _relevance /= total_weight
-            relevance = max(relevance, _relevance)
+            relevance = max(relevance, math.tanh(_relevance))
         relevance = max(0.0, min(relevance, 1.0))
         self.relevance_maps[user_msg.user_id] = relevance
         return relevance
@@ -190,15 +200,14 @@ class TimeGate(BaseModel):
             )
         self.last_timestamp = timestamp
 
-        r = relevance
-        self.pressure += 1 + r
+        self.pressure += 0.5 * (1 + relevance)
 
         if self.state is State.IDLE:
-            probs = self._idle_probs(self.pressure, r)
-            self._transition(probs, timestamp)
+            probs = self._idle_probs(self.pressure, relevance)
+            self._transition(probs)
         elif self.state is State.ACCUMULATING:
-            probs = self._accumulating_probs(self.pressure, r)
-            self._transition(probs, timestamp)
+            probs = self._accumulating_probs(self.pressure, relevance)
+            self._transition(probs)
 
     def _observe_human_fast(self, timestamp: float) -> None:
         if self.last_timestamp is not None:
@@ -220,8 +229,9 @@ class TimeGate(BaseModel):
     def _idle_probs(
         self, pressure: float, relevance: float
     ) -> tuple[float, float, float]:
-        base = math.tanh(pressure * self.talk_value * self._handle_velocity())
-        mobility = 0.1 + relevance * 0.9
+        cali_pressure = pressure * self.talk_value * self._handle_velocity()
+        base = math.tanh(cali_pressure)
+        mobility = 0.3 + relevance * 0.7
 
         p_primed = base * mobility
         remaining = 1.0 - p_primed
@@ -232,9 +242,10 @@ class TimeGate(BaseModel):
     def _accumulating_probs(
         self, pressure: float, relevance: float
     ) -> tuple[float, float, float]:
-        base = math.tanh(pressure * self.talk_value * self._handle_velocity())
-        mobility1 = 0.1 + relevance * 0.9
-        mobility2 = 0.1 + (1.0 - relevance) * 0.9
+        cali_pressure = pressure * self.talk_value * self._handle_velocity()
+        base = math.tanh(cali_pressure)
+        mobility1 = 0.3 + relevance * 0.7
+        mobility2 = 0.3 + (1.0 - relevance) * 0.7
 
         p_primed = base * mobility1
         remaining = 1.0 - p_primed
@@ -245,18 +256,9 @@ class TimeGate(BaseModel):
     def _transition(
         self,
         probs: tuple[float, float, float],
-        seed: float,
     ) -> None:
-        np_probs = np.asarray(probs, dtype=np.float64)
-        if self.temperature < 1e-12:  # noqa: PLR2004
-            index = int(np.argmax(np_probs))
-        else:
-            u = (seed * 9301.0 + 49297.0) % 233280.0 / 233280.0
-            gumbel = -np.log(-np.log(u + 1e-12))
-            logits = np.log(np_probs + 1e-12)
-            adjusted = logits / self.temperature
-            index = int(np.argmax(adjusted + gumbel))
-
+        rng = np.random.default_rng()
+        index = rng.choice(len(probs), p=probs)
         self.state = (State.IDLE, State.ACCUMULATING, State.PRIMED)[index]
 
     def _handle_velocity(self) -> float:
@@ -267,22 +269,35 @@ class TimeGate(BaseModel):
 
 
 class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
+    time_gates: dict[str, TimeGate]
+    snapshots: dict[str, TimeGateSnapshot]
+
     def __init__(
         self,
         gate_config: TimeGateConfig,
     ) -> None:
-        self.time_gate = TimeGate(**gate_config)
-        self.snapshot: TimeGateSnapshot | None = None
+        self.gate_config = gate_config
+        self.time_gates = {}
+        self.snapshots = {}
+
+    def get_time_gate(self, session_id: str) -> TimeGate:
+        if session_id not in self.time_gates:
+            self.time_gates[session_id] = TimeGate(**self.gate_config)
+        return self.time_gates[session_id]
 
     @hook_config(can_jump_to=["end"])
     async def abefore_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
-        if not self.snapshot:
-            self.time_gate.clear()
-            self.snapshot = self.time_gate.observe(state["history_messages"])
-        self.time_gate.observe(state["current_messages"], from_snapshot=self.snapshot)
-        if not runtime.context["is_tome"] and (not self.time_gate.evaluate()):
+        session_id = runtime.context["session_id"]
+        time_gate = self.get_time_gate(runtime.context["session_id"])
+        if session_id not in self.snapshots:
+            time_gate.clear()
+            self.snapshots[session_id] = time_gate.observe(state["history_messages"])
+        self.get_time_gate(session_id).observe(
+            state["current_messages"], from_snapshot=self.snapshots[session_id]
+        )
+        if not runtime.context["is_tome"] and (not time_gate.evaluate()):
             return {
                 "jump_to": "end",
                 "outputs": [
@@ -304,4 +319,6 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             elif output["type"] == "meme":
                 observe.append(AIMessage(output["data"]["content"]))
         if observe:
-            self.snapshot = self.time_gate.observe(observe)
+            self.snapshots[runtime.context["session_id"]] = self.get_time_gate(
+                runtime.context["session_id"]
+            ).observe(observe)

@@ -3,7 +3,6 @@ from typing import Any
 
 from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
-from langchain_core.messages import AIMessage
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
 from sekaibot.adapter.cqhttp.message import CQHTTPMessageSegment
@@ -13,8 +12,6 @@ from agent.base import (
     ManagerState,
     OutputMessage,
 )
-from agent.history import get_session_history
-from agent.message import QQMessageSegment
 from agent.multimodal.meme import MemeResult, search_memes
 
 
@@ -112,13 +109,6 @@ async def send_meme(
         return "无法通过索引找到对应的表情包，请检查索引是否正确。"
     await runtime.context["node"].reply(
         CQHTTPMessageSegment.image(result.base64, sub_type=1)
-    )
-    await get_session_history(runtime.context["session_id"]).aadd_message(
-        AIMessage(
-            content=QQMessageSegment.meme(
-                content=result.analysis,
-            ).get_msgcode(),
-        )
     )
     return Command(
         update={

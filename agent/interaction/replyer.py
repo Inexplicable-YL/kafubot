@@ -144,6 +144,11 @@ async def reply(
 ) -> Any:
     """调用reply工具实现对用户进行回复。"""
     focus_output: str | None = None
+    meme_msgs: list[str] = [
+        str(content).replace("已发送表情包", "当前系统已自动发送表情包")
+        for output in runtime.state["outputs"]
+        if output["type"] == "meme" and (content := output["data"].get("content"))
+    ]
     for msg in runtime.state["full_messages"]:
         if (
             isinstance(msg, HumanMessage)
@@ -161,6 +166,8 @@ async def reply(
                     "- 是否将被引用：是\n"
                     "这条消息已经是引用回复的消息。请不要at发送人。以避免重复。"
                 )
+            if meme_msgs:
+                focus_output += "-系统是否自动发送表情包：是\n" + "\n".join(meme_msgs)
             break
 
     if not focus_output:
@@ -196,6 +203,8 @@ async def reply(
         if reply is not None and (reply_msg := reply.strip()):
             raw_msg = QQMessage.from_str(reply_msg)
             msg = QQMessage(filter(lambda x: x.type in {"at", "text"}, raw_msg))
+            if not msg.get_plain_text().strip():
+                continue
             raw_cq_msg = await msg.get_cqhttp_message(inputs)
             full_text += reply_msg + "\n"
             for seg in raw_cq_msg:

@@ -39,6 +39,40 @@ DEFAULT_USERNAME = "陌生用户"
 DEFAULT_CLEAR_KEYWORDS = {"/clear", "/清除"}
 
 
+def _format_duration(seconds: int) -> str:
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    for value, unit in ((d, "day"), (h, "hour"), (m, "min"), (s, "sec")):
+        if value:
+            parts.append(f"{value}{unit}")
+    return " ".join(parts) if parts else "0s"
+
+
+def _extract_limit(agent_output: Any) -> str | None:
+    candidates = agent_output.get("outputs")
+    quota: tuple[tuple[int, float], ...] | None = None
+    if isinstance(candidates, list):
+        for item in candidates:
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("data"), dict)
+                and item.get("type") == "limit"
+            ):
+                quota = item["data"].get("quota", {})
+    if not quota:
+        return None
+    texts = ["当前回复额度耗尽，请稍后重试。\n以下是您的额度使用情况：\n"]
+    texts.extend(
+        [
+            f"{int(quota_item[1] * 100)} % was used within {_format_duration(quota_item[0])}"
+            for quota_item in quota
+        ]
+    )
+    return "\n".join(texts) or None
+
+
 def _extract_reply(agent_output: Any) -> str | None:
     candidates = agent_output.get("outputs")
     full_text = ""
@@ -271,6 +305,8 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 unrestricted=(self.event.group_id in self.config.unrestricted_groups),
             ),
         )
+        if (text := _extract_limit(agent_output)) and group_event.message.is_tome:
+            await self.reply(text, reply_message=True)
 
         if reply_text := _extract_reply(agent_output):
             print(f"Group-Agent-Reply: {reply_text}")
