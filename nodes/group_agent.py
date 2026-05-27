@@ -203,7 +203,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                     "image": img[0].base64,
                     "phash": img[0].phash,
                     "as_meme": img[1],
-                    "detail": False,
                 }
                 for img in x.images
             )

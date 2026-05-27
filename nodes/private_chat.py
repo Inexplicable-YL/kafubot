@@ -243,7 +243,6 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
                         "image": image.base64,
                         "phash": image.phash,
                         "as_meme": as_meme,
-                        "detail": False,
                     }
                 )
         except Exception:

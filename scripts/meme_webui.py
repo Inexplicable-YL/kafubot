@@ -19,7 +19,7 @@ from aiohttp.multipart import BodyPartReader
 from langchain_core.documents import Document
 
 from agent.commons.image import (
-    get_image_analyzer,
+    get_analyzer,
     read_image,
 )
 from agent.commons.meme import (
@@ -1027,11 +1027,10 @@ async def _analyze_and_add_source(
     if image is None:
         raise web.HTTPBadRequest(text="image analysis failed")
 
-    analysis = await get_image_analyzer(use_cache=False).ainvoke(
+    analysis = await get_analyzer(use_cache=False).ainvoke(
         {
             "image": image.base64,
             "phash": image.phash,
-            "detail": True,
         }
     )
     base64_value = "base64://" + image.base64

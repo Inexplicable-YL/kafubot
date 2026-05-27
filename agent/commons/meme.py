@@ -140,7 +140,6 @@ async def meme_analysis(files: list[str]) -> list[tuple[str, MemeResult]]:
                     {
                         "image": result.base64,
                         "phash": result.phash,
-                        "detail": True,
                     }
                 )
                 analysis_results.append(
