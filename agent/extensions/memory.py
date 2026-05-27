@@ -20,8 +20,8 @@ from langgraph.store.base import BaseStore
 from langgraph.types import Command
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
-from chat.agent.base import MODEL_VISIBLE_TZ, ManagerContext, ManagerState, UserMessage
-from chat.agent.builder import create_agent
+from agent.base import MODEL_VISIBLE_TZ, ManagerContext, ManagerState, UserMessage
+from agent.builder import create_agent
 
 MemoryKind = Literal[
     "fact",

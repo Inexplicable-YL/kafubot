@@ -23,11 +23,18 @@ api_timeout=10
 [permission]
 superusers = ["2682064633", "3613158872", "2641460187", "group_596488203", "group_1011357049"]
 
+[node.private_chat]
+merge_window_seconds=5
+activity_day=[8,20]
+activity_limits=[
+    [3600, 30],
+    [18000, 80],
+    [604800, 400],
+]
+activity_day_multiplier=0.5
+activity_night_multiplier=1.0
 
-
-
-
-[node.group_chat]
+[node.group_agent]
 unrestricted_groups=[
     596488203,
     1011357049,
@@ -50,53 +57,6 @@ auto_reply_groups=[
     1074180418,
     983497050,
 ]
-
-talk_value=0.15
-impact_factor=0.6
-interval_seconds=3
-
-reply_keywords=["可不", "花谱", "星界", "里命"]
-reply_when_keywords=false
-clear_keywords=["/clear", "/清除"]
-
-activity_limits=[
-    [3600, 30],
-    [18000, 90],
-    [604800, 500],
-]
-
-
-
-
-
-
-
-[node.private_chat]
-merge_window_seconds=5
-activity_day=[8,20]
-activity_limits=[
-    [3600, 30],
-    [18000, 80],
-    [604800, 400],
-]
-activity_day_multiplier=0.5
-activity_night_multiplier=1.0
-
-
-
-
-
-
-[node.group_agent]
-unrestricted_groups=[
-    596488203,
-    1011357049,
-    1058218429,
-    1087911123,
-    834922207,
-    895484096,
-]
-auto_reply_groups=[]
 reply_keywords=[
     ["可不", 0.5],
     ["星界", 0.4],
@@ -104,14 +64,11 @@ reply_keywords=[
     ["里命", 0.2],
     ["情绪", 0.1],
 ]
-reply_when_keywords=false
 clear_keywords=["/clear", "/清除"]
-
 talk_value=0.3
-impact_factor=0.7
 average_reply_count=1.2
 meme_reply_ratio=0.2
-
+rate_limit=[0.4, 2]
 activity_limits=[
     [3600, 30],
     [18000, 90],

@@ -14,7 +14,7 @@ from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, AnyMessage
 from pydantic import BaseModel, ConfigDict, Field
 
-from chat.agent.base import ManagerContext, ManagerState
+from agent.base import ManagerContext, ManagerState
 
 
 class GetEarlyMessagesInput(BaseModel):

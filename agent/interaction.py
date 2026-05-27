@@ -28,15 +28,17 @@ from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from sekaibot.adapter.cqhttp.message import CQHTTPMessageSegment
 
-from chat.agent.base import (
+from agent.base import (
     MODEL_VISIBLE_TZ,
     ManagerContext,
     ManagerState,
     OutputMessage,
     UserMessage,
 )
-from chat.agent.history import get_session_history
-from chat.agent.prompt import (
+from agent.commons.meme import MemeResult, search_memes
+from agent.history import get_session_history
+from agent.message import QQMessage, QQMessageSegment
+from agent.prompts.prompt import (
     BOT_NAME,
     GROUP_SYSTEM_PROMPT,
     IDENTITY,
@@ -44,9 +46,7 @@ from chat.agent.prompt import (
     MORE_REPLY,
     REPLY_USER_PROMPT,
 )
-from chat.meme import MemeResult, search_memes
-from chat.message import QQMessage, QQMessageSegment
-from chat.utils import to_reply
+from agent.utils import to_reply
 
 
 @cache

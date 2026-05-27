@@ -17,7 +17,7 @@ from langchain.agents.middleware import (
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import Command
 
-from chat.agent.base import (
+from agent.base import (
     MODEL_VISIBLE_TZ,
     ManagerContext,
     ManagerState,

@@ -14,12 +14,13 @@ from langgraph.runtime import Runtime
 from opencc import OpenCC
 from pydantic import BaseModel, ConfigDict, Field
 
-from chat.agent.base import (
+from agent.base import (
     ManagerContext,
     ManagerState,
     OutputMessage,
     UserMessage,
 )
+from agent.commons.limiter import ActivateLimiter
 
 
 class State(Enum):
@@ -33,7 +34,13 @@ class TimeGateConfig(TypedDict):
     velocity_alpha: NotRequired[float]
     temperature: NotRequired[float]
     relevance_decay: NotRequired[float]
-    keywords: NotRequired[list[tuple[str, float]]]
+    keywords: NotRequired[set[tuple[str, float]]]
+
+
+class ActivateLimiterConfig(TypedDict):
+    db_url: str
+    act_limits: tuple[tuple[int, int], ...]
+    rate_limit: tuple[float, float]
 
 
 class TimeGateSnapshot(TypedDict):
@@ -52,7 +59,7 @@ class TimeGate(BaseModel):
     velocity_alpha: float = 0.2
     temperature: float = 1.0
     relevance_decay: float = 0.4
-    keywords: list[tuple[str, float]] = Field(default_factory=list)
+    keywords: set[tuple[str, float]] = Field(default_factory=set)
 
     state: State = Field(default=State.IDLE, repr=False)
     pressure: float = Field(default=0.0, repr=False)
@@ -267,8 +274,13 @@ class TimeGate(BaseModel):
 
 
 class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
-    def __init__(self, config: TimeGateConfig) -> None:
-        self.time_gate = TimeGate(**config)
+    def __init__(
+        self,
+        gate_config: TimeGateConfig,
+        limiter_config: ActivateLimiterConfig,
+    ) -> None:
+        self.time_gate = TimeGate(**gate_config)
+        self.limiter = ActivateLimiter(**limiter_config)
         self.snapshot: TimeGateSnapshot | None = None
 
     @hook_config(can_jump_to=["end"])
@@ -279,7 +291,10 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             self.time_gate.clear()
             self.snapshot = self.time_gate.observe(state["history_messages"])
         self.time_gate.observe(state["current_messages"], from_snapshot=self.snapshot)
-        if (not runtime.context["is_tome"]) and (not self.time_gate.evaluate()):
+        if not runtime.context["is_tome"] and (
+            not self.time_gate.evaluate()
+            or not await self.limiter.acquire(runtime.context["session_id"])
+        ):
             return {
                 "jump_to": "end",
                 "outputs": [
@@ -301,4 +316,5 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             elif output["type"] == "meme":
                 observe.append(AIMessage(output["data"]["content"]))
         if observe:
+            await self.limiter.record(runtime.context["session_id"])
             self.snapshot = self.time_gate.observe(observe)

@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from langchain.tools import ToolRuntime, tool
 from pydantic import BaseModel, ConfigDict, Field
 
-from chat.agent.base import ManagerContext, ManagerState
+from agent.base import ManagerContext, ManagerState
 
 
 class ViewMessagesInput(BaseModel):

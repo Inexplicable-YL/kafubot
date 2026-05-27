@@ -12,8 +12,8 @@ from langchain.agents import AgentState
 from langchain_core.messages import AnyMessage
 from pydantic import BaseModel, ConfigDict, Field
 
-from chat.image import ImageReadResult  # noqa: TC001
-from chat.message import QQMessage  # noqa: TC001
+from agent.commons.image import ImageReadResult  # noqa: TC001
+from agent.message import QQMessage  # noqa: TC001
 
 load_dotenv()
 
@@ -30,8 +30,6 @@ class UserMessage(BaseModel):
     user_id: str
     message_id: str
     is_tome: bool
-    to_other: bool
-    have_keywords: bool
     images: list[tuple[ImageReadResult, bool]] = Field(default_factory=list)
 
     def as_content(self) -> str:

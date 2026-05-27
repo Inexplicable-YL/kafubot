@@ -11,10 +11,10 @@ from sqlalchemy import Boolean, DateTime, Integer, Text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from chat.agent.base import UserMessage
-from chat.image import ImageReadResult
-from chat.message import QQMessage
-from chat.utils import LimitedSQLChatMessageHistory, content_to_text
+from agent.base import UserMessage
+from agent.commons.image import ImageReadResult
+from agent.message import QQMessage
+from agent.utils import LimitedSQLChatMessageHistory, content_to_text
 
 DB_URL = "sqlite+aiosqlite:///./.database/agent_history.db"
 TABLE_NAME = "agent_history"
@@ -51,8 +51,6 @@ class ChatMessageRecord(ChatMessageBase):
     user_id: Mapped[str | None] = mapped_column(Text)
     message_id: Mapped[str | None] = mapped_column(Text)
     is_tome: Mapped[bool] = mapped_column(Boolean, default=False)
-    to_other: Mapped[bool] = mapped_column(Boolean, default=False)
-    have_keywords: Mapped[bool] = mapped_column(Boolean, default=False)
     message: Mapped[str | None] = mapped_column(Text)
     images: Mapped[str | None] = mapped_column(Text)
 
@@ -85,8 +83,6 @@ class MessageConverter(BaseMessageConverter):
                     user_id=sql_message.user_id or "",
                     message_id=sql_message.message_id or "",
                     is_tome=sql_message.is_tome,
-                    to_other=sql_message.to_other,
-                    have_keywords=sql_message.have_keywords,
                     images=images,
                 )
                 return HumanMessage(
@@ -120,8 +116,6 @@ class MessageConverter(BaseMessageConverter):
                 user_id=user_msg.user_id,
                 message_id=user_msg.message_id,
                 is_tome=user_msg.is_tome,
-                to_other=user_msg.to_other,
-                have_keywords=user_msg.have_keywords,
                 message=user_msg.message.get_msgcode(),
                 images=(
                     json.dumps(
@@ -150,8 +144,6 @@ class MessageConverter(BaseMessageConverter):
                 user_id=None,
                 message_id=None,
                 is_tome=False,
-                to_other=False,
-                have_keywords=False,
                 message=None,
                 images=None,
             )

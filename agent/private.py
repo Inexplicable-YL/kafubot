@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import os
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, tzinfo
 from functools import cache
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 from typing_extensions import override
 from zoneinfo import ZoneInfo
 
@@ -11,7 +12,6 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import (
     Runnable,
-    RunnableConfig,
     RunnableGenerator,
     RunnableLambda,
 )
@@ -22,41 +22,47 @@ from sqlalchemy import DateTime, Integer, Text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from chat.image import ImageReadResult
-from chat.message import QQMessage
-from chat.prompt import DECISION_SYSTEM_PROMPT, GROUP_HUMAN_PROMPT, GROUP_SYSTEM_PROMPT
-from chat.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
+from agent.commons.image import ImageReadResult  # noqa: TC001
+from agent.message import QQMessage, QQMessageSegment  # noqa: TC001
+from agent.prompts.image import PRIVATE_HUMAN_PROMPT, PRIVATE_SYSTEM_PROMPT
+from agent.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
 
-DB_URL = "sqlite+aiosqlite:///./.database/group_history.db"
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+
+DB_URL = "sqlite+aiosqlite:///./.database/private_history.db"
 TABLE_NAME = "deepseek_chat_messages"
-
-DECISION_DEEPSEEK_MODEL = "deepseek-v4-flash"
-CHAT_DEEPSEEK_MODEL = "deepseek-v4-pro"
-
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+CHAT_HISTORY_MAX_MESSAGES = 100
 MODEL_VISIBLE_TZ = ZoneInfo("Asia/Shanghai")
 MODEL_VISIBLE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-CHAT_HISTORY_MAX_MESSAGES = 50
+IMAGE_SEGMENT_TYPES = {"image", "meme"}
+
+
+def _ensure_utc(timestamp: datetime) -> datetime:
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=UTC)
+    return timestamp.astimezone(UTC)
 
 
 def _format_message_content(
     timestamp: datetime,
-    user: str,
     text: str,
     *,
     timezone: tzinfo,
 ) -> str:
-    return f"[{timestamp.astimezone(timezone).strftime('%Y-%m-%d %H:%M:%S')}]{user}: {text}"
+    return f"[{_ensure_utc(timestamp).astimezone(timezone).isoformat()}]{text}"
 
 
 def _format_model_visible_message_content(
     timestamp: datetime,
-    user: str,
     text: str,
     *,
     timezone: tzinfo,
 ) -> str:
-    visible_timestamp = timestamp.astimezone(timezone)
-    return f"[{visible_timestamp.strftime(MODEL_VISIBLE_TIME_FORMAT)}]{user}: {text}"
+    visible_timestamp = _ensure_utc(timestamp).astimezone(timezone)
+    return f"[{visible_timestamp.strftime(MODEL_VISIBLE_TIME_FORMAT)}]{text}"
 
 
 @cache
@@ -64,26 +70,59 @@ def _get_async_engine() -> AsyncEngine:
     return create_async_engine(DB_URL)
 
 
-class GroupMessage(BaseModel):
+class PrivateMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    role: Literal["user", "assistant"] = "user"
+
     timestamp: datetime
-    user: str
     message: QQMessage
-    user_id: str
     message_id: str
-    is_tome: bool
-    to_other: bool
-    have_keywords: bool
+    user: str = ""
+    user_id: str = ""
     images: list[tuple[ImageReadResult, bool]] = Field(default_factory=list)
 
     def as_content(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> str:
         return _format_model_visible_message_content(
             self.timestamp,
-            self.user,
             self.message.get_msgcode(),
             timezone=timezone,
         )
+
+    def has_model_visible_content(self) -> bool:
+        return any(
+            bool(seg.data.get("text", "").strip())
+            if seg.type == "text"
+            else seg.type not in IMAGE_SEGMENT_TYPES or bool(seg.data.get("content"))
+            for seg in self.message
+        )
+
+    def as_human_message(self, *, timezone: tzinfo = MODEL_VISIBLE_TZ) -> HumanMessage:
+        return HumanMessage(
+            content=self.as_content(timezone=timezone),
+            additional_kwargs={
+                "raw": {
+                    "timestamp": _ensure_utc(self.timestamp),
+                    "text": self.message.get_msgcode(),
+                }
+            },
+        )
+
+    def fill_first_pending_image(self, content: str | None) -> None:
+        new_message = QQMessage()
+        replaced = False
+        for seg in self.message:
+            if (
+                not replaced
+                and seg.type in IMAGE_SEGMENT_TYPES
+                and not seg.data.get("content")
+            ):
+                replaced = True
+                if content:
+                    data = dict(seg.data)
+                    data["content"] = content
+                    new_message += getattr(QQMessageSegment, seg.type)(**data)
+                continue
+            new_message += seg
+        self.message = new_message
 
 
 class ChatMessageBase(DeclarativeBase):
@@ -96,16 +135,15 @@ class ChatMessageRecord(ChatMessageBase):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(Text, index=True, nullable=False)
     role: Mapped[str] = mapped_column(Text, nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
     )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
     user_timestamp: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )
-    user_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     user_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     assistant_timestamp: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -122,24 +160,19 @@ class MessageConverter(BaseMessageConverter):
         role = sql_message.role
         if role == "human":
             user_timestamp = sql_message.user_timestamp
-            user_name = sql_message.user_name
             user_text = sql_message.user_text
-            if (
-                user_timestamp is not None
-                and user_name is not None
-                and user_text is not None
-            ):
+            if user_timestamp is not None and user_text is not None:
                 return HumanMessage(
                     content=_format_model_visible_message_content(
                         user_timestamp,
-                        user_name,
                         user_text,
                         timezone=MODEL_VISIBLE_TZ,
                     ),
                     additional_kwargs={
-                        "timestamp": user_timestamp,
-                        "user": user_name,
-                        "text": user_text,
+                        "raw": {
+                            "timestamp": _ensure_utc(user_timestamp),
+                            "text": user_text,
+                        }
                     },
                 )
             return HumanMessage(content=sql_message.content)
@@ -152,19 +185,22 @@ class MessageConverter(BaseMessageConverter):
         now = datetime.now(UTC)
 
         if isinstance(message, HumanMessage):
-            timestamp = message.additional_kwargs.get("timestamp")
-            user = message.additional_kwargs.get("user")
-            text = message.additional_kwargs.get("text")
+            raw = message.additional_kwargs.get("raw", {})
+            raw_timestamp = raw.get("timestamp")
+            raw_text = raw.get("text")
+            user_timestamp = (
+                _ensure_utc(raw_timestamp)
+                if isinstance(raw_timestamp, datetime)
+                else None
+            )
+            user_text = raw_text if isinstance(raw_text, str) else None
             content = (
                 _format_message_content(
-                    timestamp,
-                    user,
-                    text,
+                    user_timestamp,
+                    user_text,
                     timezone=UTC,
                 )
-                if isinstance(timestamp, datetime)
-                and isinstance(user, str)
-                and isinstance(text, str)
+                if user_timestamp is not None and user_text is not None
                 else content_to_text(message.content)
             )
             return ChatMessageRecord(
@@ -172,25 +208,26 @@ class MessageConverter(BaseMessageConverter):
                 role="human",
                 content=content,
                 created_at=now,
-                user_timestamp=timestamp if isinstance(timestamp, datetime) else None,
-                user_name=user,
-                user_text=text,
+                user_timestamp=user_timestamp,
+                user_text=user_text,
                 assistant_timestamp=None,
             )
 
         if isinstance(message, AIMessage):
+            assistant_timestamp = message.additional_kwargs.get(
+                "assistant_timestamp",
+                now,
+            )
+            if not isinstance(assistant_timestamp, datetime):
+                assistant_timestamp = now
             return ChatMessageRecord(
                 session_id=session_id,
                 role="ai",
                 content=content_to_text(message.content),
                 created_at=now,
                 user_timestamp=None,
-                user_name=None,
                 user_text=None,
-                assistant_timestamp=message.additional_kwargs.get(
-                    "timestamp",
-                    now,
-                ),
+                assistant_timestamp=_ensure_utc(assistant_timestamp),
             )
 
         raise TypeError(f"Unsupported message type: {type(message)}")
@@ -209,130 +246,43 @@ async def clear_session_history(session_id: str) -> None:
     await get_session_history(session_id).aclear()
 
 
-def get_decision_app() -> Runnable[dict[str, Any], bool]:
+def get_chat_app() -> Runnable[dict[str, Any], str]:
     def _normalize_input(payload: dict[str, Any]) -> dict[str, Any]:
-        messages = TypeAdapter(list[GroupMessage]).validate_python(payload["messages"])
-        prompt_variables = {
-            key: value
-            for key, value in payload.items()
-            if key not in {"messages", "thinking", "reasoning_effort"}
-        }
-        return {
-            **prompt_variables,
-            "current_messages": [
-                HumanMessage(
-                    content=item.as_content(timezone=MODEL_VISIBLE_TZ),
-                    additional_kwargs={
-                        "timestamp": item.timestamp,
-                        "user": item.user,
-                        "text": item.message.get_msgcode(),
-                    },
-                )
-                for item in messages
-            ],
-        }
-
-    async def _load_history(
-        payload: dict[str, Any],
-        config: RunnableConfig,
-    ) -> dict[str, Any]:
-        configurable = config.get("configurable", {})
-        session_id = configurable.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            raise ValueError("config['configurable']['session_id'] is required")
-
-        history = await get_session_history(session_id).aget_messages()
-        history = [
-            HumanMessage(content="可不（机器人）: " + content_to_text(message.content))
-            if isinstance(message, AIMessage)
-            else message
-            for message in history
-        ]
-        return {
-            **payload,
-            "decision_messages": [
-                *history,
-                *payload["current_messages"],
-            ],
-        }
-
-    def _parse_decision(result: Any) -> bool:
-        text = content_to_text(
-            result.content if isinstance(result, AIMessage) else result
+        messages = TypeAdapter(list[PrivateMessage]).validate_python(
+            payload["messages"]
         )
-        normalized = text.strip().lower().strip("`'\". \t\r\n")
-        if normalized in {"true", "yes", "1"} or normalized.startswith("true"):
-            return True
-        if normalized in {"false", "no", "0"} or normalized.startswith("false"):
-            return False
-        raise ValueError(f"Decision model returned an invalid boolean: {text!r}")
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", DECISION_SYSTEM_PROMPT),
-            MessagesPlaceholder("decision_messages"),
-        ]
-    )
-    model = ChatDeepSeek(
-        model=DECISION_DEEPSEEK_MODEL,
-        base_url=os.getenv("DEEPSEEK_BASE_URL"),
-        temperature=0,
-        max_retries=2,
-    ).bind(
-        reasoning_effort="max",
-        extra_body={
-            "thinking": {
-                "type": "enabled",
-            }
-        },
-    )
-
-    return (
-        RunnableLambda(_normalize_input)
-        | RunnableLambda(_load_history)
-        | prompt
-        | model
-        | RunnableLambda(_parse_decision)
-    )
-
-
-def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
-    def _normalize_input(payload: dict[str, Any]) -> dict[str, Any]:
-        messages = TypeAdapter(list[GroupMessage]).validate_python(payload["messages"])
         reasoning_effort = payload.get("reasoning_effort", "high")
         prompt_variables = {
             key: value
             for key, value in payload.items()
             if key not in {"messages", "thinking", "reasoning_effort"}
         }
+        prompt_variables.setdefault("extra_prompt", "")
+        prompt_variables.setdefault("user_name", "")
 
         if reasoning_effort not in {"high", "max"}:
             raise ValueError("reasoning_effort must be 'high' or 'max'")
 
         return {
             **prompt_variables,
-            "current_messages": [
-                HumanMessage(
-                    content=item.as_content(timezone=MODEL_VISIBLE_TZ),
-                    additional_kwargs={
-                        "timestamp": item.timestamp,
-                        "user": item.user,
-                        "text": item.message.get_msgcode(),
-                    },
-                )
-                for item in messages
-            ],
+            "current_messages": [message.as_human_message() for message in messages],
             "thinking": bool(payload.get("thinking", False)),
             "reasoning_effort": reasoning_effort,
         }
 
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", GROUP_SYSTEM_PROMPT),
+            ("system", PRIVATE_SYSTEM_PROMPT),
             MessagesPlaceholder("history"),
             MessagesPlaceholder("current_messages"),
-            ("human", GROUP_HUMAN_PROMPT),
+            ("human", PRIVATE_HUMAN_PROMPT),
         ]
+    )
+    model = ChatDeepSeek(
+        model=DEEPSEEK_MODEL,
+        base_url=os.getenv("DEEPSEEK_BASE_URL"),
+        temperature=1.2,
+        max_retries=2,
     )
 
     def _chat_chain_for_payload(
@@ -358,13 +308,9 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
                 },
             }
 
-        model = ChatDeepSeek(
-            model=CHAT_DEEPSEEK_MODEL,
-            base_url=os.getenv("DEEPSEEK_BASE_URL"),
-            temperature=1.2,
-            max_retries=2,
-        ).bind(**runtime_kwargs)
-        return cast("Runnable[dict[str, Any], AIMessage]", prompt | model)
+        return cast(
+            "Runnable[dict[str, Any], AIMessage]", prompt | model.bind(**runtime_kwargs)
+        )
 
     async def _attach_timestamp(
         messages: AsyncIterator[AIMessage],
@@ -372,7 +318,7 @@ def get_chat_app() -> Runnable[dict[str, Any], str]:  # noqa: PLR0915
         timestamp = datetime.now(UTC)
         async for message in messages:
             extra = dict(message.additional_kwargs or {})
-            extra["timestamp"] = timestamp
+            extra["assistant_timestamp"] = timestamp
             yield message.model_copy(update={"additional_kwargs": extra})
 
     core_chain = RunnableLambda(_chat_chain_for_payload) | RunnableGenerator(

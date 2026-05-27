@@ -5,31 +5,30 @@ from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 import anyio
-import opencc
 from langchain_core.runnables import Runnable
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sekaibot import Bot, Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.config import ConfigModel
 from sekaibot.log import logger
-from sekaibot.permission import User
 
-from chat.activity import ActivityStore, get_activity_store
-from chat.agent import UserMessage, clear_session_history, create_agent_service
-from chat.agent.base import ManagerContext, ManagerState
-from chat.image import (
+from agent import UserMessage, clear_session_history, create_agent_service
+from agent.base import ManagerContext, ManagerState
+from agent.commons.image import (
     ImageReadResult,
-    get_image_analyzer,
+    get_analyzer,
     read_image,
 )
-from chat.meme import add_memes
-from chat.message import QQMessage, QQMessageSegment
+from agent.commons.meme import add_memes
+from agent.message import QQMessage, QQMessageSegment
 
 MESSAGES_LIMIT = 30
 BACKUP_MESSAGES_LIMIT = 20
 BACKUP_PENDING_COUNTS_LIMIT = 10
 
 EXTRA_PROMPT_MAX_HISTORY = 5
+
+LIMITER_DB = "./.database/limiter.db"
 
 DEFAULT_USERNAME = "陌生用户"
 
@@ -59,10 +58,11 @@ class GroupAgentConfig(ConfigModel):
     keep_image_limit: int = 3
     talk_value: float = 0.8
     reply_keywords: set[tuple[str, float]] = set()
-    reply_when_keywords: bool = False
     clear_keywords: set[str] = set()
     average_reply_count: float = 1.5
     meme_reply_ratio: float = 0.6
+    # (requests_per_second, max_bucket_size)
+    rate_limit: tuple[float, float] = (1.0, 1.0)
     # (window_seconds, threshold)
     activity_limits: tuple[tuple[int, int], ...] = (
         (3600 * 5, 100),
@@ -108,14 +108,12 @@ class GroupAgentState(BaseModel):
 
     agent: Any | None = None
     image_analyzer: Runnable[dict[str, Any], str] = Field(
-        default_factory=lambda _: get_image_analyzer(True, add_memes_hook=add_memes)
+        default_factory=lambda _: get_analyzer(True, add_memes_hook=add_memes)
     )
-    activity_store: ActivityStore = Field(default_factory=get_activity_store)
     storages: dict[str, Histories] = Field(default_factory=dict)
     storages_lock: anyio.Lock = Field(default_factory=anyio.Lock)
 
 
-@User("group_895484096", "group_834922207", "group_596488203")
 class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
     """群聊记录节点"""
 
@@ -134,22 +132,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 self.node_state.storages[session_id] = Histories()
             return self.node_state.storages[session_id]
 
-    async def is_activity_limited(
-        self,
-        group_event: GroupEvent,
-    ) -> bool:
-        session_id = group_event.session_id
-        event_time = group_event.time
-        return bool(
-            int(session_id) not in self.config.unrestricted_groups
-            and await self.node_state.activity_store.is_limited(
-                scope="group",
-                session_id=session_id,
-                event_time=event_time,
-                activity_limits=self.config.activity_limits,
-            )
-        )
-
     async def claim_messages(  # noqa: PLR0911
         self,
         group_event: GroupEvent,
@@ -164,7 +146,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         is_released = False
         try:
             history_storage.messages.append(message)
-            len_messages = len(history_storage.messages)
             history_storage.backup_messages.append(message)
             if group_event.message.images:
                 return None
@@ -195,14 +176,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 ].message_id != str(self.event.message_id):
                     return None
 
-            # There was no response to the previous incident and the message did not refer to the bot.
-            if len_messages == len(history_storage.messages) and not is_tome:
-                # The message is a reply to someone else, skip.
-                if group_event.message.to_other:
-                    return None
-                # Activity is limited, skip.
-                if await self.is_activity_limited(group_event):
-                    return None
             history_storage.on_handle = True
             current_messages = list(history_storage.messages)
             history_storage.messages.clear()
@@ -266,8 +239,15 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             get_agent, close_agent = await create_agent_service()
             Bot.bot_exit_hook(close_agent)
             self.node_state.agent = await get_agent(
-                talk_value=self.config.talk_value,
-                keywords=tuple(self.config.reply_keywords),
+                gate_config={
+                    "talk_value": self.config.talk_value,
+                    "keywords": set(self.config.reply_keywords),
+                },
+                limiter_config={
+                    "db_url": LIMITER_DB,
+                    "rate_limit": self.config.rate_limit,
+                    "act_limits": self.config.activity_limits,
+                },
             )
         assert self.node_state.agent
         agent_output = await self.node_state.agent.ainvoke(
@@ -302,8 +282,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                     user_id=str(self.event.adapter.self_id),
                     message_id="",
                     is_tome=False,
-                    to_other=False,
-                    have_keywords=False,
                 )
             )
             group_event.history_storage.backup_pending_counts.append(
@@ -325,14 +303,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             history_storage.on_handle = False
             async with history_storage.handle_condition:
                 history_storage.handle_condition.notify_all()
-        if current_messages is None:
-            await self.node_state.activity_store.record(
-                scope="group",
-                session_id=str(self.event.group_id),
-                event_time=self.event.time,
-                weight=1.0,
-                activity_limits=self.config.activity_limits,
-            )
 
     async def delete_chat(self, session_id: str) -> None:
         await clear_session_history(session_id=session_id)
@@ -343,17 +313,16 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
 
     async def get_message_or_clear_chat(
         self, session_id: str, history_storage: Histories, to_me: bool
-    ) -> tuple[QQMessage | None, bool]:
+    ) -> QQMessage | None:
         if (text := self.event.message.get_plain_text()) and any(
             keyw in text for keyw in self.config.clear_keywords
         ):
             await self.delete_chat(session_id=session_id)
-            return None, False
+            return None
         message = await QQMessage.from_cqhttp_message(
             self.event.message, history_storage.backup_messages, self.get_image
         )
 
-        to_other = (not to_me) and any(seg.type == "at" for seg in self.event.message)
         if to_me:
             message = QQMessageSegment.at("可不") + message
         if self.event.reply and (reply_time := int(self.event.reply.time)):
@@ -370,18 +339,7 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 )
                 + message
             )
-            to_other = to_other or (
-                self.event.reply.sender.user_id != self.event.adapter.self_id
-            )
-        return message, to_other
-
-    def have_keywords(self, text: str) -> bool:
-        text = (
-            opencc.OpenCC("s2t").convert(text)
-            + "\n"
-            + opencc.OpenCC("t2s").convert(text)
-        )
-        return any(keyw[0] in text for keyw in self.config.reply_keywords)
+        return message
 
     async def get_image(self, file: str) -> ImageReadResult | None:
         try:
@@ -399,19 +357,16 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         return None
 
     async def get_event(self) -> GroupEvent | None:
-        session_id = str(self.event.group_id)
+        session_id = f"group_{self.event.group_id}"
         history_storage = await self.get_history_storage(session_id)
         is_tome = self.event.is_tome()
-        message, to_other = await self.get_message_or_clear_chat(
+        message = await self.get_message_or_clear_chat(
             session_id, history_storage, is_tome
         )
         if not message:
             return None
         timestamp = datetime.fromtimestamp(self.event.time, tz=UTC)
         user = self.event.sender.nickname or DEFAULT_USERNAME
-        have_keywords = self.have_keywords(message.get_plain_text())
-        if self.config.reply_when_keywords:
-            is_tome = is_tome or have_keywords
         msg_data = {
             "role": "user",
             "timestamp": timestamp,
@@ -420,8 +375,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             "user_id": str(self.event.user_id),
             "message_id": str(self.event.message_id),
             "is_tome": is_tome,
-            "to_other": to_other,
-            "have_keywords": have_keywords,
         }
         images: list[tuple[ImageReadResult, bool]] = []
         msg_with_image = QQMessage()

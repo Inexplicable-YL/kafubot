@@ -1,4 +1,3 @@
-from collections import deque
 from datetime import UTC, datetime
 from typing import Any, cast
 from typing_extensions import override
@@ -12,22 +11,19 @@ from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import PrivateMessageEvent
 from sekaibot.config import ConfigModel
 
-from chat.activity import ActivityStore, get_activity_store
-from chat.image import (
+from agent.commons.image import (
     ImageReadResult,
-    get_image_analyzer,
+    get_analyzer,
     read_image,
 )
-from chat.meme import add_memes
-from chat.message import QQMessage, QQMessageSegment
-from chat.private import (
+from agent.commons.meme import add_memes
+from agent.message import QQMessage, QQMessageSegment
+from agent.private import (
     IMAGE_SEGMENT_TYPES,
     PrivateMessage,
     clear_session_history,
     get_chat_app,
-    get_session_history,
 )
-from chat.prompt import get_extra_prompt
 
 BACKUP_MESSAGES_LIMIT = 10
 EXTRA_PROMPT_MAX_HISTORY = 3
@@ -47,9 +43,6 @@ class PrivateChatConfig(ConfigModel):
     clear_keywords: set[str] = Field(
         default_factory=lambda: DEFAULT_CLEAR_KEYWORDS.copy()
     )
-    activity_day: tuple[int, int] = (8, 20)
-    activity_day_multiplier: float = 0.5
-    activity_night_multiplier: float = 1.0
     # (window_seconds, threshold)
     activity_limits: tuple[tuple[int, int], ...] = (
         (3600 * 5, 100),
@@ -198,10 +191,8 @@ class PrivateChatState(BaseModel):
 
     chat: Runnable[dict[str, Any], str] = Field(default_factory=get_chat_app)
     image_analyzer: Runnable[dict[str, Any], str] = Field(
-        default_factory=lambda _: get_image_analyzer(True, add_memes_hook=add_memes)
+        default_factory=lambda _: get_analyzer(True, add_memes_hook=add_memes)
     )
-    activity_store: ActivityStore = Field(default_factory=get_activity_store)
-    backup_histories: dict[str, deque[str]] = Field(default_factory=dict)
     sessions: dict[str, SessionQueueState] = Field(default_factory=dict)
     sessions_lock: anyio.Lock = Field(default_factory=anyio.Lock)
     image_task_group_lock: anyio.Lock = Field(default_factory=anyio.Lock)
@@ -215,12 +206,6 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
     @override
     def __init_state__(self) -> PrivateChatState:
         return PrivateChatState()
-
-    def history(self, session_id: str) -> deque[str]:
-        return self.node_state.backup_histories.setdefault(
-            session_id,
-            deque(maxlen=BACKUP_MESSAGES_LIMIT),
-        )
 
     async def session_state(self, session_id: str) -> SessionQueueState:
         async with self.node_state.sessions_lock:
@@ -281,55 +266,24 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
         except Exception:
             await session_state.finish_image(message, None)
 
-    def activity_weight(self, event_time: int) -> float:
-        hour = (
-            datetime.fromtimestamp(event_time, tz=UTC)
-            .astimezone(ZoneInfo("Asia/Shanghai"))
-            .hour
-        )
-        if self.config.activity_day[0] <= hour < self.config.activity_day[1]:
-            return self.config.activity_day_multiplier
-        return self.config.activity_night_multiplier
-
     async def delete_chat(self, session_id: str) -> None:
         await clear_session_history(session_id)
-        await self.node_state.activity_store.clear_session(
-            scope="private",
-            session_id=session_id,
-        )
         async with self.node_state.sessions_lock:
             self.node_state.sessions.pop(session_id, None)
-        self.node_state.backup_histories.pop(session_id, None)
         await self.reply("[SYSTEM]已清除对话历史。")
-
-    async def record_user_context(
-        self,
-        session_id: str,
-        messages: list[PrivateMessage],
-    ) -> None:
-        texts = [message.message.get_msgcode() for message in messages]
-        self.history(session_id).append("\n".join(texts))
-        await get_session_history(session_id).aadd_messages(
-            [message.as_human_message() for message in messages]
-        )
 
     async def run_chat(
         self,
         private_event: PrivateEvent,
         messages: list[PrivateMessage],
     ) -> bool:
-        history = self.history(private_event.session_id)
         texts = [message.message.get_msgcode() for message in messages]
-        history.append("\n".join(texts))
         replied = False
         answer = ""
         print(f"Invoking-Private: {texts}")
         async for reply in self.node_state.chat.astream(
             {
                 "messages": messages,
-                "extra_prompt": await get_extra_prompt(
-                    "\n".join(list(history)[-EXTRA_PROMPT_MAX_HISTORY:])
-                ),
                 "now_time": datetime.now(tz=ZoneInfo("Asia/Shanghai")).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 ),
@@ -356,8 +310,6 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
                     await self.reply(raw_cq_msg)
             answer += reply_msg + "\n"
             replied = True
-        if replied:
-            history.append(answer)
         return replied
 
     async def get_image(self, file: str) -> ImageReadResult | None:
@@ -446,29 +398,6 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
             return None
         return state, messages
 
-    async def run_reply(
-        self,
-        private_event: PrivateEvent,
-        messages: list[PrivateMessage],
-    ) -> None:
-        if await self.node_state.activity_store.is_limited(
-            scope="private",
-            session_id=private_event.session_id,
-            event_time=private_event.time,
-            activity_limits=self.config.activity_limits,
-        ):
-            await self.record_user_context(private_event.session_id, messages)
-            return
-
-        if await self.run_chat(private_event, messages):
-            await self.node_state.activity_store.record(
-                scope="private",
-                session_id=private_event.session_id,
-                event_time=private_event.time,
-                weight=self.activity_weight(private_event.time),
-                activity_limits=self.config.activity_limits,
-            )
-
     @override
     async def handle(self) -> None:
         private_event = await self.get_event()
@@ -479,6 +408,6 @@ class PrivateChat(Node[PrivateMessageEvent, PrivateChatState, PrivateChatConfig]
             return
         state, messages = result
         try:
-            await self.run_reply(private_event, messages)
+            await self.run_chat(private_event, messages)
         finally:
             await state.finish_run()

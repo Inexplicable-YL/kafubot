@@ -13,7 +13,7 @@ from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from pydantic import BaseModel, ConfigDict
 
-from chat.image import get_image_analyzer, read_image
+from agent.commons.image import get_analyzer, read_image
 
 load_dotenv()
 
@@ -111,7 +111,7 @@ async def add_memes(
 
 
 async def meme_analysis(files: list[str]) -> list[tuple[str, MemeResult]]:
-    image_analyzer = get_image_analyzer(use_cache=False)
+    image_analyzer = get_analyzer(use_cache=False)
     analysis_results: list[tuple[str, MemeResult]] = []
     failed_files: list[str] = []
     duplicate_files: list[str] = []

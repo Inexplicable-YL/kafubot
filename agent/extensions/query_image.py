@@ -10,7 +10,7 @@ from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from chat.agent.base import ManagerContext, ManagerState, UserMessage
+from agent.base import ManagerContext, ManagerState, UserMessage
 
 load_dotenv()
 

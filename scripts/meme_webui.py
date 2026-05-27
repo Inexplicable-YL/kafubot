@@ -18,11 +18,11 @@ from aiohttp import web
 from aiohttp.multipart import BodyPartReader
 from langchain_core.documents import Document
 
-from chat.image import (
+from agent.commons.image import (
     get_image_analyzer,
     read_image,
 )
-from chat.meme import (
+from agent.commons.meme import (
     MEME_CHROMA_PATH,
     MEME_PHASH_DISTANCE,
     add_memes,

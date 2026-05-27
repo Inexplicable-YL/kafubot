@@ -5,7 +5,6 @@ from typing import Any, Literal, cast
 
 import aiosqlite
 import pandas as pd
-from async_lru import alru_cache
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -23,19 +22,20 @@ from langgraph.runtime import Runtime
 from langgraph.store.sqlite import AsyncSqliteStore
 from pydantic import TypeAdapter
 
-from chat.agent.base import (
+from agent.base import (
     MODEL_VISIBLE_TZ,
     ManagerContext,
     ManagerState,
     UserMessage,
 )
-from chat.agent.builder import create_agent
-from chat.agent.get_msgs import ContextAcquisitionMiddleware
-from chat.agent.history import get_session_history
-from chat.agent.interaction import InteractionMiddleware
-from chat.agent.logs import AgentDebugLogMiddleware
-from chat.agent.memory import LongMemoryMiddleware
-from chat.agent.prompt import (
+from agent.builder import create_agent
+from agent.extensions import TOOLS
+from agent.extensions.get_msgs import ContextAcquisitionMiddleware
+from agent.extensions.logs import AgentDebugLogMiddleware
+from agent.extensions.memory import LongMemoryMiddleware
+from agent.history import get_session_history
+from agent.interaction import InteractionMiddleware
+from agent.prompts.prompt import (
     BOT_NAME,
     IDENTITY,
     LANGUAGE_STYLE,
@@ -48,9 +48,12 @@ from chat.agent.prompt import (
     SPECIAL_REMINDER,
     TOOL_PROMOT,
 )
-from chat.agent.time_gate import TimeGateMiddleware
-from chat.agent.tools import TOOLS
-from chat.utils import content_to_text, terminal_trend
+from agent.time_gate import (
+    ActivateLimiterConfig,
+    TimeGateConfig,
+    TimeGateMiddleware,
+)
+from agent.utils import content_to_text, terminal_trend
 
 load_dotenv()
 
@@ -252,10 +255,9 @@ async def create_agent_service():
         },
     )
 
-    @alru_cache(maxsize=2)
     async def get_agent(
-        talk_value: float,
-        keywords: tuple[tuple[str, float]],
+        gate_config: TimeGateConfig,
+        limiter_config: ActivateLimiterConfig,
         reasoning_effort: Literal["high", "max"] = "max",
     ):
         return create_agent(
@@ -264,7 +266,8 @@ async def create_agent_service():
             middleware=[
                 handle_input,
                 TimeGateMiddleware(
-                    config={"talk_value": talk_value, "keywords": list(keywords)}
+                    gate_config=gate_config,
+                    limiter_config=limiter_config,
                 ),
                 hardness,
                 generate_prompt,
