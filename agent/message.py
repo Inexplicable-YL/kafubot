@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 from sekaibot.adapter.cqhttp.message import CQHTTPMessage, CQHTTPMessageSegment
 from sekaibot.internal.message import Message, MessageSegment
 
-from agent.commons.image import ImageReadResult
-from agent.commons.meme import search_meme
+from agent.multimodal.image import ImageReadResult
+from agent.multimodal.meme import search_meme
 
 __all__ = ["QQMessage", "QQMessageSegment", "escape"]
 

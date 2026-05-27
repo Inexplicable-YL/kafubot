@@ -22,9 +22,9 @@ from sqlalchemy import DateTime, Integer, Text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from agent.commons.image import ImageReadResult  # noqa: TC001
 from agent.message import QQMessage, QQMessageSegment  # noqa: TC001
-from agent.prompts.image import PRIVATE_HUMAN_PROMPT, PRIVATE_SYSTEM_PROMPT
+from agent.multimodal.image import ImageReadResult  # noqa: TC001
+from agent.prompts.private import PRIVATE_HUMAN_PROMPT, PRIVATE_SYSTEM_PROMPT
 from agent.utils import LimitedSQLChatMessageHistory, content_to_text, to_reply
 
 if TYPE_CHECKING:

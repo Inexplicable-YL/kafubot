@@ -389,7 +389,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 hits=[],
             )
 
-        chat_namespace = (self.namespace_root, "chats", ctx["group_id"])
+        chat_namespace = (self.namespace_root, "chats", ctx["chat_id"])
         if resolution.user_id:
             user_namespace = (self.namespace_root, "users", resolution.user_id)
             namespaces = [user_namespace, chat_namespace]
@@ -734,11 +734,11 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         ctx: ManagerContext,
         store: BaseStore,
     ) -> str:
-        group_id = ctx["group_id"]
+        chat_id = ctx["chat_id"]
         sections: list[str] = []
         chat_hits = await self._recent_memory_hits(
             store=store,
-            namespace=(self.namespace_root, "chats", group_id),
+            namespace=(self.namespace_root, "chats", chat_id),
             limit=RECENT_MEMORY_CONTEXT_LIMIT,
         )
         sections.append(
@@ -756,7 +756,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         for user_id, user_name in user_names_by_id.items():
             user_hits = await self._recent_memory_hits(
                 store=store,
-                namespace=(self.namespace_root, "users", user_id, group_id),
+                namespace=(self.namespace_root, "users", user_id, chat_id),
                 limit=RECENT_MEMORY_CONTEXT_LIMIT,
             )
             title = f"{user_name}({user_id})" if user_name else user_id
@@ -850,9 +850,9 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         memory_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         namespace = (
-            (self.namespace_root, "users", candidate.user_id, ctx["group_id"])
+            (self.namespace_root, "users", candidate.user_id, ctx["chat_id"])
             if candidate.user_id
-            else (self.namespace_root, "chats", ctx["group_id"])
+            else (self.namespace_root, "chats", ctx["chat_id"])
         )
 
         value: dict[str, Any] = {
@@ -862,7 +862,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             "user_id": candidate.user_id or None,
             "user_name": candidate.user_name or None,
             "source_message_ids": candidate.source_message_ids,
-            "chat_id": ctx["group_id"],
+            "chat_id": ctx["chat_id"],
             "tags": candidate.tags,
             "event_time_start": normalize_time_string(candidate.time_start),
             "event_time_end": normalize_time_string(candidate.time_end),

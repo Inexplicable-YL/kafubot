@@ -13,7 +13,7 @@ from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from pydantic import BaseModel, ConfigDict
 
-from agent.commons.image import get_analyzer, read_image
+from agent.multimodal.image import get_analyzer, read_image
 
 load_dotenv()
 

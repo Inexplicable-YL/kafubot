@@ -12,8 +12,8 @@ from langchain.agents import AgentState
 from langchain_core.messages import AnyMessage
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent.commons.image import ImageReadResult  # noqa: TC001
 from agent.message import QQMessage  # noqa: TC001
+from agent.multimodal.image import ImageReadResult  # noqa: TC001
 
 load_dotenv()
 
@@ -41,7 +41,7 @@ class UserMessage(BaseModel):
 
 
 class OutputMessage(TypedDict):
-    type: Literal["reply", "finish", "stop", "meme"]
+    type: Literal["reply", "finish", "stop", "meme", "limit"]
     data: dict[str, Any]
 
 
@@ -68,4 +68,5 @@ class ManagerContext(TypedDict):
     meme_reply_ratio: float
     is_tome: bool
     node: Any
-    group_id: str
+    chat_id: str
+    unrestricted: bool

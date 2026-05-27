@@ -12,15 +12,19 @@ from sekaibot.adapter.cqhttp.event import GroupMessageEvent
 from sekaibot.config import ConfigModel
 from sekaibot.log import logger
 
-from agent import UserMessage, clear_session_history, create_agent_service
+from agent import (
+    UserMessage,
+    clear_session_history,
+    create_agent_service,
+)
 from agent.base import ManagerContext, ManagerState
-from agent.commons.image import (
+from agent.message import QQMessage, QQMessageSegment
+from agent.multimodal.image import (
     ImageReadResult,
     get_analyzer,
     read_image,
 )
-from agent.commons.meme import add_memes
-from agent.message import QQMessage, QQMessageSegment
+from agent.multimodal.meme import add_memes
 
 MESSAGES_LIMIT = 30
 BACKUP_MESSAGES_LIMIT = 20
@@ -28,7 +32,7 @@ BACKUP_PENDING_COUNTS_LIMIT = 10
 
 EXTRA_PROMPT_MAX_HISTORY = 5
 
-LIMITER_DB = "./.database/limiter.db"
+LIMITER_DB = "sqlite+aiosqlite:///./.database/group_limiter.db"
 
 DEFAULT_USERNAME = "陌生用户"
 
@@ -84,9 +88,6 @@ class Histories(BaseModel):
     )
     backup_messages: deque[UserMessage] = Field(
         default_factory=lambda: deque(maxlen=BACKUP_MESSAGES_LIMIT)
-    )
-    backup_pending_counts: deque[int] = Field(
-        default_factory=lambda: deque(maxlen=BACKUP_PENDING_COUNTS_LIMIT)
     )
     on_handle: bool = False
     handle_condition: anyio.Condition = Field(default_factory=anyio.Condition)
@@ -266,7 +267,8 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 node=self,
                 average_reply_count=self.config.average_reply_count,
                 meme_reply_ratio=self.config.meme_reply_ratio,
-                group_id=str(self.event.group_id),
+                chat_id=str(self.event.group_id),
+                unrestricted=(self.event.group_id in self.config.unrestricted_groups),
             ),
         )
 
@@ -282,9 +284,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                     message_id="",
                     is_tome=False,
                 )
-            )
-            group_event.history_storage.backup_pending_counts.append(
-                len(current_messages)
             )
             return None
         return current_messages

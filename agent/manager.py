@@ -29,13 +29,21 @@ from agent.base import (
     UserMessage,
 )
 from agent.builder import create_agent
-from agent.extensions import TOOLS
-from agent.extensions.get_msgs import ContextAcquisitionMiddleware
-from agent.extensions.logs import AgentDebugLogMiddleware
-from agent.extensions.memory import LongMemoryMiddleware
+from agent.extensions import (
+    ActivateLimitMiddleware,
+    AgentDebugLogMiddleware,
+    ContextAcquisitionMiddleware,
+    LongMemoryMiddleware,
+    TimeGateMiddleware,
+    query_image,
+    search_song,
+    view_forward_message,
+)
+from agent.extensions.limiter import ActivateLimiterConfig
+from agent.extensions.time_gate import TimeGateConfig
 from agent.history import get_session_history
 from agent.interaction import InteractionMiddleware
-from agent.prompts.prompt import (
+from agent.prompts.manager import (
     BOT_NAME,
     IDENTITY,
     LANGUAGE_STYLE,
@@ -47,11 +55,6 @@ from agent.prompts.prompt import (
     MORE_MEME,
     SPECIAL_REMINDER,
     TOOL_PROMOT,
-)
-from agent.time_gate import (
-    ActivateLimiterConfig,
-    TimeGateConfig,
-    TimeGateMiddleware,
 )
 from agent.utils import content_to_text, terminal_trend
 
@@ -166,16 +169,20 @@ async def hardness(
                 dt = cast("datetime", dt)
         else:
             ai_reply.append(False)
-    real_average_count = float(
-        pd.Series(reply_counts).ewm(alpha=0.1).mean().iloc[-1]
-    ) * (1 + 0.5 * terminal_trend(ai_reply))
-    print(real_average_count, runtime.context["average_reply_count"])
-    real_meme_ratio = (
-        sum(meme_reply)
-        / (len(meme_reply) - sum(meme_reply))
-        * (1 + 0.5 * terminal_trend(meme_reply))
-    )
-    print(real_meme_ratio, runtime.context["meme_reply_ratio"])
+    if len(reply_counts) > 0:
+        real_average_count = float(
+            pd.Series(reply_counts).ewm(alpha=0.1).mean().iloc[-1]
+        ) * (1 + 0.5 * terminal_trend(ai_reply))
+        print(real_average_count, runtime.context["average_reply_count"])
+    else:
+        real_average_count = 1.0
+    if len(meme_reply) > 1 and (no_meme := len(meme_reply) - sum(meme_reply)):
+        real_meme_ratio = (
+            sum(meme_reply) / no_meme * (1 + 0.5 * terminal_trend(meme_reply))
+        )
+        print(real_meme_ratio, runtime.context["meme_reply_ratio"])
+    else:
+        real_meme_ratio = 1.0
     return {
         "real_average_count": real_average_count,
         "real_meme_ratio": real_meme_ratio,
@@ -262,15 +269,11 @@ async def create_agent_service():
     ):
         return create_agent(
             model=get_model(reasoning_effort),
-            tools=TOOLS,
+            tools=[query_image, search_song, view_forward_message],
             middleware=[
                 handle_input,
-                TimeGateMiddleware(
-                    gate_config=gate_config,
-                    limiter_config=limiter_config,
-                ),
-                hardness,
-                generate_prompt,
+                ActivateLimitMiddleware(limiter_config=limiter_config),
+                TimeGateMiddleware(gate_config=gate_config),
                 AgentDebugLogMiddleware(
                     log_path=".logs/agent_debug.jsonl",
                     log_text_limit=1000,
@@ -281,11 +284,13 @@ async def create_agent_service():
                     use_subagent=True,
                     subagent_model=get_model(reasoning_effort),
                 ),
+                hardness,
+                generate_prompt,
                 add_user_prompt,
             ],
             state_schema=ManagerState,
             context_schema=ManagerContext,
-            store=store,  # ← 闭包捕获，生命周期与 conn 绑定
+            store=store,
         )
 
     async def shutdown():

@@ -1,12 +1,23 @@
-from __future__ import annotations
-
 import asyncio
 from datetime import UTC, datetime
+from typing import Any, TypedDict
 
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    hook_config,
+)
+from langchain_core.messages import AIMessage
+from langgraph.runtime import Runtime
 from sqlalchemy import Float, Index, Integer, Text, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import NullPool
+
+from agent.base import (
+    ManagerContext,
+    ManagerState,
+    OutputMessage,
+)
 
 
 class _Base(DeclarativeBase):
@@ -30,6 +41,12 @@ class _Bucket(_Base):
     session_id: Mapped[str] = mapped_column(Text, primary_key=True)
     available: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     last_update: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class ActivateLimiterConfig(TypedDict):
+    db_url: str
+    act_limits: tuple[tuple[int, int], ...]
+    rate_limit: tuple[float, float]
 
 
 class ActivateLimiter:
@@ -164,3 +181,49 @@ class ActivateLimiter:
                 )
                 result.append((window, min(float(total.scalar_one()) / threshold, 1.0)))
             return tuple(result)
+
+
+class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
+    def __init__(
+        self,
+        limiter_config: ActivateLimiterConfig,
+    ) -> None:
+        self.limiter = ActivateLimiter(**limiter_config)
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_agent(
+        self, state: ManagerState, runtime: Runtime[ManagerContext]
+    ) -> dict[str, Any] | None:
+        _ = state
+        if runtime.context["unrestricted"]:
+            return None
+        if not await self.limiter.acquire(runtime.context["session_id"]):
+            return {
+                "jump_to": "end",
+                "outputs": [
+                    OutputMessage(
+                        type="limit",
+                        data={
+                            "quota": await self.limiter.quota(
+                                runtime.context["session_id"]
+                            ),
+                        },
+                    )
+                ],
+            }
+        return None
+
+    async def aafter_agent(
+        self, state: ManagerState, runtime: Runtime[ManagerContext]
+    ) -> dict[str, Any] | None:
+        _ = runtime
+        if runtime.context["unrestricted"]:
+            return None
+        observe = []
+        for output in state["outputs"]:
+            if output["type"] == "reply":
+                observe.append(AIMessage(output["data"]["full_text"]))
+            elif output["type"] == "meme":
+                observe.append(AIMessage(output["data"]["content"]))
+        if observe:
+            await self.limiter.record(runtime.context["session_id"])

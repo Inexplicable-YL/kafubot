@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from agent.base import UserMessage
-from agent.commons.image import ImageReadResult
 from agent.message import QQMessage
+from agent.multimodal.image import ImageReadResult
 from agent.utils import LimitedSQLChatMessageHistory, content_to_text
 
 DB_URL = "sqlite+aiosqlite:///./.database/agent_history.db"
