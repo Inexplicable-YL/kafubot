@@ -86,15 +86,20 @@ def query_image(
     runtime: ToolRuntime[ManagerContext, ManagerState],
 ) -> str:
     message: UserMessage | None = None
-    for msg in reversed(runtime.state["histories"]):
-        if (
-            isinstance(msg, HumanMessage)
-            and (group_msg := msg.additional_kwargs.get("raw"))
-            and isinstance(group_msg, UserMessage)
-            and group_msg.message_id == message_id.strip()
-        ):
-            message = group_msg
+    for msg in reversed(runtime.state["inputs"]):
+        if msg.message_id == message_id.strip():
+            message = msg
             break
+    if not message:
+        for msg in reversed(runtime.state["histories"]):
+            if (
+                isinstance(msg, HumanMessage)
+                and (group_msg := msg.additional_kwargs.get("raw"))
+                and isinstance(group_msg, UserMessage)
+                and group_msg.message_id == message_id.strip()
+            ):
+                message = group_msg
+                break
     if not message:
         return "没有找到对应的消息。请检查 message_id 是否正确。"
     if not message.images:

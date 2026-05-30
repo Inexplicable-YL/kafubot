@@ -180,11 +180,11 @@ class QueryMemoryInput(BaseModel):
     )
     time_start: str = Field(
         default="",
-        description="起始时间，可填写时间戳或可解析时间文本。",
+        description="起始时间，可填写时间戳或 ISO 时间。",
     )
     time_end: str = Field(
         default="",
-        description="结束时间，可填写时间戳或可解析时间文本。",
+        description="结束时间，可填写时间戳或 ISO 时间。",
     )
 
 

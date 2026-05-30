@@ -297,7 +297,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
 
         inputs = TypeAdapter(list[UserMessage]).validate_python(
             state["inputs"] or state["messages"]
-        )
+        )[-self.max_history_window :]
         currents = [
             HumanMessage(
                 content=item.as_content(),
@@ -384,20 +384,19 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             [ModelRequest[ManagerContext]], Awaitable[ModelResponse[Any]]
         ],
     ) -> ModelResponse[Any] | AIMessage | ExtendedModelResponse[Any]:
+        request = request.override(
+            messages=cast(
+                "list[AnyMessage]",
+                self.display_messages[request.runtime.context["session_id"]],
+            )
+            + request.messages
+        )
         resp = await handler(request)
         for _ in range(self.mas_retries - 1):
             last = resp.result[-1]
             if not (isinstance(last, AIMessage) and last.content):
                 break
-            resp = await handler(
-                request.override(
-                    messages=cast(
-                        "list[AnyMessage]",
-                        self.display_messages[request.runtime.context["session_id"]],
-                    )
-                    + request.messages
-                )
-            )
+            resp = await handler(request)
         return resp
 
     def _get_input_messages(
