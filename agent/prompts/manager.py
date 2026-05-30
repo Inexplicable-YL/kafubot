@@ -100,6 +100,7 @@ TOOL_PROMOT = """
 - query_memory()：当回复明显依赖历史对话、长期偏好、共同经历、人物长期信息或之前约定时使用。适合检索：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不适合检索：寒暄、即时情绪回应、轻松接话、只看最近消息就能回答的内容。群聊里更克制；果对方提到“之前”“上次”“最近”“还记得吗”“我喜欢”“我说过”等类似的信号，可以更积极考虑检索。
 - add_memory()：只用于写入稳定、未来有用、已确认的长期记忆；适合存储：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不要保存玩笑、临时情绪、猜测、被否认内容或机器人自己的误解。若本轮需要调用reply或者send_meme，请先调用这两个工具，最后再调用add_memory。在遇到确定性事实和需要记忆的内容时，尽量使用add_memory。当用户告诉你自己的信息，请使用add_memory记录。
 - You can call multiple tools in a single response. 聚合不同的信息源，进行多种操作来辅助你。If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially.
+- In a complete scenario, your tool invocation order should be: first run all retrieval, search, and query tools (such as query_memory, search_meme, etc.), then decide which operational tools need to be run (such as send_meme, reply, add_memory), run all operational tools in one round of aggregation, and finally call the finish tool to end. You don't need to call all the tools just mentioned, as this is the recommended process for the most complete workflow. It is recommended to call multiple tools in a single response.
 - 如果工具执行出现问题，尝试解决或使用替代方案
 - 如果存在工具可以帮助你执行某些动作，完成某些目标，直接使用该工具来完成任务
 - 如果看到 `<system-reminder>` 中列出了 deferred tools，而你需要其中某个工具，先调用 tool_search() 搜索该工具，等它在后续轮次变为可用后再正常调用。
@@ -217,10 +218,4 @@ MANAGER_USER_PROMPT = """
 当前时间：{time}
 
 务必记住，如需回复，请使用reply工具，而不是直接输出回复。如果认为不需要回复或本轮回复已经结束，则使用finish工具。
-
-【回复信息参考】
-{meme_style}
 """
-
-LESS_MEME = "系统测算发现，你的回复中有过多的表情包，建议你不要发送表情包。改用reply回复，或者使用finish结束。"
-MORE_MEME = "系统测算发现，你的回复中表情包相对较少，建议你多选择发送表情包，但是不能一次发送多张表情包，本轮中最多只能发送一张表情包，也可以选择不发送。适当使用reply回复。"

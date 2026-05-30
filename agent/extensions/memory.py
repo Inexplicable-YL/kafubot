@@ -176,7 +176,7 @@ class QueryMemoryInput(BaseModel):
     )
     user_name: str = Field(
         default="",
-        description="人物名称。提供后优先按 state['user_map'] 解析为 user_id；无法匹配则降级为关键词模糊检索。",
+        description="人物名称。提供后优先用于解析 user_id；无法匹配则降级为关键词模糊检索。",
     )
     time_start: str = Field(
         default="",
@@ -209,7 +209,7 @@ class AddMemoryManualInput(BaseModel):
     )
     user_name: str = Field(
         default="",
-        description="人物名称。若提供，会优先通过 state['user_map'] 解析 user_id。",
+        description="人物名称。若提供，会优先用于解析 user_id。",
     )
     time_start: str = Field(
         default="",
@@ -276,6 +276,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self.subagent_model = subagent_model
         self.namespace_root = _clean_text(namespace_root) or "long_memory"
         self.inject_tool_hint = inject_tool_hint
+        self._user_map: dict[str, str] = {}
         self._recent_memory_cache: dict[tuple[str, ...], list[LongMemoryHit]] = {}
         self.tools = self._build_tools()
 
@@ -566,7 +567,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             )
 
         messages: dict[str, tuple[int, UserMessage]] = {}
-        for message in runtime.state["full_messages"]:
+        for message in runtime.state["histories"]:
             if isinstance(message, HumanMessage) and isinstance(
                 raw := message.additional_kwargs.get("raw"), UserMessage
             ):
@@ -913,10 +914,12 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         if not name:
             return NormalizedUserResolution()
 
-        user_map = state.get("user_map", {}) or {}
+        self._user_map = self._user_map | {
+            msg.user: msg.user_id for msg in state["inputs"]
+        }
 
-        if name in user_map:
-            user_id = _clean_text(user_map[name])
+        if name in self._user_map:
+            user_id = _clean_text(self._user_map[name])
             if not user_id:
                 return NormalizedUserResolution(
                     user_name=name,
@@ -932,7 +935,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         normalized_name = loose_name(name)
         exact_matches = [
             (key, user_id)
-            for key, value in user_map.items()
+            for key, value in self._user_map.items()
             if normalized_name
             and loose_name(key) == normalized_name
             and (user_id := _clean_text(value))

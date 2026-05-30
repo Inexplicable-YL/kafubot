@@ -86,7 +86,7 @@ def query_image(
     runtime: ToolRuntime[ManagerContext, ManagerState],
 ) -> str:
     message: UserMessage | None = None
-    for msg in runtime.state["full_messages"]:
+    for msg in reversed(runtime.state["histories"]):
         if (
             isinstance(msg, HumanMessage)
             and (group_msg := msg.additional_kwargs.get("raw"))

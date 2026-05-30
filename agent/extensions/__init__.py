@@ -1,6 +1,6 @@
-from agent.extensions.get_msgs import ContextAcquisitionMiddleware
 from agent.extensions.limiter import ActivateLimitMiddleware
 from agent.extensions.logs import AgentDebugLogMiddleware
+from agent.extensions.meme import MemeSendingMiddleware
 from agent.extensions.memory import LongMemoryMiddleware
 from agent.extensions.query_image import query_image
 from agent.extensions.search_song import search_song
@@ -15,7 +15,7 @@ __all__ = [
     "TimeGateMiddleware",
     "ActivateLimitMiddleware",
     "DeferredToolMiddleware",
-    "ContextAcquisitionMiddleware",
     "AgentDebugLogMiddleware",
     "LongMemoryMiddleware",
+    "MemeSendingMiddleware",
 ]

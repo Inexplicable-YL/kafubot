@@ -1,3 +1,4 @@
+from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -10,7 +11,7 @@ from langchain.agents.middleware.types import ToolCallRequest
 from langchain.messages import ToolMessage
 from langchain.tools import BaseTool, ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.types import Command
+from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field
 
 from agent.base import ManagerContext, ManagerState
@@ -31,47 +32,24 @@ class SearchTool(BaseModel):
 
 
 class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
-    tools: Sequence[BaseTool]
+    deferred_tools: list[BaseTool]
+    display_tools: dict[str, list[BaseTool]]
 
     def __init__(
         self,
         deferred_tools: Sequence[BaseTool],
     ) -> None:
-        self.deferred_tools_by_name = {tool.name: tool for tool in deferred_tools}
-        self.deferred_tools = list(self.deferred_tools_by_name.values())
+        self.deferred_tools = list(deferred_tools)
+        self.display_tools = defaultdict(list)
         self.tools = [
             tool(
                 "search_tool",
                 args_schema=SearchTool,
                 description="在 deferred tools 列表中按名称或关键词搜索工具，并将命中的工具加入后续轮次的可用工具列表。",
-            )(self._search_tool)
+            )(self.search_tool)
         ]
 
-    def _get_display_tools_dict(self, messages: Sequence[Any]) -> dict[str, BaseTool]:
-        display_tools_dict: dict[str, BaseTool] = {}
-        for msg in messages:
-            if not isinstance(msg, ToolMessage):
-                continue
-            if (
-                names := msg.additional_kwargs.get("search_tool_result_names")
-            ) and isinstance(names, list):
-                display_tools_dict.update(
-                    {
-                        name: tool
-                        for name in names
-                        if isinstance(name, str)
-                        and (tool := self.deferred_tools_by_name.get(name))
-                    }
-                )
-            elif (
-                results := msg.additional_kwargs.get("search_tool_results")
-            ) and isinstance(results, list):
-                display_tools_dict.update(
-                    {tool.name: tool for tool in results if isinstance(tool, BaseTool)}
-                )
-        return display_tools_dict
-
-    def _search_tool(
+    def search_tool(
         self,
         query: str,
         limit: int,
@@ -80,9 +58,11 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
         if not query.strip():
             return "tool_search 需要提供非空的 `query` 字符串参数。"
 
-        display_tools_dict = self._get_display_tools_dict(
-            runtime.state.get("messages", [])
-        )
+        deferred_tools_dict = {tool.name: tool for tool in self.deferred_tools}
+        display_tools_dict = {
+            tool.name: tool
+            for tool in self.display_tools[runtime.context["session_id"]]
+        }
         normalized_query = query.strip().casefold()
         scored_matches: list[tuple[int, str, BaseTool]] = []
         query_terms = [
@@ -91,7 +71,7 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
             if term
         ]
 
-        for tool_name, tool_spec in self.deferred_tools_by_name.items():
+        for tool_name, tool_spec in deferred_tools_dict.items():
             lower_name = tool_name.casefold()
             lower_description = tool_spec.description.casefold()
             score = 0
@@ -129,6 +109,9 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
                 "未找到匹配的 deferred tools，请尝试更完整的工具名、前缀或其他关键词。"
             )
 
+        self.display_tools[runtime.context["session_id"]] += [
+            t for t in matched_tool_specs if t.name not in display_tools_dict
+        ]
         content_lines: list[str] = [
             f"已找到 {len(matched_tool_names)} 个 deferred tools，它们会在后续轮次中加入可用工具列表：",
             *[
@@ -136,18 +119,9 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
                 for tool_name in matched_tool_names
             ],
         ]
-        return Command(
-            update={
-                "messages": [
-                    ToolMessage(
-                        content="\n".join(content_lines),
-                        tool_call_id=runtime.tool_call_id,
-                        additional_kwargs={
-                            "search_tool_result_names": matched_tool_names
-                        },
-                    )
-                ],
-            }
+        return ToolMessage(
+            content="\n".join(content_lines),
+            tool_call_id=runtime.tool_call_id,
         )
 
     def wrap_tool_call(
@@ -156,10 +130,12 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
         handler: Callable[[ToolCallRequest], Any],
     ) -> Any:
         if request.tool is None:
-            display_tools_by_name = self._get_display_tools_dict(
-                request.state.get("messages", [])
-            )
-            if tool := display_tools_by_name.get(request.tool_call["name"]):
+            assert request.runtime.context
+            display_tools_dict = {
+                tool.name: tool
+                for tool in self.display_tools[request.runtime.context["session_id"]]
+            }
+            if tool := display_tools_dict.get(request.tool_call["name"]):
                 return handler(request.override(tool=tool))
         return handler(request)
 
@@ -169,10 +145,12 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
         handler: Callable[[ToolCallRequest], Awaitable[Any]],
     ) -> Any:
         if request.tool is None:
-            display_tools_by_name = self._get_display_tools_dict(
-                request.state.get("messages", [])
-            )
-            if tool := display_tools_by_name.get(request.tool_call["name"]):
+            assert request.runtime.context
+            display_tools_dict = {
+                tool.name: tool
+                for tool in self.display_tools[request.runtime.context["session_id"]]
+            }
+            if tool := display_tools_dict.get(request.tool_call["name"]):
                 return await handler(request.override(tool=tool))
         return await handler(request)
 
@@ -183,7 +161,10 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
             [ModelRequest[ManagerContext]], Awaitable[ModelResponse[Any]]
         ],
     ) -> ModelResponse[Any] | AIMessage:
-        display_tools_dict = self._get_display_tools_dict(request.messages)
+        display_tools_dict = {
+            tool.name: tool
+            for tool in self.display_tools[request.runtime.context["session_id"]]
+        }
         deferred_tools = list(
             {
                 tool.name: tool
@@ -205,3 +186,15 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
                 messages=request.messages + [remind_message],
             )
         )
+
+    async def abefore_agent(
+        self, state: ManagerState, runtime: Runtime[ManagerContext]
+    ) -> dict[str, Any] | None:
+        _ = state
+        self.display_tools[runtime.context["session_id"]] = []
+
+    async def aafter_agent(
+        self, state: ManagerState, runtime: Runtime[ManagerContext]
+    ) -> dict[str, Any] | None:
+        _ = state
+        self.display_tools[runtime.context["session_id"]] = []

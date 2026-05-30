@@ -186,9 +186,15 @@ class ActivateLimiter:
 class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     def __init__(
         self,
-        limiter_config: ActivateLimiterConfig,
+        db_url: str,
+        act_limits: tuple[tuple[int, int], ...],
+        rate_limit: tuple[float, float] | None = None,
     ) -> None:
-        self.limiter = ActivateLimiter(**limiter_config)
+        self.limiter = ActivateLimiter(
+            db_url=db_url,
+            act_limits=act_limits,
+            rate_limit=rate_limit,
+        )
 
     @hook_config(can_jump_to=["end"])
     async def abefore_agent(

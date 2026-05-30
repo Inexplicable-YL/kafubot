@@ -107,7 +107,6 @@ class PrivateAgentConfig(ConfigModel):
     reply_keywords: set[tuple[str, float]] = set()
     clear_keywords: set[str] = set()
     average_reply_count: float = 1.5
-    meme_reply_ratio: float = 0.6
     # (requests_per_second, max_bucket_size)
     rate_limit: tuple[float, float] = (1.0, 1.0)
     # (window_seconds, threshold)
@@ -337,6 +336,9 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
             get_agent, close_agent = await create_agent_service()
             Bot.bot_exit_hook(close_agent)
             self.node_state.agent = await get_agent(
+                interaction_config={
+                    "average_reply_count": self.config.average_reply_count,
+                },
                 gate_config={
                     "talk_value": self.config.talk_value,
                     "keywords": set(self.config.reply_keywords),
@@ -352,19 +354,14 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
             ManagerState(
                 messages=[],
                 inputs=messages,
-                history_messages=[],
-                current_messages=[],
-                early_messages=[],
-                full_messages=[],
                 outputs=[],
-                user_map={},
+                currents=[],
+                histories=[],
             ),
             context=ManagerContext(
                 session_id=session_id,
                 is_tome=True,
                 node=self,
-                average_reply_count=self.config.average_reply_count,
-                meme_reply_ratio=self.config.meme_reply_ratio,
                 chat_id=str(self.event.user_id),
                 unrestricted=False,
             ),

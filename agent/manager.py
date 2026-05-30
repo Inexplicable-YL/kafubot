@@ -4,36 +4,31 @@ from functools import cache
 from typing import Any, Literal, cast
 
 import aiosqlite
-import pandas as pd
 from dotenv import load_dotenv
 from langchain.agents.middleware import (
     AgentMiddleware,
     ModelRequest,
     ModelResponse,
-    before_agent,
     dynamic_prompt,
     wrap_model_call,
 )
 from langchain.agents.middleware.types import _CallableReturningSystemMessage
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_deepseek import ChatDeepSeek
+from langchain_core.messages import HumanMessage
+from langchain_deepseek.chat_models import DEFAULT_API_BASE, ChatDeepSeek
 from langchain_openai import OpenAIEmbeddings
-from langgraph.runtime import Runtime
 from langgraph.store.sqlite import AsyncSqliteStore
-from pydantic import TypeAdapter
 
 from agent.base import (
     MODEL_VISIBLE_TZ,
     ManagerContext,
     ManagerState,
-    UserMessage,
 )
 from agent.builder import create_agent
 from agent.extensions import (
     ActivateLimitMiddleware,
     AgentDebugLogMiddleware,
-    ContextAcquisitionMiddleware,
     LongMemoryMiddleware,
+    MemeSendingMiddleware,
     TimeGateMiddleware,
     query_image,
     search_song,
@@ -42,21 +37,18 @@ from agent.extensions import (
 from agent.extensions.limiter import ActivateLimiterConfig
 from agent.extensions.time_gate import TimeGateConfig
 from agent.history import get_session_history
-from agent.interaction import InteractionMiddleware
+from agent.interaction import InteractionConfig, InteractionMiddleware
 from agent.prompts.manager import (
     BOT_NAME,
     IDENTITY,
     LANGUAGE_STYLE,
-    LESS_MEME,
     MANAGER_PROMPT,
     MANAGER_USER_PROMPT,
     MANAGER_WITH_DECISION_PROMPT,
     MEME_PROMPT,
-    MORE_MEME,
     SPECIAL_REMINDER,
     TOOL_PROMOT,
 )
-from agent.utils import content_to_text, terminal_trend
 
 load_dotenv()
 
@@ -94,110 +86,8 @@ def generate_prompt(request: ModelRequest[ManagerContext]) -> str:
     )
 
 
-@before_agent
-async def handle_input(
-    state: ManagerState,
-    runtime: Runtime[ManagerContext],
-) -> dict[str, Any]:
-    inputs = TypeAdapter(list[UserMessage]).validate_python(
-        state["inputs"] or state["messages"]
-    )
-    currents = [
-        HumanMessage(
-            content=item.as_content(),
-            additional_kwargs={"raw": item},
-        )
-        for item in inputs
-    ]
-    session_id = runtime.context.get("session_id")
-    if not isinstance(session_id, str) or not session_id:
-        raise ValueError("session_id is required")
-    history_messages = await get_session_history(session_id).aget_messages()
-    histories = [
-        HumanMessage(
-            content=f"<bot-message user=可不>\n{content_to_text(message.content)}\n</bot-message>"
-        )
-        if isinstance(message, AIMessage)
-        else message
-        for message in history_messages
-    ]
-    messages = (histories + currents)[-HISTORY_WINDOW:]
-    early_messages = (histories + currents)[:-HISTORY_WINDOW]
-
-    user_map = {msg.user: msg.user_id for msg in inputs} | {
-        msg.user: msg.user_id
-        for msg in [
-            TypeAdapter(UserMessage).validate_python(msg.additional_kwargs.get("raw"))
-            for msg in history_messages
-            if isinstance(msg, HumanMessage) and msg.additional_kwargs.get("raw")
-        ]
-    }
-    prompt_variables = {
-        key: value for key, value in state.items() if key not in {"messages"}
-    }
-    return {
-        **prompt_variables,
-        "inputs": inputs,
-        "messages": messages,
-        "history_messages": history_messages,
-        "current_messages": currents,
-        "early_messages": early_messages,
-        "full_messages": history_messages + currents,
-        "user_map": user_map,
-    }
-
-
-@before_agent(state_schema=ManagerState)
-async def hardness(
-    state: ManagerState,
-    runtime: Runtime[ManagerContext],
-) -> dict[str, Any]:
-    ai_reply: list[bool] = []
-    meme_reply: list[bool] = []
-    reply_counts: list[int] = []
-    for message in state["full_messages"]:
-        if isinstance(message, AIMessage):
-            ai_reply.append(True)
-            if "MSG:meme" not in message.content:
-                meme_reply.append(False)
-                reply_counts.append(
-                    len(content_to_text(message.content).strip().split("\n"))
-                )
-            else:
-                meme_reply.append(True)
-            if dt := message.additional_kwargs.get("created_at"):
-                dt = cast("datetime", dt)
-        else:
-            ai_reply.append(False)
-    if len(reply_counts) > 0:
-        real_average_count = float(
-            pd.Series(reply_counts).ewm(alpha=0.1).mean().iloc[-1]
-        ) * (1 + 0.5 * terminal_trend(ai_reply))
-        print(real_average_count, runtime.context["average_reply_count"])
-    else:
-        real_average_count = 1.0
-    if len(meme_reply) > 1 and (no_meme := len(meme_reply) - sum(meme_reply)):
-        real_meme_ratio = (
-            sum(meme_reply) / no_meme * (1 + 0.5 * terminal_trend(meme_reply))
-        )
-        print(real_meme_ratio, runtime.context["meme_reply_ratio"])
-    else:
-        real_meme_ratio = 1.0
-    return {
-        "real_average_count": real_average_count,
-        "real_meme_ratio": real_meme_ratio,
-    }
-
-
 @wrap_model_call_async(state_schema=ManagerState)
-async def add_user_prompt(
-    request: ModelRequest[ManagerContext], handler
-) -> ModelResponse:
-    state = cast("ManagerState", request.state)
-    if state.get("real_meme_ratio", 0.6) > request.runtime.context["meme_reply_ratio"]:
-        meme_style = LESS_MEME
-    else:
-        meme_style = MORE_MEME
+async def add_time(request: ModelRequest[ManagerContext], handler) -> ModelResponse:
     return await handler(
         request.override(
             messages=request.messages
@@ -207,7 +97,6 @@ async def add_user_prompt(
                         time=datetime.now(tz=MODEL_VISIBLE_TZ).strftime(
                             "%Y-%m-%d %H:%M:%S"
                         ),
-                        meme_style=meme_style,
                     )
                 )
             ]
@@ -222,8 +111,8 @@ def get_model(
     if reasoning_effort == "max":
         return ChatDeepSeek(
             model=MODEL_NAME,
-            base_url=os.getenv("DEEPSEEK_BASE_URL"),
-            temperature=1.2,
+            api_base=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE),
+            temperature=0.8,
             max_retries=2,
             reasoning_effort="max",
             extra_body={
@@ -234,8 +123,8 @@ def get_model(
         )
     return ChatDeepSeek(
         model=MODEL_NAME,
-        base_url=os.getenv("DEEPSEEK_BASE_URL"),
-        temperature=1.2,
+        api_base=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE),
+        temperature=0.8,
         max_retries=2,
         reasoning_effort="high",
         extra_body={
@@ -263,30 +152,34 @@ async def create_agent_service():
     )
 
     async def get_agent(
+        interaction_config: InteractionConfig,
         gate_config: TimeGateConfig,
         limiter_config: ActivateLimiterConfig,
-        reasoning_effort: Literal["high", "max"] = "max",
     ):
+        interaction_config = (
+            InteractionConfig(
+                reply_model=get_model("high"), get_session_history=get_session_history
+            )
+            | interaction_config
+        )
         return create_agent(
-            model=get_model(reasoning_effort),
+            model=get_model("max"),
             tools=[query_image, search_song, view_forward_message],
             middleware=[
-                handle_input,
-                ActivateLimitMiddleware(limiter_config=limiter_config),
-                TimeGateMiddleware(gate_config=gate_config),
+                InteractionMiddleware(**interaction_config),
+                ActivateLimitMiddleware(**limiter_config),
+                TimeGateMiddleware(**gate_config),
                 AgentDebugLogMiddleware(
                     log_path=".logs/agent_debug.jsonl",
                     log_text_limit=1000,
                 ),
-                InteractionMiddleware(),
-                ContextAcquisitionMiddleware(),
+                MemeSendingMiddleware(man_send_per_turn=1),
                 LongMemoryMiddleware(
                     use_subagent=True,
-                    subagent_model=get_model(reasoning_effort),
+                    subagent_model=get_model("max"),
                 ),
-                hardness,
                 generate_prompt,
-                add_user_prompt,
+                add_time,
             ],
             state_schema=ManagerState,
             context_schema=ManagerContext,

@@ -274,9 +274,21 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
 
     def __init__(
         self,
-        gate_config: TimeGateConfig,
+        talk_value: float = 0.2,
+        velocity_alpha: float = 0.2,
+        temperature: float = 1.0,
+        relevance_decay: float = 0.4,
+        keywords: set[tuple[str, float]] | None = None,
     ) -> None:
-        self.time_gates = defaultdict(lambda: TimeGate(**gate_config))
+        self.time_gates = defaultdict(
+            lambda: TimeGate(
+                talk_value=talk_value,
+                velocity_alpha=velocity_alpha,
+                temperature=temperature,
+                relevance_decay=relevance_decay,
+                keywords=keywords or set(),
+            )
+        )
         self.snapshots = {}
 
     @hook_config(can_jump_to=["end"])
@@ -287,10 +299,8 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         time_gate = self.time_gates[session_id]
         if session_id not in self.snapshots:
             time_gate.clear()
-            self.snapshots[session_id] = time_gate.observe(state["history_messages"])
-        time_gate.observe(
-            state["current_messages"], from_snapshot=self.snapshots[session_id]
-        )
+            self.snapshots[session_id] = time_gate.observe(state["histories"])
+        time_gate.observe(state["currents"], from_snapshot=self.snapshots[session_id])
         if not runtime.context["is_tome"] and (not time_gate.evaluate()):
             return {
                 "jump_to": "end",

@@ -98,7 +98,6 @@ class GroupAgentConfig(ConfigModel):
     reply_keywords: set[tuple[str, float]] = set()
     clear_keywords: set[str] = set()
     average_reply_count: float = 1.5
-    meme_reply_ratio: float = 0.6
     # (requests_per_second, max_bucket_size)
     rate_limit: tuple[float, float] = (1.0, 1.0)
     # (window_seconds, threshold)
@@ -273,6 +272,9 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             get_agent, close_agent = await create_agent_service()
             Bot.bot_exit_hook(close_agent)
             self.node_state.agent = await get_agent(
+                interaction_config={
+                    "average_reply_count": self.config.average_reply_count,
+                },
                 gate_config={
                     "talk_value": self.config.talk_value,
                     "keywords": set(self.config.reply_keywords),
@@ -288,19 +290,14 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             ManagerState(
                 messages=[],
                 inputs=current_messages,
-                history_messages=[],
-                current_messages=[],
-                early_messages=[],
-                full_messages=[],
                 outputs=[],
-                user_map={},
+                currents=[],
+                histories=[],
             ),
             context=ManagerContext(
                 session_id=group_event.session_id,
                 is_tome=group_event.message.is_tome,
                 node=self,
-                average_reply_count=self.config.average_reply_count,
-                meme_reply_ratio=self.config.meme_reply_ratio,
                 chat_id=str(self.event.group_id),
                 unrestricted=(self.event.group_id in self.config.unrestricted_groups),
             ),
@@ -333,7 +330,9 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         history_storage = group_event.history_storage
         async with history_storage.lock:
             if current_messages:
-                history_storage.messages.extendleft(current_messages)
+                new_messages = list(history_storage.messages)
+                history_storage.messages.clear()
+                history_storage.messages.extend(current_messages + new_messages)
             history_storage.on_handle = False
             async with history_storage.handle_condition:
                 history_storage.handle_condition.notify_all()

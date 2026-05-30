@@ -1,9 +1,8 @@
-import itertools
 import os
 from datetime import datetime  # noqa: TC003
 from html import escape
 from operator import add
-from typing import Annotated, Any, Literal, NotRequired
+from typing import Annotated, Any, Literal
 from typing_extensions import TypedDict
 from zoneinfo import ZoneInfo
 
@@ -45,28 +44,16 @@ class OutputMessage(TypedDict):
     data: dict[str, Any]
 
 
-class ManagerState(AgentState, extra_items=Any):
+class ManagerState(AgentState):
     inputs: list[UserMessage]
     outputs: Annotated[list[OutputMessage], add]
-
-    history_messages: list[AnyMessage]
-    current_messages: list[AnyMessage]
-    early_messages: list[AnyMessage]
-    full_messages: list[AnyMessage]
-
-    meme_id: NotRequired[itertools.count]
-
-    user_map: dict[str, str]
-
-    real_average_count: NotRequired[float]
-    real_meme_ratio: NotRequired[float]
+    currents: list[AnyMessage]
+    histories: list[AnyMessage]
 
 
 class ManagerContext(TypedDict):
-    session_id: str
-    average_reply_count: float
-    meme_reply_ratio: float
-    is_tome: bool
     node: Any
+    session_id: str
+    is_tome: bool
     chat_id: str
     unrestricted: bool
