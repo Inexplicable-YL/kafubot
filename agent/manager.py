@@ -29,13 +29,11 @@ from agent.extensions import (
     AgentDebugLogMiddleware,
     LongMemoryMiddleware,
     MemeSendingMiddleware,
-    TimeGateMiddleware,
     query_image,
     search_song,
     view_forward_message,
 )
 from agent.extensions.limiter import ActivateLimiterConfig
-from agent.extensions.time_gate import TimeGateConfig
 from agent.history import get_session_history
 from agent.interaction import InteractionConfig, InteractionMiddleware
 from agent.prompts.manager import (
@@ -49,6 +47,7 @@ from agent.prompts.manager import (
     SPECIAL_REMINDER,
     TOOL_PROMOT,
 )
+from agent.time_gate import TimeGateConfig, TimeGateMiddleware
 
 load_dotenv()
 
@@ -169,10 +168,7 @@ async def create_agent_service():
                 InteractionMiddleware(**interaction_config),
                 ActivateLimitMiddleware(**limiter_config),
                 TimeGateMiddleware(**gate_config),
-                AgentDebugLogMiddleware(
-                    log_path=".logs/agent_debug.jsonl",
-                    log_text_limit=1000,
-                ),
+                AgentDebugLogMiddleware(log_path=".logs/agent_debug.jsonl"),
                 MemeSendingMiddleware(man_send_per_turn=1),
                 LongMemoryMiddleware(
                     use_subagent=True,

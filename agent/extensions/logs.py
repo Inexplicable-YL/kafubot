@@ -29,6 +29,8 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+AGENT_LOG_TEXT_LIMIT = 8000
+
 
 class AgentDebugLogMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     """Log model responses and tool I/O for the manager agent."""
@@ -38,19 +40,13 @@ class AgentDebugLogMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     def __init__(
         self,
         *,
-        log_path: str | os.PathLike[str] | Path | None = None,
+        log_path: str | os.PathLike[str] | Path,
         log_text_limit: int | None = None,
     ) -> None:
         super().__init__()
-        self.log_path = Path(
-            log_path
-            if log_path is not None
-            else os.getenv("AGENT_LOG_PATH", ".logs/agent_debug.jsonl")
-        )
+        self.log_path = Path(log_path)
         self.log_text_limit = (
-            int(log_text_limit)
-            if log_text_limit is not None
-            else int(os.getenv("AGENT_LOG_TEXT_LIMIT", "8000"))
+            int(log_text_limit) if log_text_limit is not None else AGENT_LOG_TEXT_LIMIT
         )
 
     def _truncate(self, value: Any) -> Any:

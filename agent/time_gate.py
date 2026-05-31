@@ -35,15 +35,6 @@ class _State(Enum):
     PRIMED = auto()
 
 
-class _TimeGateSnapshot(TypedDict):
-    state: _State
-    pressure: float
-    human_velocity: float
-    human_intervals: NotRequired[list[float]]
-    last_timestamp: NotRequired[float | None]
-    relevance_maps: NotRequired[dict[str, float]]
-
-
 class _TimeGate(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -70,16 +61,19 @@ class _TimeGate(BaseModel):
     def observe(
         self,
         messages: list[AnyMessage],
-        from_snapshot: _TimeGateSnapshot | None = None,
-    ) -> _TimeGateSnapshot:
-        if from_snapshot is not None:
-            self.state = from_snapshot["state"]
-            self.pressure = from_snapshot["pressure"]
-            self.human_velocity = from_snapshot["human_velocity"]
-            self.human_intervals = deque(from_snapshot.get("human_intervals", []))
-            self.last_timestamp = from_snapshot.get("last_timestamp")
-            self.relevance_maps = from_snapshot.get("relevance_maps", {})
-
+    ) -> None:
+        if self.last_timestamp is not None:
+            messages = [
+                msg
+                for msg in messages
+                if isinstance(msg, AIMessage)
+                or (
+                    isinstance(msg, HumanMessage)
+                    and (user_msg := msg.additional_kwargs.get("raw"))
+                    and isinstance(user_msg, UserMessage)
+                    and user_msg.timestamp.timestamp() > self.last_timestamp
+                )
+            ]
         last_ai_idx = -1
         for i in range(len(messages) - 1, -1, -1):
             if isinstance(messages[i], AIMessage):
@@ -108,15 +102,6 @@ class _TimeGate(BaseModel):
         else:
             for msg in messages:
                 self._process_message(msg)
-
-        return _TimeGateSnapshot(
-            state=self.state,
-            pressure=self.pressure,
-            human_velocity=self.human_velocity,
-            human_intervals=list(self.human_intervals),
-            last_timestamp=self.last_timestamp,
-            relevance_maps=self.relevance_maps,
-        )
 
     def evaluate(self) -> bool:
         print(f"pressure: {self.pressure}, human_velocity: {self.human_velocity}")
@@ -268,7 +253,7 @@ class _TimeGate(BaseModel):
 
 class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     time_gates: dict[str, _TimeGate]
-    snapshots: dict[str, _TimeGateSnapshot]
+    initialized: dict[str, bool]
 
     def __init__(
         self,
@@ -277,6 +262,7 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         relevance_decay: float = 0.4,
         keywords: set[tuple[str, float]] | None = None,
     ) -> None:
+        self.talk_value = talk_value
         self.time_gates = defaultdict(
             lambda: _TimeGate(
                 talk_value=talk_value,
@@ -285,7 +271,7 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 keywords=keywords or set(),
             )
         )
-        self.snapshots = {}
+        self.initialized = defaultdict(lambda: False)
 
     @hook_config(can_jump_to=["end"])
     async def abefore_agent(
@@ -293,10 +279,12 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     ) -> dict[str, Any] | None:
         session_id = runtime.context["session_id"]
         time_gate = self.time_gates[session_id]
-        if session_id not in self.snapshots:
+        if not self.initialized[session_id]:
             time_gate.clear()
-            self.snapshots[session_id] = time_gate.observe(state["histories"])
-        time_gate.observe(state["currents"], from_snapshot=self.snapshots[session_id])
+            time_gate.observe(state["histories"] + state["currents"])
+            self.initialized[session_id] = True
+        else:
+            time_gate.observe(state["currents"])
         if not runtime.context["is_tome"] and (not time_gate.evaluate()):
             return {
                 "jump_to": "end",
@@ -319,9 +307,11 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             elif output["type"] == "meme":
                 observe.append(AIMessage(output["data"]["content"]))
         if observe:
-            self.snapshots[runtime.context["session_id"]] = self.time_gates[
-                runtime.context["session_id"]
-            ].observe(observe)
+            self.time_gates[runtime.context["session_id"]].observe(observe)
+        else:
+            self.time_gates[runtime.context["session_id"]].pressure *= (
+                0.2 + 0.6 * self.talk_value
+            )
 
 
 __all__ = ["TimeGateConfig", "TimeGateMiddleware"]

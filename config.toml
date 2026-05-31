@@ -27,12 +27,21 @@ superusers = ["2682064633", "3613158872", "2641460187", "group_596488203", "grou
 merge_window_seconds=5
 clear_keywords=["/clear", "/清除"]
 average_reply_count=1.3
-meme_reply_ratio=0.2
 rate_limit=[0.2, 2]
 activity_limits=[
     [3600, 20],
     [18000, 60],
     [604800, 300],
+]
+
+[node.group_agent]
+unrestricted_groups=[
+    596488203,
+    1011357049,
+    1058218429,
+    1087911123,
+    834922207,
+    895484096,
 ]
 auto_reply_groups=[
     648749016,
@@ -48,30 +57,16 @@ auto_reply_groups=[
     1074180418,
     983497050,
 ]
-
-
-
-[node.group_agent]
-unrestricted_groups=[
-    596488203,
-    1011357049,
-    1058218429,
-    1087911123,
-    834922207,
-    895484096,
-]
-
 reply_keywords=[
-    ["可不", 0.8],
+    ["可不", 0.7],
     ["星界", 0.6],
     ["花谱", 0.5],
     ["里命", 0.2],
     ["情绪", 0.1],
 ]
 clear_keywords=["/clear", "/清除"]
-talk_value=0.2
+talk_value=0.15
 average_reply_count=1.2
-meme_reply_ratio=0.2
 rate_limit=[0.2, 2]
 activity_limits=[
     [3600, 15],
