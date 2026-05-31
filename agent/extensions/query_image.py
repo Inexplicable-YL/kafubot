@@ -8,7 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent.base import ManagerContext, ManagerState, UserMessage
 
@@ -53,9 +53,8 @@ def get_image_analyzer() -> Runnable[dict[str, Any], str]:
         return " ".join(text.strip().split())
 
     model = ChatOpenAI(
-        model="kimi-k2.6",
-        api_key=SecretStr(os.getenv("KIMI_API_KEY", "")),
-        base_url=os.getenv("KIMI_BASE_URL"),
+        model="gpt-5.4-mini",
+        base_url=os.getenv("OPENAI_BASE_URL"),
         temperature=1,
         max_retries=2,
     )

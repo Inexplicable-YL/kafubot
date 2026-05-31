@@ -405,30 +405,6 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             resp = await handler(request)
         return resp
 
-    def _get_input_messages(
-        self, input_val: str | BaseMessage | Sequence[BaseMessage] | dict
-    ) -> list[BaseMessage]:
-        if isinstance(input_val, dict):
-            input_val = input_val["messages"]
-        if isinstance(input_val, str):
-            return [HumanMessage(content=input_val)]
-        if isinstance(input_val, BaseMessage):
-            return [input_val]
-        if isinstance(input_val, (list, tuple)):
-            if len(input_val) == 0:
-                return list(input_val)
-            if isinstance(input_val[0], list):
-                if len(input_val) != 1:
-                    msg = f"Expected a single list of messages. Got {input_val}."
-                    raise ValueError(msg)
-                return input_val[0]
-            return list(input_val)
-        msg = (
-            f"Expected str, BaseMessage, list[BaseMessage], or tuple[BaseMessage]. "
-            f"Got {input_val}."
-        )
-        raise ValueError(msg)
-
     def _get_output_messages(
         self, output_val: str | BaseMessage | Sequence[BaseMessage] | dict
     ) -> list[BaseMessage]:
@@ -480,15 +456,13 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         )
         return (
             RunnableLambda(_handle_prompt)
-            | prompt
-            | reply_model.with_alisteners(on_end=self._aexit_history)
+            | (prompt | reply_model).with_alisteners(on_end=self._aexit_history)
             | RunnableGenerator(to_reply)
         )
 
     async def _aexit_history(self, run: Run, config: RunnableConfig) -> None:
         new_messages: list[BaseMessage] = []
-        input_val = load(run.inputs, allowed_objects="messages")
-        input_essages = self._get_input_messages(input_val)
+        input_essages = run.inputs.get("messages", [])
         output_val = load(run.outputs, allowed_objects="messages")
         output_messages = self._get_output_messages(output_val)
 

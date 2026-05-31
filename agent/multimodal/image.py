@@ -19,7 +19,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableBranch, RunnableLambda
 from langchain_openai import ChatOpenAI
 from PIL import Image, ImageOps
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import DateTime, Integer, Text, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -363,9 +363,8 @@ def get_analyzer(
         return " ".join(text.strip().split())
 
     llm = ChatOpenAI(
-        model="kimi-k2.6",
-        api_key=SecretStr(os.getenv("KIMI_API_KEY", "")),
-        base_url=os.getenv("KIMI_BASE_URL"),
+        model="gemini-3.1-flash-lite-preview",
+        base_url=os.getenv("OPENAI_BASE_URL"),
         temperature=0.6,
         max_retries=2,
         extra_body={

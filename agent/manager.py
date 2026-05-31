@@ -26,7 +26,6 @@ from agent.base import (
 from agent.builder import create_agent
 from agent.extensions import (
     ActivateLimitMiddleware,
-    AgentDebugLogMiddleware,
     LongMemoryMiddleware,
     MemeSendingMiddleware,
     query_image,
@@ -168,7 +167,6 @@ async def create_agent_service():
                 InteractionMiddleware(**interaction_config),
                 ActivateLimitMiddleware(**limiter_config),
                 TimeGateMiddleware(**gate_config),
-                AgentDebugLogMiddleware(log_path=".logs/agent_debug.jsonl"),
                 MemeSendingMiddleware(man_send_per_turn=1),
                 LongMemoryMiddleware(
                     use_subagent=True,
