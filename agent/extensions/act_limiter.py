@@ -9,7 +9,12 @@ from langchain.agents.middleware import (
 from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
 from sqlalchemy import Float, Index, Integer, Text, delete, func, select
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import NullPool
 
@@ -66,8 +71,17 @@ class ActivateLimiter:
         if not self._limits:
             raise ValueError("至少需要一条有效限流规则")
         self._max_window = max(w for w, _ in self._limits)
-        self._use_rate_limit = rate_limit is not None
-        self._rps, self._cap = rate_limit or (1.0, 1.0)
+        if (
+            rate_limit is not None
+            and len(rate_limit) == 2
+            and rate_limit[0] > 0
+            and rate_limit[1] > 0
+        ):
+            self._use_rate_limit = True
+            self._rps, self._cap = rate_limit
+        else:
+            self._use_rate_limit = False
+            self._rps, self._cap = (1.0, 1.0)
 
         kw = {"poolclass": NullPool} if db_url.startswith("sqlite") else {}
         self._engine: AsyncEngine = create_async_engine(db_url, **kw)
@@ -95,7 +109,7 @@ class ActivateLimiter:
             )
         )
 
-    async def _check_bucket(self, session, sid: str, now: float) -> bool:
+    async def _check_bucket(self, session: AsyncSession, sid: str, now: float) -> bool:
         bucket = await session.get(_Bucket, sid)
         if bucket is None:
             if self._cap >= 1.0:

@@ -46,6 +46,7 @@ async def view_forward_message(
                 msgs.append(
                     f"<forward-message time={datetime.fromtimestamp(int(msg['time']), tz=UTC).astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')}, user={escape(msg['sender']['nickname'], quote=True)}>\n{text}\n</forward-message>"
                 )
+    full_len = len(msgs)
     if len(msgs) > limit:
         if limit % 2 == 0:
             msgs = (
@@ -60,5 +61,8 @@ async def view_forward_message(
                 + msgs[-(limit + 1) // 2 :]
             )
     if msgs:
-        return "以下是转发消息:\n\n" + "\n".join(msgs)
+        return (
+            f"以下是转发消息，共 {full_len} 条，已显示 {len(msgs) - 1} 条:\n\n"
+            + "\n".join(msgs)
+        )
     return "成功获取转发消息，但无法解析消息，请放弃获取。"

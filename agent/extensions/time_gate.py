@@ -31,7 +31,6 @@ class State(Enum):
 class TimeGateConfig(TypedDict):
     talk_value: NotRequired[float]
     velocity_alpha: NotRequired[float]
-    temperature: NotRequired[float]
     relevance_decay: NotRequired[float]
     keywords: NotRequired[set[tuple[str, float]]]
 
@@ -50,7 +49,6 @@ class TimeGate(BaseModel):
 
     talk_value: float = 0.2
     velocity_alpha: float = 0.2
-    temperature: float = 1.0
     relevance_decay: float = 0.4
     keywords: set[tuple[str, float]] = Field(default_factory=set)
 
@@ -276,7 +274,6 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         talk_value: float = 0.2,
         velocity_alpha: float = 0.2,
-        temperature: float = 1.0,
         relevance_decay: float = 0.4,
         keywords: set[tuple[str, float]] | None = None,
     ) -> None:
@@ -284,7 +281,6 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             lambda: TimeGate(
                 talk_value=talk_value,
                 velocity_alpha=velocity_alpha,
-                temperature=temperature,
                 relevance_decay=relevance_decay,
                 keywords=keywords or set(),
             )
