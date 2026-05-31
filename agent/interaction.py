@@ -88,7 +88,7 @@ class ReplyInput(BaseModel):
 
     focus: str = Field(description="要回复的目标用户消息的 message_id。")
     use_reply: bool = Field(
-        description="是否使用引用回复模式。在消息较多时，可以使用引用回复模式。其会自动引用回复focus指向的消息。只在需要时设置为True。"
+        description="是否使用引用回复模式。在消息较多时，可以使用引用回复模式。其会自动引用回复focus指向的消息。只在需要时设置为True。不要每次都设置为True！！！"
     )
     reference_info: str = Field(
         description="有助于回复的信息，之前搜集得到的事实性信息，记忆等，使用平文本格式。需要较为详细地陈述。你需要针对focus指向的消息进行回复。"
