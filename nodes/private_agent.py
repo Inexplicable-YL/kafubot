@@ -75,26 +75,6 @@ def _has_model_visible_content(message: UserMessage) -> bool:
     )
 
 
-def _fill_first_pending_image(message: UserMessage, content: str | None) -> UserMessage:
-    new_message = QQMessage()
-    replaced = False
-    for seg in message.message:
-        if (
-            not replaced
-            and seg.type in {"image", "meme"}
-            and not seg.data.get("content")
-        ):
-            replaced = True
-            if content:
-                data = dict(seg.data)
-                data["content"] = content
-                new_message += getattr(QQMessageSegment, seg.type)(**data)
-            continue
-        new_message += seg
-    message.message = new_message
-    return message
-
-
 class PrivateAgentConfig(ConfigModel):
     """私聊记录节点配置"""
 
@@ -168,12 +148,23 @@ class SessionQueueState(BaseModel):
     async def finish_image(
         self,
         message: UserMessage,
-        abstract: str | None,
+        abstracts: list[str | None],
     ) -> None:
         async with self.condition:
             self.pending_image_ids.discard(message.message_id)
-            if abstract or _has_model_visible_content(message):
-                message = _fill_first_pending_image(message, abstract)
+            if any(abstracts) or _has_model_visible_content(message):
+                new_message = QQMessage()
+                content_iter = iter(abstracts)
+                for seg in message.message:
+                    if seg.type in {"image", "meme"} and not seg.data.get("content"):
+                        content = next(content_iter, None)
+                        if content:
+                            data = dict(seg.data)
+                            data["content"] = content
+                            new_message += getattr(QQMessageSegment, seg.type)(**data)
+                        continue
+                    new_message += seg
+                message.message = new_message
                 if not message.message:
                     self.dropped_message_ids.add(message.message_id)
             else:
@@ -289,19 +280,28 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
                 await self.node_state.image_task_group.__aenter__()
             return self.node_state.image_task_group
 
-    async def analyze_image_message(self, message: UserMessage) -> str | None:
-        image, as_meme = message.images[0]
-        try:
-            async with self.image_limiter():
-                return await self.node_state.image_analyzer.ainvoke(
-                    {
-                        "image": image.base64,
-                        "phash": image.phash,
-                        "as_meme": as_meme,
-                    }
-                )
-        except Exception:
-            return None
+    async def analyze_image_message(self, message: UserMessage) -> list[str | None]:
+        results: list[str | None] = [None] * len(message.images)
+
+        async def _analyze_image(
+            index: int, image: ImageReadResult, as_meme: bool
+        ) -> None:
+            try:
+                async with self.image_limiter():
+                    results[index] = await self.node_state.image_analyzer.ainvoke(
+                        {
+                            "image": image.base64,
+                            "phash": image.phash,
+                            "as_meme": as_meme,
+                        }
+                    )
+            except Exception:
+                results[index] = None
+
+        async with anyio.create_task_group() as tg:
+            for index, (image, as_meme) in enumerate(message.images):
+                tg.start_soon(_analyze_image, index, image, as_meme)
+        return results
 
     async def start_image_analysis(
         self,
@@ -318,7 +318,7 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
             task_group = await self.ensure_image_task_group()
             task_group.start_soon(_finish_image_analysis)
         except Exception:
-            await session_state.finish_image(message, None)
+            await session_state.finish_image(message, [None] * len(message.images))
 
     async def delete_chat(self, session_id: str) -> None:
         await clear_session_history(session_id)
