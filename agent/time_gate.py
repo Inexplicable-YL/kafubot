@@ -1,6 +1,7 @@
 import math
 from bisect import bisect_left
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from enum import Enum, auto
 from typing import Any, ClassVar, NotRequired, TypedDict
 
@@ -9,7 +10,7 @@ from langchain.agents.middleware import (
     AgentMiddleware,
     hook_config,
 )
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.runtime import Runtime
 from opencc import OpenCC
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,6 +34,10 @@ class _State(Enum):
     IDLE = auto()
     ACCUMULATING = auto()
     PRIMED = auto()
+
+
+class IgnoreMessage(BaseMessage):
+    pass
 
 
 class _TimeGate(BaseModel):
@@ -60,13 +65,13 @@ class _TimeGate(BaseModel):
 
     def observe(
         self,
-        messages: list[AnyMessage],
+        messages: Sequence[BaseMessage],
     ) -> None:
         if self.last_timestamp is not None:
             messages = [
                 msg
                 for msg in messages
-                if isinstance(msg, AIMessage)
+                if isinstance(msg, AIMessage | IgnoreMessage)
                 or (
                     isinstance(msg, HumanMessage)
                     and (user_msg := msg.additional_kwargs.get("raw"))
@@ -115,9 +120,12 @@ class _TimeGate(BaseModel):
         self.last_timestamp = None
         self.relevance_maps.clear()
 
-    def _process_message(self, msg: AnyMessage) -> None:
+    def _process_message(self, msg: BaseMessage) -> None:
         if isinstance(msg, AIMessage):
             self._observe_ai()
+            return
+        if isinstance(msg, IgnoreMessage):
+            self._observe_ignore()
             return
 
         if (
@@ -165,6 +173,10 @@ class _TimeGate(BaseModel):
     def _observe_ai(self) -> None:
         self.state = _State.IDLE
         self.pressure = 0.0
+
+    def _observe_ignore(self) -> None:
+        self.state = _State.ACCUMULATING
+        self.pressure *= 0.1 + 0.8 * self.talk_value
 
     def _observe_human(self, timestamp: float, relevance: float) -> None:
         if self.last_timestamp is not None:
@@ -309,8 +321,8 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         if observe:
             self.time_gates[runtime.context["session_id"]].observe(observe)
         else:
-            self.time_gates[runtime.context["session_id"]].pressure *= (
-                0.2 + 0.6 * self.talk_value
+            self.time_gates[runtime.context["session_id"]].observe(
+                [IgnoreMessage(type="non_standard", content="ignore")]
             )
 
 

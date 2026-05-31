@@ -55,6 +55,7 @@ from agent.utils import content_to_text, to_reply
 class InteractionConfig(TypedDict):
     reply_model: NotRequired[BaseChatModel]
     get_session_history: NotRequired[Callable[..., BaseChatMessageHistory]]
+    stop_when_reply: NotRequired[bool]
     average_reply_count: NotRequired[float]
     min_history_window: NotRequired[int]
     max_history_window: NotRequired[int]
@@ -119,6 +120,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         reply_model: BaseChatModel,
         get_session_history: Callable[..., BaseChatMessageHistory],
         *,
+        stop_when_reply: bool = False,
         average_reply_count: float = 1.25,
         min_history_window: int = 20,
         max_history_window: int = 40,
@@ -134,6 +136,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         self.min_history_window = min_history_window
         self.max_history_window = max_history_window
 
+        self.stop_when_reply = stop_when_reply
         self.max_reply_per_turn = max_reply_per_turn
         self.max_turns = max_turns
         self.max_tool_calls = max_tool_calls
@@ -361,7 +364,10 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
         _ = runtime
-        if any(o["type"] in {"finish", "stop"} for o in state["outputs"]):
+        stop_tags = (
+            {"finish", "stop", "reply"} if self.stop_when_reply else {"finish", "stop"}
+        )
+        if any(o["type"] in stop_tags for o in state["outputs"]):
             return {"jump_to": "end"}
         messgaes = state["messages"]
         if sum(isinstance(x, AIMessage) for x in messgaes) >= self.max_turns:

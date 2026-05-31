@@ -338,6 +338,7 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
             self.node_state.agent = await get_agent(
                 interaction_config={
                     "average_reply_count": self.config.average_reply_count,
+                    "stop_when_reply": True,
                 },
                 gate_config={
                     "talk_value": self.config.talk_value,
