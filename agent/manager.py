@@ -34,7 +34,7 @@ from agent.extensions import (
     search_song,
     view_forward_message,
 )
-from agent.extensions.act_limiter import ActivateLimiterConfig
+from agent.extensions.limiter import ActivateLimiterConfig
 from agent.extensions.time_gate import TimeGateConfig
 from agent.history import get_session_history
 from agent.interaction import InteractionConfig, InteractionMiddleware

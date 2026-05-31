@@ -1,6 +1,6 @@
 import asyncio
 from datetime import UTC, datetime
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -51,14 +51,14 @@ class _Bucket(_Base):
 class ActivateLimiterConfig(TypedDict):
     db_url: str
     act_limits: tuple[tuple[int, int], ...]
-    rate_limit: tuple[float, float]
+    rate_limit: NotRequired[tuple[float, float] | None]
 
 
-class ActivateLimiter:
+class _ActivateLimiter:
     def __init__(
         self,
         db_url: str,
-        act_limits: tuple[tuple[int, int], ...],
+        act_limits: tuple[tuple[int, int], ...] = (),
         rate_limit: tuple[float, float] | None = None,
     ) -> None:
         """
@@ -67,10 +67,10 @@ class ActivateLimiter:
             act_limits: 请求限流规则，格式为 [(window, threshold), ...]
             rate_limit: 限流规则，格式为 (requests_per_second, max_bucket_size)
         """
-        self._limits = tuple((w, t) for w, t in act_limits if w > 0 and t > 0)
-        if not self._limits:
-            raise ValueError("至少需要一条有效限流规则")
-        self._max_window = max(w for w, _ in self._limits)
+        self._act_limits = tuple((w, t) for w, t in act_limits if w > 0 and t > 0)
+        self._use_act_limits = len(self._act_limits) > 0
+        self._max_window = max(w for w, _ in self._act_limits)
+
         if (
             rate_limit is not None
             and len(rate_limit) == 2
@@ -83,7 +83,11 @@ class ActivateLimiter:
             self._use_rate_limit = False
             self._rps, self._cap = (1.0, 1.0)
 
-        kw = {"poolclass": NullPool} if db_url.startswith("sqlite") else {}
+        kw = (
+            {"poolclass": NullPool}
+            if db_url.startswith(("sqlite", "aiosqlite"))
+            else {}
+        )
         self._engine: AsyncEngine = create_async_engine(db_url, **kw)
         self._sessionmaker = async_sessionmaker(self._engine, expire_on_commit=False)
         self._ready = False
@@ -144,7 +148,7 @@ class ActivateLimiter:
 
         async with self._sessionmaker() as s:
             await self._purge(s, session_id, t - self._max_window)
-            for window, threshold in self._limits:
+            for window, threshold in self._act_limits:
                 total = await s.execute(
                     select(func.coalesce(func.sum(_Record.weight), 0.0)).where(
                         _Record.session_id == session_id,
@@ -186,7 +190,7 @@ class ActivateLimiter:
 
         async with self._sessionmaker() as s:
             result: list[tuple[int, float]] = []
-            for window, threshold in self._limits:
+            for window, threshold in self._act_limits:
                 total = await s.execute(
                     select(func.coalesce(func.sum(_Record.weight), 0.0)).where(
                         _Record.session_id == session_id,
@@ -204,7 +208,7 @@ class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         act_limits: tuple[tuple[int, int], ...],
         rate_limit: tuple[float, float] | None = None,
     ) -> None:
-        self.limiter = ActivateLimiter(
+        self.limiter = _ActivateLimiter(
             db_url=db_url,
             act_limits=act_limits,
             rate_limit=rate_limit,
@@ -247,3 +251,6 @@ class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 observe.append(AIMessage(output["data"]["content"]))
         if observe:
             await self.limiter.record(runtime.context["session_id"])
+
+
+__all__ = ["ActivateLimitMiddleware", "ActivateLimiterConfig"]

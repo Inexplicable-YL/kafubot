@@ -22,12 +22,6 @@ from agent.base import (
 )
 
 
-class State(Enum):
-    IDLE = auto()
-    ACCUMULATING = auto()
-    PRIMED = auto()
-
-
 class TimeGateConfig(TypedDict):
     talk_value: NotRequired[float]
     velocity_alpha: NotRequired[float]
@@ -35,8 +29,14 @@ class TimeGateConfig(TypedDict):
     keywords: NotRequired[set[tuple[str, float]]]
 
 
-class TimeGateSnapshot(TypedDict):
-    state: State
+class _State(Enum):
+    IDLE = auto()
+    ACCUMULATING = auto()
+    PRIMED = auto()
+
+
+class _TimeGateSnapshot(TypedDict):
+    state: _State
     pressure: float
     human_velocity: float
     human_intervals: NotRequired[list[float]]
@@ -44,7 +44,7 @@ class TimeGateSnapshot(TypedDict):
     relevance_maps: NotRequired[dict[str, float]]
 
 
-class TimeGate(BaseModel):
+class _TimeGate(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     talk_value: float = 0.2
@@ -52,7 +52,7 @@ class TimeGate(BaseModel):
     relevance_decay: float = 0.4
     keywords: set[tuple[str, float]] = Field(default_factory=set)
 
-    state: State = Field(default=State.IDLE, repr=False)
+    state: _State = Field(default=_State.IDLE, repr=False)
     pressure: float = Field(default=0.0, repr=False)
 
     human_intervals: deque[float] = Field(
@@ -70,8 +70,8 @@ class TimeGate(BaseModel):
     def observe(
         self,
         messages: list[AnyMessage],
-        from_snapshot: TimeGateSnapshot | None = None,
-    ) -> TimeGateSnapshot:
+        from_snapshot: _TimeGateSnapshot | None = None,
+    ) -> _TimeGateSnapshot:
         if from_snapshot is not None:
             self.state = from_snapshot["state"]
             self.pressure = from_snapshot["pressure"]
@@ -109,7 +109,7 @@ class TimeGate(BaseModel):
             for msg in messages:
                 self._process_message(msg)
 
-        return TimeGateSnapshot(
+        return _TimeGateSnapshot(
             state=self.state,
             pressure=self.pressure,
             human_velocity=self.human_velocity,
@@ -120,10 +120,10 @@ class TimeGate(BaseModel):
 
     def evaluate(self) -> bool:
         print(f"pressure: {self.pressure}, human_velocity: {self.human_velocity}")
-        return self.state is State.PRIMED
+        return self.state is _State.PRIMED
 
     def clear(self) -> None:
-        self.state = State.IDLE
+        self.state = _State.IDLE
         self.pressure = 0.0
         self.human_velocity = 0.5
         self.human_intervals.clear()
@@ -178,7 +178,7 @@ class TimeGate(BaseModel):
             del self.relevance_maps[user_id]
 
     def _observe_ai(self) -> None:
-        self.state = State.IDLE
+        self.state = _State.IDLE
         self.pressure = 0.0
 
     def _observe_human(self, timestamp: float, relevance: float) -> None:
@@ -200,10 +200,10 @@ class TimeGate(BaseModel):
 
         self.pressure += 0.5 * (1 + relevance)
 
-        if self.state is State.IDLE:
+        if self.state is _State.IDLE:
             probs = self._idle_probs(self.pressure, relevance)
             self._transition(probs)
-        elif self.state is State.ACCUMULATING:
+        elif self.state is _State.ACCUMULATING:
             probs = self._accumulating_probs(self.pressure, relevance)
             self._transition(probs)
 
@@ -257,7 +257,7 @@ class TimeGate(BaseModel):
     ) -> None:
         rng = np.random.default_rng()
         index = rng.choice(len(probs), p=probs)
-        self.state = (State.IDLE, State.ACCUMULATING, State.PRIMED)[index]
+        self.state = (_State.IDLE, _State.ACCUMULATING, _State.PRIMED)[index]
 
     def _handle_velocity(self) -> float:
         value = 0.3 + self.talk_value * 0.7
@@ -267,8 +267,8 @@ class TimeGate(BaseModel):
 
 
 class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
-    time_gates: dict[str, TimeGate]
-    snapshots: dict[str, TimeGateSnapshot]
+    time_gates: dict[str, _TimeGate]
+    snapshots: dict[str, _TimeGateSnapshot]
 
     def __init__(
         self,
@@ -278,7 +278,7 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         keywords: set[tuple[str, float]] | None = None,
     ) -> None:
         self.time_gates = defaultdict(
-            lambda: TimeGate(
+            lambda: _TimeGate(
                 talk_value=talk_value,
                 velocity_alpha=velocity_alpha,
                 relevance_decay=relevance_decay,
@@ -322,3 +322,6 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             self.snapshots[runtime.context["session_id"]] = self.time_gates[
                 runtime.context["session_id"]
             ].observe(observe)
+
+
+__all__ = ["TimeGateConfig", "TimeGateMiddleware"]

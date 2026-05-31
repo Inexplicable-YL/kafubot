@@ -1,4 +1,4 @@
-from agent.extensions.act_limiter import ActivateLimitMiddleware
+from agent.extensions.limiter import ActivateLimitMiddleware
 from agent.extensions.logs import AgentDebugLogMiddleware
 from agent.extensions.meme import MemeSendingMiddleware
 from agent.extensions.memory import LongMemoryMiddleware
