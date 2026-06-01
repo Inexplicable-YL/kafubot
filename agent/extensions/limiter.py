@@ -52,6 +52,7 @@ class ActivateLimiterConfig(TypedDict):
     db_url: str
     act_limits: tuple[tuple[int, int], ...]
     rate_limit: NotRequired[tuple[float, float] | None]
+    notice_when_limit: NotRequired[bool]
 
 
 class _ActivateLimiter:
@@ -68,8 +69,7 @@ class _ActivateLimiter:
             rate_limit: 限流规则，格式为 (requests_per_second, max_bucket_size)
         """
         self._act_limits = tuple((w, t) for w, t in act_limits if w > 0 and t > 0)
-        self._use_act_limits = len(self._act_limits) > 0
-        self._max_window = max(w for w, _ in self._act_limits)
+        self._max_window = max(604800, *(w for w, _ in self._act_limits))
 
         if (
             rate_limit is not None
@@ -131,7 +131,6 @@ class _ActivateLimiter:
         if elapsed > 0:
             bucket.available = min(bucket.available + elapsed * self._rps, self._cap)
             bucket.last_update = now
-
         if bucket.available >= 1.0:
             bucket.available -= 1.0
             return True
@@ -164,6 +163,35 @@ class _ActivateLimiter:
             await s.commit()
             return True
 
+    async def acquire_with_text(
+        self,
+        session_id: str,
+        *,
+        timestamp: float | None = None,
+    ) -> tuple[bool, str | None]:
+        t = timestamp if timestamp is not None else self._now()
+        await self._ensure_schema()
+
+        async with self._sessionmaker() as s:
+            await self._purge(s, session_id, t - self._max_window)
+            result: list[tuple[int, float]] = []
+            for window, threshold in self._act_limits:
+                total = await s.execute(
+                    select(func.coalesce(func.sum(_Record.weight), 0.0)).where(
+                        _Record.session_id == session_id,
+                        _Record.timestamp > t - window,
+                    )
+                )
+                result.append((window, min(float(total.scalar_one()) / threshold, 1.0)))
+                if any(v >= 1.0 for _, v in result):
+                    await s.commit()
+                    return False, _quota_to_text(result)
+            if self._use_rate_limit and not await self._check_bucket(s, session_id, t):
+                await s.commit()
+                return False, "发的太快啦~ 让可不休息一会儿吧~"
+            await s.commit()
+            return True, None
+
     async def record(
         self,
         session_id: str,
@@ -179,27 +207,6 @@ class _ActivateLimiter:
             await self._purge(s, session_id, t - self._max_window)
             await s.commit()
 
-    async def quota(
-        self,
-        session_id: str,
-        *,
-        timestamp: float | None = None,
-    ) -> tuple[tuple[int, float], ...]:
-        t = timestamp if timestamp is not None else self._now()
-        await self._ensure_schema()
-
-        async with self._sessionmaker() as s:
-            result: list[tuple[int, float]] = []
-            for window, threshold in self._act_limits:
-                total = await s.execute(
-                    select(func.coalesce(func.sum(_Record.weight), 0.0)).where(
-                        _Record.session_id == session_id,
-                        _Record.timestamp > t - window,
-                    )
-                )
-                result.append((window, min(float(total.scalar_one()) / threshold, 1.0)))
-            return tuple(result)
-
 
 class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     def __init__(
@@ -207,7 +214,9 @@ class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         db_url: str,
         act_limits: tuple[tuple[int, int], ...],
         rate_limit: tuple[float, float] | None = None,
+        notice_when_limit: bool = True,
     ) -> None:
+        self.notice_when_limit = notice_when_limit
         self.limiter = _ActivateLimiter(
             db_url=db_url,
             act_limits=act_limits,
@@ -221,16 +230,19 @@ class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         _ = state
         if runtime.context["unrestricted"]:
             return None
-        if not await self.limiter.acquire(runtime.context["session_id"]):
+        reply, text = await self.limiter.acquire_with_text(
+            runtime.context["session_id"]
+        )
+        if not reply:
+            if text and self.notice_when_limit and runtime.context["is_tome"]:
+                await runtime.context["node"].reply(text, reply_message=True)
             return {
                 "jump_to": "end",
                 "outputs": [
                     OutputMessage(
                         type="limit",
                         data={
-                            "quota": await self.limiter.quota(
-                                runtime.context["session_id"]
-                            ),
+                            "prompt": text,
                         },
                     )
                 ],
@@ -251,6 +263,30 @@ class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 observe.append(AIMessage(output["data"]["content"]))
         if observe:
             await self.limiter.record(runtime.context["session_id"])
+
+
+def _format_duration(seconds: int) -> str:
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    for value, unit in ((d, "day"), (h, "hour"), (m, "min"), (s, "sec")):
+        if value:
+            parts.append(f"{value}{unit}")
+    return " ".join(parts) if parts else "0s"
+
+
+def _quota_to_text(quota: list[tuple[int, float]]) -> str | None:
+    if not quota:
+        return None
+    texts = ["当前回复额度耗尽，请稍后重试。\n以下是您的额度使用情况：\n"]
+    texts.extend(
+        [
+            f"{int(quota_item[1] * 100)} % was used within {_format_duration(quota_item[0])}"
+            for quota_item in quota
+        ]
+    )
+    return "\n".join(texts) or None
 
 
 __all__ = ["ActivateLimitMiddleware", "ActivateLimiterConfig"]

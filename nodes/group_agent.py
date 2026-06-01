@@ -28,49 +28,13 @@ from agent.multimodal.meme import add_memes
 
 MESSAGES_LIMIT = 30
 BACKUP_MESSAGES_LIMIT = 20
-BACKUP_PENDING_COUNTS_LIMIT = 10
 
-EXTRA_PROMPT_MAX_HISTORY = 5
 
 LIMITER_DB = "sqlite+aiosqlite:///./.database/group_limiter.db"
 
 DEFAULT_USERNAME = "陌生用户"
 
 DEFAULT_CLEAR_KEYWORDS = {"/clear", "/清除"}
-
-
-def _format_duration(seconds: int) -> str:
-    d, rem = divmod(seconds, 86400)
-    h, rem = divmod(rem, 3600)
-    m, s = divmod(rem, 60)
-    parts = []
-    for value, unit in ((d, "day"), (h, "hour"), (m, "min"), (s, "sec")):
-        if value:
-            parts.append(f"{value}{unit}")
-    return " ".join(parts) if parts else "0s"
-
-
-def _extract_limit(agent_output: Any) -> str | None:
-    candidates = agent_output.get("outputs")
-    quota: tuple[tuple[int, float], ...] | None = None
-    if isinstance(candidates, list):
-        for item in candidates:
-            if (
-                isinstance(item, dict)
-                and isinstance(item.get("data"), dict)
-                and item.get("type") == "limit"
-            ):
-                quota = item["data"].get("quota", {})
-    if not quota:
-        return None
-    texts = ["当前回复额度耗尽，请稍后重试。\n以下是您的额度使用情况：\n"]
-    texts.extend(
-        [
-            f"{int(quota_item[1] * 100)} % was used within {_format_duration(quota_item[0])}"
-            for quota_item in quota
-        ]
-    )
-    return "\n".join(texts) or None
 
 
 def _extract_reply(agent_output: Any) -> str | None:
@@ -267,7 +231,9 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
     ) -> list[UserMessage] | None:
         current_messages = await self.filling_images(current_messages)
 
-        print(f"Group-Agent-Invoking: {[m.message for m in current_messages]}")
+        print(
+            f"Group-Agent-Invoking: 已省略{len(current_messages) - 5}个消息，{[m.message.get_msgcode() for m in current_messages][-5:]}"
+        )
         if not self.node_state.agent:
             get_agent, close_agent = await create_agent_service()
             Bot.bot_exit_hook(close_agent)
@@ -303,22 +269,8 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 unrestricted=(self.event.group_id in self.config.unrestricted_groups),
             ),
         )
-        if (text := _extract_limit(agent_output)) and group_event.message.is_tome:
-            await self.reply(text, reply_message=True)
 
-        if reply_text := _extract_reply(agent_output):
-            print(f"Group-Agent-Reply: {reply_text}")
-            group_event.history_storage.backup_messages.append(
-                UserMessage(
-                    role="assistant",
-                    timestamp=datetime.now(tz=UTC),
-                    user="可不",
-                    message=QQMessage.from_str(reply_text),
-                    user_id=str(self.event.adapter.self_id),
-                    message_id="",
-                    is_tome=False,
-                )
-            )
+        if _extract_reply(agent_output):
             return None
         return current_messages
 

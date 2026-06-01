@@ -1,5 +1,6 @@
 import re
 import uuid
+from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -276,7 +277,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self.subagent_model = subagent_model
         self.namespace_root = _clean_text(namespace_root) or "long_memory"
         self.inject_tool_hint = inject_tool_hint
-        self._user_map: dict[str, str] = {}
+        self._user_maps: dict[str, dict[str, str]] = defaultdict(dict)
         self._recent_memory_cache: dict[tuple[str, ...], list[LongMemoryHit]] = {}
         self.tools = self._build_tools()
 
@@ -341,7 +342,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         clean_query = _clean_text(query)
         requested_mode = mode
         safe_limit = limit
-        resolution = self._resolve_user(state, user_name)
+        resolution = self._resolve_user(state, user_name=user_name, session_id=ctx["session_id"])
 
         if store is None:
             return LongMemoryQueryResult(
@@ -634,7 +635,9 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             source_message_ids=source_message_ids or [],
             tags=tags or [],
         )
-        resolved = self._resolve_candidate_user(candidate, runtime.state)
+        resolved = self._resolve_candidate_user(
+            candidate, runtime.state, runtime.context["session_id"]
+        )
         event = await self._store_memory_candidate(
             candidate=resolved,
             ctx=runtime.context,
@@ -695,7 +698,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 source_message_ids=source_message_ids or [],
                 tags=tags or [],
             )
-            resolved = self._resolve_candidate_user(candidate, state)
+            resolved = self._resolve_candidate_user(candidate, state, ctx["session_id"])
             event = await self._store_memory_candidate(
                 candidate=resolved,
                 ctx=ctx,
@@ -820,11 +823,14 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         candidate: MemoryCandidate,
         state: ManagerState,
+        session_id: str,
     ) -> MemoryCandidate:
         if candidate.user_id or not candidate.user_name:
             return candidate
 
-        resolution = self._resolve_user(state, candidate.user_name)
+        resolution = self._resolve_user(
+            state, user_name=candidate.user_name, session_id=session_id
+        )
         if not resolution.user_id:
             return candidate
 
@@ -905,7 +911,9 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     def _resolve_user(
         self,
         state: ManagerState,
+        *,
         user_name: str,
+        session_id: str,
     ) -> NormalizedUserResolution:
         def loose_name(value: str) -> str:
             return re.sub(r"[\s@：:，,。.!！?？（）()\[\]【】_\-]+", "", value).lower()
@@ -914,12 +922,21 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         if not name:
             return NormalizedUserResolution()
 
-        self._user_map = self._user_map | {
+        if not self._user_maps[session_id]:
+            self._user_maps[session_id] = {
+                user_msg.user: user_msg.user_id
+                for msg in state["histories"]
+                if isinstance(msg, HumanMessage)
+                and (user_msg := msg.additional_kwargs.get("raw"))
+                and isinstance(user_msg, UserMessage)
+            }
+
+        self._user_maps[session_id] = self._user_maps[session_id] | {
             msg.user: msg.user_id for msg in state["inputs"]
         }
 
-        if name in self._user_map:
-            user_id = _clean_text(self._user_map[name])
+        if name in self._user_maps[session_id]:
+            user_id = _clean_text(self._user_maps[session_id][name])
             if not user_id:
                 return NormalizedUserResolution(
                     user_name=name,
@@ -935,7 +952,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         normalized_name = loose_name(name)
         exact_matches = [
             (key, user_id)
-            for key, value in self._user_map.items()
+            for key, value in self._user_maps[session_id].items()
             if normalized_name
             and loose_name(key) == normalized_name
             and (user_id := _clean_text(value))

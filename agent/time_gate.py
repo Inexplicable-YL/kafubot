@@ -109,7 +109,6 @@ class _TimeGate(BaseModel):
                 self._process_message(msg)
 
     def evaluate(self) -> bool:
-        print(f"pressure: {self.pressure}, human_velocity: {self.human_velocity}")
         return self.state is _State.PRIMED
 
     def clear(self) -> None:

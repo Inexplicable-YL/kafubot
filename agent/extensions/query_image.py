@@ -55,7 +55,7 @@ def get_image_analyzer() -> Runnable[dict[str, Any], str]:
     model = ChatOpenAI(
         model="gpt-5.4-mini",
         base_url=os.getenv("OPENAI_BASE_URL"),
-        temperature=1,
+        temperature=0.6,
         max_retries=2,
     )
 

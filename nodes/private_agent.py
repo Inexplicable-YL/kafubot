@@ -25,45 +25,8 @@ from agent.multimodal.image import (
 )
 from agent.multimodal.meme import add_memes
 
-BACKUP_MESSAGES_LIMIT = 10
-EXTRA_PROMPT_MAX_HISTORY = 3
-
 LIMITER_DB = "sqlite+aiosqlite:///./.database/private_limiter.db"
 DEFAULT_CLEAR_KEYWORDS = {"/clear", "/清除"}
-
-
-def _format_duration(seconds: int) -> str:
-    d, rem = divmod(seconds, 86400)
-    h, rem = divmod(rem, 3600)
-    m, s = divmod(rem, 60)
-    parts = []
-    for value, unit in ((d, "day"), (h, "hour"), (m, "min"), (s, "sec")):
-        if value:
-            parts.append(f"{value}{unit}")
-    return " ".join(parts) if parts else "0s"
-
-
-def _extract_limit(agent_output: Any) -> str | None:
-    candidates = agent_output.get("outputs")
-    quota: tuple[tuple[int, float], ...] | None = None
-    if isinstance(candidates, list):
-        for item in candidates:
-            if (
-                isinstance(item, dict)
-                and isinstance(item.get("data"), dict)
-                and item.get("type") == "limit"
-            ):
-                quota = item["data"].get("quota", {})
-    if not quota:
-        return None
-    texts = ["当前回复额度耗尽，请稍后重试。\n以下是您的额度使用情况：\n"]
-    texts.extend(
-        [
-            f"{int(quota_item[1] * 100)} % was used within {_format_duration(quota_item[0])}"
-            for quota_item in quota
-        ]
-    )
-    return "\n".join(texts) or None
 
 
 def _has_model_visible_content(message: UserMessage) -> bool:
@@ -108,6 +71,7 @@ class PrivateAgentConfig(ConfigModel):
             raise ValueError("image_analyzer_workers must be positive")
         if not 0 <= self.image_hash_similarity_threshold <= 64:  # noqa: PLR2004
             raise ValueError("image_hash_similarity_threshold must be between 0 and 64")
+        self.clear_keywords = self.clear_keywords.union(DEFAULT_CLEAR_KEYWORDS)
         return self
 
 
@@ -331,7 +295,9 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
         session_id: str,
         messages: list[UserMessage],
     ) -> None:
-        print(f"Group-Agent-Invoking: {[m.message for m in messages]}")
+        print(
+            f"Private-Agent-Invoking: 已省略{len(messages) - 5}个消息，{[m.message.get_msgcode() for m in messages][-5:]}"
+        )
         if not self.node_state.agent:
             get_agent, close_agent = await create_agent_service()
             Bot.bot_exit_hook(close_agent)
@@ -351,7 +317,7 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
                 },
             )
         assert self.node_state.agent
-        agent_output = await self.node_state.agent.ainvoke(
+        await self.node_state.agent.ainvoke(
             ManagerState(
                 messages=[],
                 inputs=messages,
@@ -367,8 +333,6 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
                 unrestricted=False,
             ),
         )
-        if text := _extract_limit(agent_output):
-            await self.reply(text)
 
     async def get_image(self, file: str) -> ImageReadResult | None:
         try:
