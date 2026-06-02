@@ -216,7 +216,6 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             ),
             "",
         )
-
         full_text = ""
         async for reply in self.chat_app.astream(
             {
@@ -252,6 +251,10 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         full_text = full_text.strip()
         if not full_text:
             return "回复失败：无法生成回复。"
+        print(
+            f"Agent-Invoking: 已省略{max(0, len(runtime.state['inputs']) - 5)}个消息，{[m.message.get_msgcode() for m in runtime.state['inputs']][-5:]}\n",
+            f"Agent-Reply: {full_text.replace(chr(10), chr(92) + 'n ').strip()}",
+        )
         self.reply_turn[runtime.context["session_id"]] += 1
         return Command(
             update={

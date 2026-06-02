@@ -295,9 +295,6 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
         session_id: str,
         messages: list[UserMessage],
     ) -> None:
-        print(
-            f"Private-Agent-Invoking: 已省略{len(messages) - 5}个消息，{[m.message.get_msgcode() for m in messages][-5:]}"
-        )
         if not self.node_state.agent:
             get_agent, close_agent = await create_agent_service()
             Bot.bot_exit_hook(close_agent)

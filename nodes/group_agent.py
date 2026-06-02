@@ -230,10 +230,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         current_messages: list[UserMessage],
     ) -> list[UserMessage] | None:
         current_messages = await self.filling_images(current_messages)
-
-        print(
-            f"Group-Agent-Invoking: 已省略{len(current_messages) - 5}个消息，{[m.message.get_msgcode() for m in current_messages][-5:]}"
-        )
         if not self.node_state.agent:
             get_agent, close_agent = await create_agent_service()
             Bot.bot_exit_hook(close_agent)
