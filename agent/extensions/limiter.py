@@ -183,9 +183,9 @@ class _ActivateLimiter:
                     )
                 )
                 result.append((window, min(float(total.scalar_one()) / threshold, 1.0)))
-                if any(v >= 1.0 for _, v in result):
-                    await s.commit()
-                    return False, _quota_to_text(result)
+            if any(v >= 1.0 for _, v in result):
+                await s.commit()
+                return False, _quota_to_text(result)
             if self._use_rate_limit and not await self._check_bucket(s, session_id, t):
                 await s.commit()
                 return False, "发的太快啦~ 让可不休息一会儿吧~"

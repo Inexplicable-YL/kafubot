@@ -50,6 +50,7 @@ class _TimeGate(BaseModel):
 
     state: _State = Field(default=_State.IDLE, repr=False)
     pressure: float = Field(default=0.0, repr=False)
+    ignore_count: int = Field(default=0, repr=False)
 
     human_intervals: deque[float] = Field(
         default_factory=lambda: deque(maxlen=100), repr=False
@@ -172,10 +173,12 @@ class _TimeGate(BaseModel):
     def _observe_ai(self) -> None:
         self.state = _State.IDLE
         self.pressure = 0.0
+        self.ignore_count = 0
 
     def _observe_ignore(self) -> None:
         self.state = _State.ACCUMULATING
-        self.pressure *= 0.1 + 0.8 * self.talk_value
+        self.pressure *= 0.2 + 0.8 * self.talk_value
+        self.ignore_count += 1
 
     def _observe_human(self, timestamp: float, relevance: float) -> None:
         if self.last_timestamp is not None:
@@ -194,7 +197,7 @@ class _TimeGate(BaseModel):
             )
         self.last_timestamp = timestamp
 
-        self.pressure += 0.5 * (1 + relevance)
+        self.pressure += 0.8 * (0.8**self.ignore_count + relevance)
 
         if self.state is _State.IDLE:
             probs = self._idle_probs(self.pressure, relevance)
