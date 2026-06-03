@@ -142,14 +142,10 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     async def abefore_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
+        _ = state
         if runtime.store is not None:
             self._store = self._store or runtime.store
         await self._ensure_session_summary_loaded(runtime.context["session_id"])
-        await self._handle_pruned_messages(
-            session_id=runtime.context["session_id"],
-            messages=state.get("summary_pruned_messages"),
-        )
-        return {"summary_pruned_messages": None}
 
     async def aafter_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
@@ -160,7 +156,6 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             session_id=runtime.context["session_id"],
             messages=state.get("summary_pruned_messages"),
         )
-        return {"summary_pruned_messages": None}
 
     async def awrap_model_call(
         self,
