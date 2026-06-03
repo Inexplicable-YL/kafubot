@@ -28,6 +28,7 @@ from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tracers.schemas import Run
 from langgraph.runtime import Runtime
 from langgraph.types import Command
+from numpy import random
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from sekaibot.adapter.cqhttp.message import CQHTTPMessageSegment
 
@@ -232,6 +233,12 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             config={"configurable": {"session_id": runtime.context["session_id"]}},
         ):
             if reply is not None and (reply_msg := reply.strip()):
+                if reply_msg.endswith("（"):
+                    reply_msg = reply_msg[:-1].rstrip()
+                    rng = random.default_rng()
+                    pools = ("（", "（）", "。。", "")
+                    probs = (0.4, 0.2, 0.1, 0.3)
+                    reply_msg += pools[rng.choice(len(pools), p=probs)]
                 raw_msg = QQMessage.from_str(reply_msg)
                 msg = QQMessage(filter(lambda x: x.type in {"at", "text"}, raw_msg))
                 if not msg.get_plain_text().strip():

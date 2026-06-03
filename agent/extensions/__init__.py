@@ -1,3 +1,4 @@
+from agent.extensions.jargon import JargonMiddleware
 from agent.extensions.limiter import ActivateLimitMiddleware
 from agent.extensions.logs import AgentDebugLogMiddleware
 from agent.extensions.meme import MemeSendingMiddleware
@@ -15,6 +16,7 @@ __all__ = [
     "ActivateLimitMiddleware",
     "DeferredToolMiddleware",
     "AgentDebugLogMiddleware",
+    "JargonMiddleware",
     "LongMemoryMiddleware",
     "MemeSendingMiddleware",
     "SummarizationMiddleware",

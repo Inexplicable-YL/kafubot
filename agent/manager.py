@@ -26,6 +26,7 @@ from agent.base import (
 from agent.builder import create_agent
 from agent.extensions import (
     ActivateLimitMiddleware,
+    JargonMiddleware,
     LongMemoryMiddleware,
     MemeSendingMiddleware,
     SummarizationMiddleware,
@@ -105,13 +106,14 @@ async def add_time(request: ModelRequest[ManagerContext], handler) -> ModelRespo
 
 @cache
 def get_model(
+    temperature: float = 0.8,
     reasoning_effort: Literal["high", "max"] = "high",
 ) -> ChatDeepSeek:
     if reasoning_effort == "max":
         return ChatDeepSeek(
             model=MODEL_NAME,
             api_base=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE),
-            temperature=0.8,
+            temperature=temperature,
             max_retries=2,
             reasoning_effort="max",
             extra_body={
@@ -123,7 +125,7 @@ def get_model(
     return ChatDeepSeek(
         model=MODEL_NAME,
         api_base=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE),
-        temperature=0.8,
+        temperature=temperature,
         max_retries=2,
         reasoning_effort="high",
         extra_body={
@@ -135,6 +137,8 @@ def get_model(
 
 
 async def create_agent_service():
+    jargon_middlewares: list[JargonMiddleware] = []
+    memory_middlewares: list[LongMemoryMiddleware] = []
     summary_middlewares: list[SummarizationMiddleware] = []
     conn = await aiosqlite.connect(
         "./.database/long_memory.db",
@@ -158,24 +162,29 @@ async def create_agent_service():
     ):
         interaction_config = (
             InteractionConfig(
-                reply_model=get_model("high"), get_session_history=get_session_history
+                reply_model=get_model(1.2, "high"),
+                get_session_history=get_session_history,
             )
             | interaction_config
         )
-        summary_middleware = SummarizationMiddleware(summary_model=get_model("high"))
+        jargon_middleware = JargonMiddleware(analyze_model=get_model(0.3, "max"))
+        jargon_middlewares.append(jargon_middleware)
+        summary_middleware = SummarizationMiddleware(
+            summary_model=get_model(0.3, "max")
+        )
         summary_middlewares.append(summary_middleware)
+        memory_middleware = LongMemoryMiddleware(analyze_model=get_model(0.3, "max"))
+        memory_middlewares.append(memory_middleware)
         return create_agent(
-            model=get_model("max"),
+            model=get_model(0.6, "max"),
             tools=[query_image, search_song, view_forward_message],
             middleware=[
                 InteractionMiddleware(**interaction_config),
                 ActivateLimitMiddleware(**limiter_config),
                 TimeGateMiddleware(**gate_config),
                 MemeSendingMiddleware(man_send_per_turn=1),
-                LongMemoryMiddleware(
-                    use_subagent=True,
-                    subagent_model=get_model("max"),
-                ),
+                # jargon_middleware,
+                # memory_middleware,
                 summary_middleware,
                 generate_prompt,
                 add_time,
@@ -186,6 +195,10 @@ async def create_agent_service():
         )
 
     async def shutdown():
+        for jargon_middleware in jargon_middlewares:
+            await jargon_middleware.aclose()
+        for memory_middleware in memory_middlewares:
+            await memory_middleware.aclose()
         for summary_middleware in summary_middlewares:
             await summary_middleware.aclose()
         await conn.close()

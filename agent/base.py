@@ -51,6 +51,7 @@ class ManagerState(AgentState):
 
     summary_pruned_messages: NotRequired[list[BaseMessage] | None]
 
+
 class ManagerContext(TypedDict):
     node: Any
     session_id: str

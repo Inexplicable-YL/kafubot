@@ -1,28 +1,36 @@
+import logging
 import re
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
+import anyio
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.agents.middleware.types import ExtendedModelResponse
 from langchain.tools import BaseTool, ToolRuntime, tool
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
+    BaseMessage,
     HumanMessage,
-    ToolMessage,
 )
 from langgraph.errors import GraphRecursionError
+from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
-from langgraph.types import Command
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from agent.base import MODEL_VISIBLE_TZ, ManagerContext, ManagerState, UserMessage
 from agent.builder import create_agent
+
+if TYPE_CHECKING:
+    from anyio.abc import TaskGroup
+
+logger = logging.getLogger(__name__)
 
 MemoryKind = Literal[
     "fact",
@@ -43,17 +51,15 @@ QueryMode = Literal[
 ]
 
 MEMORY_EXTRACTION_MAX_WRITES = 8
-HISTORY_WINDOW = 20
 RECENT_MEMORY_CONTEXT_LIMIT = 3
-RECENT_MEMORY_CACHE_LIMIT = RECENT_MEMORY_CONTEXT_LIMIT
 
 
 TOOL_HINT_PROMPT = """【长期记忆工具】
 
-- query_memory()：当回复明显依赖历史对话、长期偏好、共同经历、人物长期信息或之前约定时使用。适合检索：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不适合检索：寒暄、即时情绪回应、轻松接话、只看最近消息就能回答的内容。群聊里更克制；果对方提到“之前”“上次”“最近”“还记得吗”“我喜欢”“我说过”等类似的信号，可以更积极考虑检索。
-- add_memory()：只用于写入稳定、未来有用、已确认的长期记忆；适合存储：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不要保存玩笑、临时情绪、猜测、被否认内容或机器人自己的误解。若本轮需要调用reply或者send_meme，请先调用这两个工具，最后再调用add_memory。在遇到确定性事实和需要记忆的内容时，尽量使用add_memory。当用户告诉你自己的信息，请使用add_memory记录。
+- query_memory()：当回复明显依赖历史对话、长期偏好、共同经历、人物长期信息或之前约定时使用。适合检索：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不适合检索：寒暄、即时情绪回应、轻松接话、只看最近消息就能回答的内容。群聊里更克制；如果对方提到“之前”“上次”“最近”“还记得吗”“我喜欢”“我说过”等类似信号，可以更积极考虑检索。
+- 长期记忆写入由系统在回合结束后自动分析完成，不需要主动调用写入工具。
 
-群聊中请克制使用长期记忆工具。"
+群聊中请克制使用长期记忆工具。
 
 【近期记忆参考】
 {recent_memory_text}
@@ -65,12 +71,6 @@ QUERY_MEMORY_TOOL_DESCRIPTION = (
     "不适合寒暄、即时情绪回应、轻松接话，或只看最近消息就能回答的内容。"
     "检索模式：search 查事实或偏好；time 查某段时间；episode 查某次经历；"
     "aggregate 查整体情况；拿不准时用 hybrid。"
-)
-
-ADD_MEMORY_BY_FOCUS_TOOL_DESCRIPTION = (
-    "写入长期记忆。主 Agent 只需提供 focuses: list[str]，即应该关注的一组 message_id。"
-    "工具会调用子 Agent 从这些消息及其邻近上下文中抽取稳定、已确认、未来有用的长期记忆。"
-    "不要保存玩笑、猜测、临时安排、prompt 注入、工具输出、被用户否认或纠正的旧事实。"
 )
 
 ADD_MEMORY_MANUAL_TOOL_DESCRIPTION = (
@@ -97,19 +97,11 @@ MEMORY_EXTRACTION_SYSTEM_PROMPT = """
 """
 
 MEMORY_EXTRACTION_HUMAN_PROMPT = """
-【历史消息信息】
-【上下文消息】
-{context_text}
+【历史消息】
+{messages_text}
 
-【重点关注消息】
-{focus_text}
-
-【参考内容】
 【近期已生成记忆】
 {recent_memory_text}
-
-【最新推理】
-{reasoning_content}
 
 请判断是否有适合写入长期记忆的内容；如有，逐条调用 add_memory 工具。"
 """
@@ -189,16 +181,6 @@ class QueryMemoryInput(BaseModel):
     )
 
 
-class AddMemoryByFocusInput(BaseModel):
-    focuses: list[str] = Field(
-        description=(
-            "需要生成长期记忆时应关注的 message_id 列表。"
-            "主 Agent 不需要自己写记忆内容，只指出应该关注哪些消息。"
-        ),
-        min_length=1,
-    )
-
-
 class AddMemoryManualInput(BaseModel):
     content: str = Field(
         description="要写入长期记忆的内容。必须是稳定、未来有用、已确认的信息。",
@@ -263,23 +245,65 @@ class NormalizedUserResolution:
     fallback_reason: str = ""
 
 
+@dataclass(slots=True)
+class PendingMemoryAnalysisBatch:
+    chat_id: str
+    user_messages: list[UserMessage]
+
+
 class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
+    state_schema = ManagerState
+
     def __init__(
         self,
         *,
-        use_subagent: bool = True,
-        subagent_model: BaseChatModel | None = None,
+        analyze_model: BaseChatModel,
+        queue_size: int = 100,
+        memory_extraction_max_writes: int = MEMORY_EXTRACTION_MAX_WRITES,
+        recent_memory_context_limit: int = RECENT_MEMORY_CONTEXT_LIMIT,
         namespace_root: str = "long_memory",
-        inject_tool_hint: bool = True,
+        inject_memory_hint: bool = True,
+        store: BaseStore | None = None,
     ) -> None:
         super().__init__()
-        self.use_subagent = use_subagent
-        self.subagent_model = subagent_model
+        self.analyze_model = analyze_model
+        self.queue_size = self._validate_positive_int(queue_size, "queue_size")
+        self.memory_extraction_max_writes = self._validate_positive_int(
+            memory_extraction_max_writes,
+            "memory_extraction_max_writes",
+        )
+        self.recent_memory_context_limit = self._validate_positive_int(
+            recent_memory_context_limit,
+            "recent_memory_context_limit",
+        )
         self.namespace_root = _clean_text(namespace_root) or "long_memory"
-        self.inject_tool_hint = inject_tool_hint
+        self.inject_memory_hint = inject_memory_hint
         self._user_maps: dict[str, dict[str, str]] = defaultdict(dict)
         self._recent_memory_cache: dict[tuple[str, ...], list[LongMemoryHit]] = {}
+        self._pending_batches: dict[str, deque[PendingMemoryAnalysisBatch]] = (
+            defaultdict(deque)
+        )
+        self._scheduled_sessions: set[str] = set()
+        self._store: BaseStore | None = store
+        self._start_lock = anyio.Lock()
+        self._task_group: TaskGroup | None = None
+        self._send_stream: MemoryObjectSendStream[str] | None = None
+        self._receive_stream: MemoryObjectReceiveStream[str] | None = None
         self.tools = self._build_tools()
+
+    async def aafter_agent(
+        self, state: ManagerState, runtime: Runtime[ManagerContext]
+    ) -> dict[str, Any] | None:
+        if runtime.store is not None:
+            self._store = self._store or runtime.store
+        session_id = runtime.context["session_id"]
+        self._remember_users_from_state(state, session_id)
+        await self._handle_pruned_messages(
+            session_id=session_id,
+            chat_id=runtime.context["chat_id"],
+            messages=state.get("summary_pruned_messages"),
+        )
+        return None
 
     async def awrap_model_call(
         self,
@@ -288,14 +312,17 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             [ModelRequest[ManagerContext]], Awaitable[ModelResponse[Any]]
         ],
     ) -> ModelResponse[Any] | AIMessage | ExtendedModelResponse[Any]:
-        if not self.inject_tool_hint:
+        if request.runtime.store is not None:
+            self._store = self._store or request.runtime.store
+        if not self.inject_memory_hint:
             return await handler(request)
         state = cast("ManagerState", request.state)
+        self._remember_users_from_state(state, request.runtime.context["session_id"])
         recent_memory_text = "暂无近期记忆。"
         if request.runtime.store:
             recent_memory_text = await self._format_recent_memory_context(
-                focus_messages=state.get("inputs", []),
-                ctx=request.runtime.context,
+                related_messages=state.get("inputs", []),
+                chat_id=request.runtime.context["chat_id"],
                 store=request.runtime.store,
             )
         hint = HumanMessage(
@@ -304,27 +331,164 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         request = request.override(messages=[*request.messages, hint])
         return await handler(request)
 
+    async def aclose(self) -> None:
+        if self._send_stream is not None:
+            await self._send_stream.aclose()
+        if self._receive_stream is not None:
+            await self._receive_stream.aclose()
+        if self._task_group is not None:
+            self._task_group.cancel_scope.cancel()
+            await self._task_group.__aexit__(None, None, None)
+
+        self._send_stream = None
+        self._receive_stream = None
+        self._task_group = None
+        self._store = None
+        self._pending_batches.clear()
+        self._scheduled_sessions.clear()
+        self._user_maps.clear()
+        self._recent_memory_cache.clear()
+
     def _build_tools(self) -> list[BaseTool]:
         query_tool = tool(
             "query_memory",
             description=QUERY_MEMORY_TOOL_DESCRIPTION,
             args_schema=QueryMemoryInput,
         )(self._query_memory)
+        return [query_tool]
 
-        if self.use_subagent:
-            add_tool = tool(
-                "add_memory",
-                description=ADD_MEMORY_BY_FOCUS_TOOL_DESCRIPTION,
-                args_schema=AddMemoryByFocusInput,
-            )(self._add_memory_with_subagent)
+    async def _ensure_service(self) -> None:
+        if self._send_stream is not None:
+            return
+
+        async with self._start_lock:
+            if self._send_stream is not None:
+                return
+
+            send_stream, receive_stream = anyio.create_memory_object_stream[str](
+                self.queue_size
+            )
+            task_group = anyio.create_task_group()
+            await task_group.__aenter__()
+            task_group.start_soon(self._memory_worker, receive_stream)
+
+            self._send_stream = send_stream
+            self._receive_stream = receive_stream
+            self._task_group = task_group
+
+    async def _handle_pruned_messages(
+        self,
+        *,
+        session_id: str,
+        chat_id: str,
+        messages: list[BaseMessage] | None,
+    ) -> None:
+        if messages is None:
+            return
+        user_messages = self._extract_user_messages(messages)
+        if not user_messages:
+            return
+
+        self._remember_users_from_user_messages(session_id, user_messages)
+        await self._ensure_service()
+        self._pending_batches[session_id].append(
+            PendingMemoryAnalysisBatch(
+                chat_id=chat_id,
+                user_messages=user_messages,
+            )
+        )
+        await self._queue_memory_job(session_id)
+
+    async def _queue_memory_job(self, session_id: str) -> None:
+        send_stream = self._send_stream
+        task_group = self._task_group
+        if send_stream is None or task_group is None:
+            return
+        if session_id in self._scheduled_sessions:
+            return
+
+        self._scheduled_sessions.add(session_id)
+        try:
+            send_stream.send_nowait(session_id)
+        except anyio.WouldBlock:
+            pass
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            self._scheduled_sessions.discard(session_id)
+            logger.exception("Failed to queue long memory analysis job")
+            return
         else:
-            add_tool = tool(
-                "add_memory",
-                description=ADD_MEMORY_MANUAL_TOOL_DESCRIPTION,
-                args_schema=AddMemoryManualInput,
-            )(self._add_memory_manual)
+            return
 
-        return [query_tool, add_tool]
+        try:
+            task_group.start_soon(self._send_memory_job, send_stream, session_id)
+        except RuntimeError:
+            self._scheduled_sessions.discard(session_id)
+            logger.exception("Failed to schedule long memory analysis job")
+
+    async def _send_memory_job(
+        self,
+        send_stream: MemoryObjectSendStream[str],
+        session_id: str,
+    ) -> None:
+        try:
+            await send_stream.send(session_id)
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            self._scheduled_sessions.discard(session_id)
+            logger.exception("Failed to send long memory analysis job")
+
+    async def _memory_worker(
+        self,
+        receive_stream: MemoryObjectReceiveStream[str],
+    ) -> None:
+        async with receive_stream:
+            async for session_id in receive_stream:
+                try:
+                    progressed = await self._analyze_session(session_id)
+                except Exception:
+                    logger.exception("Failed to analyze long memory batch")
+                    progressed = False
+                finally:
+                    self._scheduled_sessions.discard(session_id)
+
+                if progressed and self._pending_batches.get(session_id):
+                    await self._queue_memory_job(session_id)
+
+    async def _analyze_session(self, session_id: str) -> bool:
+        store = self._store
+        if store is None:
+            logger.warning(
+                "Skipping long memory analysis for session %s because store is unavailable",
+                session_id,
+            )
+            return False
+
+        progressed = False
+        pending_batches = self._pending_batches.get(session_id)
+        if not pending_batches:
+            return False
+
+        while pending_batches:
+            batch = pending_batches.popleft()
+            if not batch.user_messages:
+                progressed = True
+                continue
+
+            await self._run_memory_subagent(
+                messages=batch.user_messages,
+                session_id=session_id,
+                chat_id=batch.chat_id,
+                store=store,
+            )
+            progressed = True
+
+        self._pending_batches.pop(session_id, None)
+        return progressed
+
+    @staticmethod
+    def _validate_positive_int(value: int, name: str) -> int:
+        if value < 1:
+            raise ValueError(f"{name} must be greater than 0, got {value}.")
+        return value
 
     async def _query_memory(  # noqa: PLR0915
         self,
@@ -342,7 +506,11 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         clean_query = _clean_text(query)
         requested_mode = mode
         safe_limit = limit
-        resolution = self._resolve_user(state, user_name=user_name, session_id=ctx["session_id"])
+        self._remember_users_from_state(state, ctx["session_id"])
+        resolution = self._resolve_user(
+            user_name=user_name,
+            session_id=ctx["session_id"],
+        )
 
         if store is None:
             return LongMemoryQueryResult(
@@ -391,12 +559,10 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 hits=[],
             )
 
-        chat_namespace = (self.namespace_root, "chats", ctx["chat_id"])
-        if resolution.user_id:
-            user_namespace = (self.namespace_root, "users", resolution.user_id)
-            namespaces = [user_namespace, chat_namespace]
-        else:
-            namespaces = [chat_namespace]
+        namespaces = self._get_query_namespaces(
+            chat_id=ctx["chat_id"],
+            user_id=resolution.user_id,
+        )
 
         raw_hits: list[LongMemoryHit] = []
         effective_mode = requested_mode
@@ -547,132 +713,19 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             hits=hits,
         )
 
-    async def _add_memory_with_subagent(
-        self,
-        focuses: list[str],
-        runtime: ToolRuntime[ManagerContext, ManagerState],
-    ) -> Command:
-        store = runtime.store
-        if store is None:
-            return _tool_command(
-                runtime=runtime,
-                content="add_memory 失败：未配置 LangGraph store，无法写入长期记忆。",
-                events=[],
-            )
-
-        if self.subagent_model is None:
-            return _tool_command(
-                runtime=runtime,
-                content="add_memory 失败：use_subagent=True 时必须提供 subagent_model。",
-                events=[],
-            )
-
-        messages: dict[str, tuple[int, UserMessage]] = {}
-        for message in runtime.state["histories"]:
-            if isinstance(message, HumanMessage) and isinstance(
-                raw := message.additional_kwargs.get("raw"), UserMessage
-            ):
-                messages[raw.message_id] = (int(raw.timestamp.timestamp()), raw)
-
-        focus_ids = [focus_id for focus in focuses if (focus_id := _clean_text(focus))]
-        focus_message_sqec = sorted(
-            [messages[x] for x in focus_ids if x in messages], key=lambda x: x[0]
-        )
-        focus_messages = [m[1] for m in focus_message_sqec]
-        if not focus_messages:
-            return _tool_command(
-                runtime=runtime,
-                content=f"add_memory 未找到 focuses 对应的消息：{focus_ids}",
-                events=[],
-            )
-
-        context_messages = [m[1] for m in list(messages.values())[-HISTORY_WINDOW:]]
-        events = await self._run_memory_subagent(
-            focus_messages=focus_messages,
-            context_messages=context_messages,
-            state=runtime.state,
-            ctx=runtime.context,
-            store=store,
-        )
-        if not events:
-            return _tool_command(
-                runtime=runtime,
-                content="add_memory 完成：子 Agent 判断没有适合写入长期记忆的稳定事实。",
-                events=[],
-            )
-        return _tool_command(
-            runtime=runtime,
-            content=f"add_memory 完成：写入 {len(events)} 条长期记忆。",
-            events=events,
-        )
-
-    async def _add_memory_manual(
-        self,
-        runtime: ToolRuntime[ManagerContext, ManagerState],
-        content: str,
-        kind: MemoryKind = "fact",
-        user_name: str = "",
-        time_start: str = "",
-        time_end: str = "",
-        source_message_ids: list[str] | None = None,
-        tags: list[str] | None = None,
-    ) -> Command:
-        store = runtime.store
-        if store is None:
-            return _tool_command(
-                runtime=runtime,
-                content="add_memory 失败：未配置 LangGraph store，无法写入长期记忆。",
-                events=[],
-            )
-
-        candidate = MemoryCandidate(
-            content=content,
-            kind=kind,
-            user_name=user_name,
-            user_id="",
-            time_start=time_start,
-            time_end=time_end,
-            source_message_ids=source_message_ids or [],
-            tags=tags or [],
-        )
-        resolved = self._resolve_candidate_user(
-            candidate, runtime.state, runtime.context["session_id"]
-        )
-        event = await self._store_memory_candidate(
-            candidate=resolved,
-            ctx=runtime.context,
-            store=store,
-        )
-        return _tool_command(
-            runtime=runtime,
-            content=f"add_memory 完成：写入 1 条长期记忆。内容：{event['content']}",
-            events=[event],
-        )
-
     async def _run_memory_subagent(
         self,
         *,
-        focus_messages: list[UserMessage],
-        context_messages: list[UserMessage],
-        state: ManagerState,
-        ctx: ManagerContext,
+        messages: list[UserMessage],
+        session_id: str,
+        chat_id: str,
         store: BaseStore,
     ) -> list[LongMemoryEvent]:
-        focus_text = "\n".join(m.as_content() for m in focus_messages)
-        context_text = "\n".join(m.as_content() for m in context_messages)
+        messages_text = "\n".join(message.as_content() for message in messages)
         recent_memory_text = await self._format_recent_memory_context(
-            focus_messages=focus_messages,
-            ctx=ctx,
+            related_messages=messages,
+            chat_id=chat_id,
             store=store,
-        )
-        reasoning_content: str = next(
-            (
-                str(m.additional_kwargs.get("reasoning_content"))
-                for m in reversed(state["messages"])
-                if isinstance(m, AIMessage)
-                and m.additional_kwargs.get("reasoning_content")
-            ),
-            "",
         )
         events: list[LongMemoryEvent] = []
 
@@ -685,7 +738,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             source_message_ids: list[str] | None = None,
             tags: list[str] | None = None,
         ) -> str:
-            if len(events) >= MEMORY_EXTRACTION_MAX_WRITES:
+            if len(events) >= self.memory_extraction_max_writes:
                 return "写入失败：本次 add_memory 已达到写入上限。"
 
             candidate = MemoryCandidate(
@@ -698,10 +751,10 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 source_message_ids=source_message_ids or [],
                 tags=tags or [],
             )
-            resolved = self._resolve_candidate_user(candidate, state, ctx["session_id"])
+            resolved = self._resolve_candidate_user(candidate, session_id)
             event = await self._store_memory_candidate(
                 candidate=resolved,
-                ctx=ctx,
+                chat_id=chat_id,
                 store=store,
             )
             events.append(event)
@@ -709,20 +762,17 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
 
         human = HumanMessage(
             content=MEMORY_EXTRACTION_HUMAN_PROMPT.format(
-                context_text=context_text,
-                focus_text=focus_text,
+                messages_text=messages_text,
                 recent_memory_text=recent_memory_text,
-                reasoning_content=reasoning_content,
             )
         )
-        assert self.subagent_model
         add_memory_tool = tool(
             "add_memory",
             description=ADD_MEMORY_MANUAL_TOOL_DESCRIPTION,
             args_schema=AddMemoryManualInput,
         )(add_memory)
         sub_agent = create_agent(
-            model=self.subagent_model,
+            model=self.analyze_model,
             tools=[add_memory_tool],
             system_prompt=MEMORY_EXTRACTION_SYSTEM_PROMPT,
         )
@@ -734,16 +784,15 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     async def _format_recent_memory_context(
         self,
         *,
-        focus_messages: list[UserMessage],
-        ctx: ManagerContext,
+        related_messages: list[UserMessage],
+        chat_id: str,
         store: BaseStore,
     ) -> str:
-        chat_id = ctx["chat_id"]
         sections: list[str] = []
         chat_hits = await self._recent_memory_hits(
             store=store,
             namespace=(self.namespace_root, "chats", chat_id),
-            limit=RECENT_MEMORY_CONTEXT_LIMIT,
+            limit=self.recent_memory_context_limit,
         )
         sections.append(
             _format_recent_memory_section(
@@ -752,7 +801,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             )
         )
         user_names_by_id: dict[str, str] = {}
-        for message in focus_messages:
+        for message in related_messages:
             user_id = _clean_text(message.user_id)
             if user_id and user_id not in user_names_by_id:
                 user_names_by_id[user_id] = _clean_text(message.user)
@@ -761,7 +810,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             user_hits = await self._recent_memory_hits(
                 store=store,
                 namespace=(self.namespace_root, "users", user_id, chat_id),
-                limit=RECENT_MEMORY_CONTEXT_LIMIT,
+                limit=self.recent_memory_context_limit,
             )
             title = f"{user_name}({user_id})" if user_name else user_id
             sections.append(
@@ -783,7 +832,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             cached_hits = self._recent_memory_cache[namespace]
             if (
                 len(cached_hits) >= limit
-                or len(cached_hits) < RECENT_MEMORY_CACHE_LIMIT
+                or len(cached_hits) < self.recent_memory_context_limit
             ):
                 return cached_hits[:limit]
 
@@ -802,7 +851,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 break
             offset += page_size
 
-        recent_hits = _sort_hits(hits)[: max(limit, RECENT_MEMORY_CACHE_LIMIT)]
+        recent_hits = _sort_hits(hits)[: max(limit, self.recent_memory_context_limit)]
         self._recent_memory_cache[namespace] = recent_hits
         return recent_hits[:limit]
 
@@ -816,20 +865,20 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         ]
         merged_hits.append(hit)
         self._recent_memory_cache[hit["namespace"]] = _sort_hits(merged_hits)[
-            :RECENT_MEMORY_CACHE_LIMIT
+            : self.recent_memory_context_limit
         ]
 
     def _resolve_candidate_user(
         self,
         candidate: MemoryCandidate,
-        state: ManagerState,
         session_id: str,
     ) -> MemoryCandidate:
         if candidate.user_id or not candidate.user_name:
             return candidate
 
         resolution = self._resolve_user(
-            state, user_name=candidate.user_name, session_id=session_id
+            user_name=candidate.user_name,
+            session_id=session_id,
         )
         if not resolution.user_id:
             return candidate
@@ -845,7 +894,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         *,
         candidate: MemoryCandidate,
-        ctx: ManagerContext,
+        chat_id: str,
         store: BaseStore,
     ) -> LongMemoryEvent:
         def normalize_time_string(value: str) -> str | None:
@@ -857,9 +906,9 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         memory_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         namespace = (
-            (self.namespace_root, "users", candidate.user_id, ctx["chat_id"])
+            (self.namespace_root, "users", candidate.user_id, chat_id)
             if candidate.user_id
-            else (self.namespace_root, "chats", ctx["chat_id"])
+            else (self.namespace_root, "chats", chat_id)
         )
 
         value: dict[str, Any] = {
@@ -869,7 +918,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             "user_id": candidate.user_id or None,
             "user_name": candidate.user_name or None,
             "source_message_ids": candidate.source_message_ids,
-            "chat_id": ctx["chat_id"],
+            "chat_id": chat_id,
             "tags": candidate.tags,
             "event_time_start": normalize_time_string(candidate.time_start),
             "event_time_end": normalize_time_string(candidate.time_end),
@@ -910,7 +959,6 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
 
     def _resolve_user(
         self,
-        state: ManagerState,
         *,
         user_name: str,
         session_id: str,
@@ -921,19 +969,6 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         name = _clean_text(user_name)
         if not name:
             return NormalizedUserResolution()
-
-        if not self._user_maps[session_id]:
-            self._user_maps[session_id] = {
-                user_msg.user: user_msg.user_id
-                for msg in state["histories"]
-                if isinstance(msg, HumanMessage)
-                and (user_msg := msg.additional_kwargs.get("raw"))
-                and isinstance(user_msg, UserMessage)
-            }
-
-        self._user_maps[session_id] = self._user_maps[session_id] | {
-            msg.user: msg.user_id for msg in state["inputs"]
-        }
 
         if name in self._user_maps[session_id]:
             user_id = _clean_text(self._user_maps[session_id][name])
@@ -980,6 +1015,65 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             fallback_applied=True,
             fallback_reason="user_name_not_resolved",
         )
+
+    def _remember_users_from_state(self, state: ManagerState, session_id: str) -> None:
+        self._remember_users_from_messages(
+            session_id, cast("list[BaseMessage]", state.get("histories"))
+        )
+        self._remember_users_from_user_messages(session_id, state.get("inputs", []))
+
+    def _remember_users_from_messages(
+        self,
+        session_id: str,
+        messages: list[BaseMessage] | None,
+    ) -> None:
+        if not messages:
+            return
+        self._remember_users_from_user_messages(
+            session_id,
+            self._extract_user_messages(messages),
+        )
+
+    def _remember_users_from_user_messages(
+        self,
+        session_id: str,
+        messages: list[UserMessage],
+    ) -> None:
+        if not messages:
+            return
+
+        user_map = self._user_maps[session_id]
+        for message in messages:
+            user_name = _clean_text(message.user)
+            if user_name:
+                user_map[user_name] = _clean_text(message.user_id)
+
+    def _extract_user_messages(
+        self,
+        messages: list[BaseMessage],
+    ) -> list[UserMessage]:
+        return [
+            raw
+            for message in messages
+            if isinstance(message, HumanMessage)
+            and isinstance(raw := message.additional_kwargs.get("raw"), UserMessage)
+        ]
+
+    def _get_query_namespaces(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+    ) -> list[tuple[str, ...]]:
+        chat_namespace = (self.namespace_root, "chats", chat_id)
+        if not user_id:
+            return [chat_namespace]
+
+        return [
+            (self.namespace_root, "users", user_id, chat_id),
+            (self.namespace_root, "users", user_id),
+            chat_namespace,
+        ]
 
     async def _search_semantic(
         self,
@@ -1059,26 +1153,6 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 offset += page_size
 
         return _sort_hits(hits)[:limit]
-
-
-def _tool_command(
-    *,
-    runtime: ToolRuntime[ManagerContext, ManagerState],
-    content: str,
-    events: list[LongMemoryEvent],
-) -> Command:
-    old_events = list(runtime.state.get("long_memory_events", []) or [])
-    return Command(
-        update={
-            "long_memory_events": [*old_events, *events],
-            "messages": [
-                ToolMessage(
-                    content=content,
-                    tool_call_id=runtime.tool_call_id,
-                )
-            ],
-        }
-    )
 
 
 def _item_to_hit(item: Any) -> LongMemoryHit:
