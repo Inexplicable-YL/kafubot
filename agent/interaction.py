@@ -111,6 +111,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
 
     get_session_history: Callable[..., BaseChatMessageHistory]
     history_caches: dict[str, list[BaseMessage]]
+    summary_pruned_messages: dict[str, list[BaseMessage]]
     reply_turn: dict[str, int]
     real_average_count: dict[str, float]
     display_messages: dict[str, list[BaseMessage]]
@@ -144,6 +145,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         self.average_reply_count = average_reply_count
 
         self.history_caches = defaultdict(list)
+        self.summary_pruned_messages = defaultdict(list)
         self.reply_turn = defaultdict(lambda: 0)
         self.real_average_count = defaultdict(lambda: 0)
         self.display_messages = defaultdict(list)
@@ -270,6 +272,10 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
                         tool_call_id=runtime.tool_call_id,
                     )
                 ],
+                "summary_pruned_messages": self.summary_pruned_messages.pop(
+                    runtime.context["session_id"], None
+                )
+                or None,
             }
         )
 
@@ -353,6 +359,10 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             "histories": history_messages,
             "inputs": inputs,
             "outputs": [],
+            "summary_pruned_messages": self.summary_pruned_messages.pop(
+                session_id, None
+            )
+            or None,
         }
 
     async def aafter_agent(
@@ -480,9 +490,12 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             len(self.history_caches[session_id]) + len(new_messages)
             > self.max_history_window
         ):
-            self.history_caches[session_id] = (
-                self.history_caches[session_id] + new_messages
-            )[-self.min_history_window :]
+            combined_messages = self.history_caches[session_id] + new_messages
+            kept_messages = combined_messages[-self.min_history_window :]
+            pruned_messages = combined_messages[: -self.min_history_window]
+            self.history_caches[session_id] = kept_messages
+            if pruned_messages:
+                self.summary_pruned_messages[session_id].extend(pruned_messages)
         else:
             self.history_caches[session_id] += new_messages
         for output in output_messages:

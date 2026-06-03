@@ -2,13 +2,12 @@ import os
 from datetime import datetime  # noqa: TC003
 from html import escape
 from operator import add
-from typing import Annotated, Any, Literal
-from typing_extensions import TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from langchain.agents import AgentState
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, BaseMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.message import QQMessage  # noqa: TC001
@@ -50,6 +49,7 @@ class ManagerState(AgentState):
     currents: list[AnyMessage]
     histories: list[AnyMessage]
 
+    summary_pruned_messages: NotRequired[list[BaseMessage] | None]
 
 class ManagerContext(TypedDict):
     node: Any

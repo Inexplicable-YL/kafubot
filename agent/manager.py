@@ -28,6 +28,7 @@ from agent.extensions import (
     ActivateLimitMiddleware,
     LongMemoryMiddleware,
     MemeSendingMiddleware,
+    SummarizationMiddleware,
     query_image,
     search_song,
     view_forward_message,
@@ -134,6 +135,7 @@ def get_model(
 
 
 async def create_agent_service():
+    summary_middlewares: list[SummarizationMiddleware] = []
     conn = await aiosqlite.connect(
         "./.database/long_memory.db",
         isolation_level=None,
@@ -160,6 +162,8 @@ async def create_agent_service():
             )
             | interaction_config
         )
+        summary_middleware = SummarizationMiddleware(summary_model=get_model("high"))
+        summary_middlewares.append(summary_middleware)
         return create_agent(
             model=get_model("max"),
             tools=[query_image, search_song, view_forward_message],
@@ -172,6 +176,7 @@ async def create_agent_service():
                     use_subagent=True,
                     subagent_model=get_model("max"),
                 ),
+                summary_middleware,
                 generate_prompt,
                 add_time,
             ],
@@ -181,6 +186,8 @@ async def create_agent_service():
         )
 
     async def shutdown():
+        for summary_middleware in summary_middlewares:
+            await summary_middleware.aclose()
         await conn.close()
 
     return get_agent, shutdown
