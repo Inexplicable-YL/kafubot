@@ -1,7 +1,22 @@
 """会话摘要中间件。
 
-该中间件不负责主动裁剪消息，而是消费上游已经剪掉的历史消息，
-在后台异步生成会话摘要，并在后续模型调用前把摘要重新注入上下文。
+该中间件不负责主动裁剪消息，而是消费上游已经剪掉的历史消息，在后台异步生成
+会话摘要，并在后续模型调用前把摘要重新注入上下文。
+
+整体流程分为三段：
+
+1. `abefore_agent` 在主代理开始执行前，预热当前会话的摘要缓存。
+2. `aafter_agent` 接收上游已经裁剪掉的历史消息，并按 `session_id` 投递到后台队列。
+3. 后台 worker 串行更新摘要，`awrap_model_call` 再把最新摘要注入后续模型调用。
+
+与“把所有历史消息一直保留在 live context”相比，这种设计的核心价值在于：
+
+1. 历史上下文可以被压缩成稳定、低成本的会话记忆层。
+2. 摘要生成发生在主对话链路之外，不直接增加当前轮回复延迟。
+3. 摘要内容可以持续覆盖更新，避免旧消息无限累积。
+
+该模块的职责边界也比较明确：它只关心“已经被上游裁剪掉的消息如何沉淀成摘要”，
+不决定何时裁剪、裁剪多少，也不改写当前轮正在参与推理的 live messages。
 """
 
 from __future__ import annotations
@@ -91,24 +106,32 @@ Here is a summary of the conversation to date:
 
 
 DEFAULT_NAMESPACE_ROOT = "session_memory"
-
-# 默认的空摘要文本，确保 summary 字段始终有内容，避免模型调用时注入完全空的 system message。
 _DEFAULT_EMPTY_SUMMARY = "None."
 _SUMMARY_SOURCE = "session_summary"
 _DEFAULT_RETRY_BACKOFF = 5.0
 
 
 class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
-    """为会话提供异步摘要能力。
+    """为代理提供异步会话摘要能力。
 
-    整体流程分成三段：
+    这个中间件的核心设计思想，是把“长期上下文压缩”作为一个独立的后台子系统来
+    维护，而不是在主调用链里即时总结。这样既能持续保留会话进展，又能避免把大段
+    历史消息反复塞回 live context。
 
-    1. `aafter_agent` 接收由上游裁剪出的历史消息，并按 session 入队。
-    2. 后台 worker 串行处理同一 session 的待总结批次，生成并持久化摘要。
-    3. `awrap_model_call` 在主模型调用前把摘要作为额外的 system message 注入。
+    内部流程可以概括为三个层次：
 
-    设计上它只关心“已经被裁掉的旧消息”，不会干预上游如何裁剪，也不会
-    主动改写当前轮的 live messages。
+    1. 收集层：`aafter_agent` 接收被上游裁剪掉的历史消息，按会话写入待处理队列。
+    2. 工作层：后台 worker 串行处理同一会话的批次，生成并持久化最新摘要。
+    3. 注入层：`awrap_model_call` 在主模型调用前读取缓存，把摘要作为额外 system
+       message 注入。
+
+    与普通缓存不同，这里的摘要缓存既承担性能职责，也承担语义职责：
+
+    1. 性能上，它避免每一轮都从 store 反复读取同一摘要。
+    2. 语义上，它代表“当前会话已压缩沉淀出的最重要上下文”。
+
+    Attributes:
+        namespace: 当前中间件写入 store 时使用的命名空间。
     """
 
     state_schema = ManagerState
@@ -129,15 +152,19 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         """初始化摘要中间件。
 
         Args:
-            summary_model: 专门用于生成摘要的模型。
-            max_sessions: 整个系统最多同时持有的 session 数量（LRU 驱逐）。
-            max_input_chars: 单次摘要输入的最大字符数。
-            max_output_chars: 最终摘要文本的最大字符数。
-            max_batches: 单次摘要时最多合并多少个待处理批次。
-            max_retries: 单个 session 摘要失败后的最大重试次数。
-            summary_prompt: 摘要模型使用的提示词模板。
-            store: 可选持久化存储；为空时只保存在进程内。
-            namespace_root: 持久化存储命名空间的根路径。
+            summary_model: 专门用于生成会话摘要的模型。
+            max_sessions: 进程内最多同时维护多少个活跃会话的队列、缓存和重试状态。
+                超出后由 `LRUCache` 自动驱逐较久未访问的会话状态。
+            max_input_chars: 单次摘要模型调用允许输入的最大字符数。
+            max_output_chars: 单条摘要最终允许保留的最大字符数。
+            max_batches: 单次后台处理时，最多合并多少个待处理批次。
+            max_retries: 同一会话摘要任务失败后的最大自动重试次数。
+            summary_prompt: 用于生成摘要的提示词模板。调用方可以覆盖默认模板，但
+                仍应保持“基于旧摘要与新消息，产出完整新摘要”的语义。
+            store: 可选的持久化存储。若未显式传入，会在运行时优先使用
+                `runtime.store`。
+            namespace_root: 持久化命名空间根名称。若包含点号，会被转换成下划线，
+                以避免不同 store 后端在命名空间解析上的差异。
         """
         super().__init__()
         self.summary_model = summary_model
@@ -175,7 +202,20 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         state: ManagerState,
         runtime: Runtime[ManagerContext],
     ) -> dict[str, Any] | None:
-        """在 agent 启动前预热当前 session 的摘要缓存。"""
+        """在主代理开始执行前预热当前会话的摘要缓存。
+
+        该钩子的目标很直接：尽量在真正进入模型调用前，就把当前会话的摘要从
+        store 惰性加载到进程内缓存。这样一来，`awrap_model_call` 通常只需要做一
+        次字典读取，而不必在主调用链上临时访问外部存储。
+
+        Args:
+            state: 当前代理状态。这里不直接读取其中内容，但保留参数以满足中间件
+                接口约定。
+            runtime: 运行时上下文，用于获取 `session_id` 和可用的 store。
+
+        Returns:
+            始终返回 `None`，因为该钩子只做缓存预热，不改写状态。
+        """
         _ = state
         if runtime.store is not None:
             self._store = self._store or runtime.store
@@ -187,7 +227,21 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         state: ManagerState,
         runtime: Runtime[ManagerContext],
     ) -> dict[str, Any] | None:
-        """接收本轮被上游裁掉的历史消息，并把它们投递到后台摘要队列。"""
+        """接收本轮被裁剪掉的历史消息，并把它们投递到后台摘要队列。
+
+        该钩子只关心 `summary_pruned_messages`。这意味着：
+
+        1. 当前还留在 live context 中的消息不会被重复总结。
+        2. 摘要系统天然与“消息裁剪策略”解耦，只消费其产物。
+        3. 摘要生成延迟到主代理执行之后，不阻塞当前轮响应。
+
+        Args:
+            state: 当前代理状态。这里会读取 `summary_pruned_messages`。
+            runtime: 运行时上下文，用于获取 `session_id` 和 store。
+
+        Returns:
+            始终返回 `None`，因为该钩子只负责排队副作用。
+        """
         if runtime.store is not None:
             self._store = self._store or runtime.store
         if messages := cast(
@@ -208,10 +262,21 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         request: ModelRequest[ManagerContext],
         handler,
     ) -> Any:
-        """在主模型调用前注入 session summary。
+        """在主模型调用前注入当前会话摘要。
 
-        这里刻意不去改写主 system prompt，而是额外插入一条 system message，
-        让摘要成为独立的会话背景层，便于和主提示词职责分离。
+        这里刻意不去修改原始 system prompt，而是额外插入一条新的 `SystemMessage`。
+        这样做的好处是：
+
+        1. 摘要作为独立上下文层存在，更容易与角色提示分离。
+        2. 上游若需要观察或调试注入内容，可以明确识别 `_SUMMARY_SOURCE`。
+        3. 未来如果调整摘要注入策略，不必侵入主提示词模板。
+
+        Args:
+            request: 当前模型调用请求。
+            handler: 下一个处理器。
+
+        Returns:
+            下游处理器返回的模型调用结果。
         """
         if request.runtime.store is not None:
             self._store = self._store or request.runtime.store
@@ -235,7 +300,11 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         )
 
     async def aclose(self) -> None:
-        """关闭后台服务并清空进程内缓存。"""
+        """关闭后台摘要服务并清空进程内状态。
+
+        该方法只会清理当前进程持有的资源与缓存，不删除已经写入外部 store 的持久化
+        摘要数据。
+        """
         if self._send_stream is not None:
             await self._send_stream.aclose()
         if self._receive_stream is not None:
@@ -258,7 +327,8 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     async def _ensure_service(self) -> None:
         """确保后台摘要 worker 已启动。
 
-        该服务是惰性启动的：只有第一次真的收到 pruned messages 时才创建。
+        该后台服务采用惰性启动策略：只有真正收到待总结消息时才创建内存流与
+        `TaskGroup`。这可以避免在完全不需要摘要能力的会话中平白持有后台资源。
         """
         if self._send_stream is not None:
             return
@@ -282,10 +352,13 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         receive_stream: MemoryObjectReceiveStream[str],
     ) -> None:
-        """异常隔离与自动重启包装器。
+        """作为外层监护循环运行摘要 worker。
 
-        当 _worker 因任何未捕获异常退出时，自动等待 1s 后重启，
-        直到 aclose() 将 receive_stream 置空。
+        真正的业务处理由 `_worker` 完成；这里的职责是隔离未捕获异常，并在 worker
+        崩溃后自动等待一小段时间再重启，避免偶发错误直接让整个摘要子系统永久停摆。
+
+        Args:
+            receive_stream: 接收待处理 `session_id` 的内存流。
         """
         async with receive_stream:
             while self._receive_stream is not None:
@@ -298,10 +371,14 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                     await anyio.sleep(1.0)
 
     async def _queue_job(self, session_id: str) -> None:
-        """为指定 session 投递一次摘要任务。
+        """为指定会话投递一次摘要任务。
 
-        `_scheduled_sessions` 用于去重，保证同一 session 在后台最多只挂一个
-        待执行任务；真正的批次合并在 worker 内部完成。
+        `_scheduled_sessions` 用于去重，保证同一 `session_id` 在任意时刻最多只存在
+        一个“已进入调度体系但尚未完成”的后台任务。至于这个任务内部会合并多少个批
+        次，则由 `_worker` 和 `_build_summary_input` 决定。
+
+        Args:
+            session_id: 需要安排摘要处理的会话 ID。
         """
         if (
             self._send_stream is None
@@ -344,10 +421,13 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         receive_stream: MemoryObjectReceiveStream[str],
     ) -> None:
-        """后台摘要 worker。
+        """后台摘要 worker 主循环。
 
-        它按 session 维度串行推进摘要，失败时触发延迟重试，成功时继续消费
-        同一 session 剩余的待处理批次。
+        它按会话维度串行推进摘要更新：某个会话失败时进入延迟重试，成功时若该会话
+        仍然残留待处理批次，则继续重新排队，直到当前积压被尽可能消费完。
+
+        Args:
+            receive_stream: 从 `_queue_job` 投递过来的 `session_id` 流。
         """
         async for session_id in receive_stream:
             try:
@@ -368,12 +448,22 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 await self._queue_job(session_id)
 
     async def _summarize_session(self, session_id: str) -> tuple[bool, bool]:
-        """尽可能推进某个 session 的摘要状态。
+        """尽可能推进某个会话的摘要状态。
+
+        该方法会反复尝试消费当前会话积压的待处理批次。每一轮都执行：
+
+        1. 取若干批次并拼成一次摘要输入。
+        2. 调用摘要模型生成新的完整摘要。
+        3. 将结果写回缓存和 store。
+        4. 成功后从队列中移除对应批次。
+
+        Args:
+            session_id: 需要推进摘要状态的会话 ID。
 
         Returns:
-            `(progressed, failed)`：
-            - `progressed=True` 表示至少消费掉了一部分待处理批次。
-            - `failed=True` 表示本轮处理中遇到了需要后续重试的错误。
+            一个二元组 `(progressed, failed)`：
+            `progressed=True` 表示至少消费掉了一个批次或空批次；
+            `failed=True` 表示本轮遇到了需要进入重试流程的错误。
         """
         progressed = False
         failed = False
@@ -418,10 +508,17 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         current_summary: str,
         messages_text: str,
     ) -> str | None:
-        """调用摘要模型生成新摘要。
+        """调用摘要模型生成新的完整摘要。
 
-        这里采用“当前摘要 + 新剪枝消息”的增量覆盖模式，每次生成的结果都
-        会完整替换旧摘要。
+        这里采用“旧摘要 + 新裁剪消息 -> 新摘要”的覆盖式更新模式。也就是说，模型
+        每次输出的都应当是可以直接替换旧摘要的完整结果，而不是一段增量补丁。
+
+        Args:
+            current_summary: 当前会话已存在的摘要文本。
+            messages_text: 本轮新纳入总结范围的历史消息文本。
+
+        Returns:
+            生成成功时返回新的摘要文本；若模型调用失败或返回空结果，则返回 `None`。
         """
         try:
             response = await self.summary_model.ainvoke(
@@ -445,12 +542,21 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         pending_batches: deque[list[BaseMessage]],
     ) -> tuple[int, str]:
-        """从待处理批次中拼出一次摘要调用的输入。
+        """从待处理批次中构建一次摘要模型调用的输入。
 
-        策略是按顺序合并前若干个批次：
-        - 单条消息先做字符级截断，避免异常长消息污染输入。
-        - 一旦累计文本超过 `max_summary_input_chars`，就停止继续扩张。
-        - 如果超长发生在第一批，则保留该批并整体截断，确保任务还能推进。
+        输入拼装策略与后台摘要的吞吐和成本直接相关，因此这里做了三层约束：
+
+        1. 单条消息先按 `_max_message_chars` 截断，防止极长消息污染整批输入。
+        2. 单次最多合并 `max_batches` 个批次，限制单轮处理时延。
+        3. 总文本超过 `max_input_chars` 后停止扩展；若超限发生在首批，则保留首批并
+           做整体截断，确保任务仍然能够继续前进，而不是被一条超长历史永久卡住。
+
+        Args:
+            pending_batches: 当前会话积压的待处理批次队列。
+
+        Returns:
+            一个二元组 `(batch_count, messages_text)`，其中 `batch_count` 表示本轮纳入
+            的批次数，`messages_text` 是格式化后的摘要输入文本。
         """
         selected_messages: list[BaseMessage] = []
         batch_count = 0
@@ -485,7 +591,18 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         )
 
     async def _ensure_session_summary_loaded(self, session_id: str) -> None:
-        """把指定 session 的摘要从 store 懒加载到进程内缓存。"""
+        """把指定会话的摘要从 store 惰性加载到进程内缓存。
+
+        `_loaded_sessions` 的语义不是“该会话一定有摘要”，而是“该会话已经尝试过装载”。
+        这样可以区分：
+
+        1. 还没查过 store。
+        2. 查过，但确实没有摘要。
+        3. 查过，并成功装入了摘要内容。
+
+        Args:
+            session_id: 需要装载摘要的会话 ID。
+        """
         if (
             session_id in self._loaded_sessions
             and session_id in self._session_summaries
@@ -515,7 +632,21 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             )
 
     async def _save_session_summary(self, session_id: str, summary: str) -> bool:
-        """保存摘要到缓存，并在有 store 时写入持久层。"""
+        """保存摘要到进程缓存，并在可用时写入持久化 store。
+
+        该方法会统一负责：
+
+        1. 按 `max_output_chars` 截断最终摘要。
+        2. 在纯内存模式下更新缓存。
+        3. 在持久化模式下保留既有 `created_at`，只刷新 `updated_at`。
+
+        Args:
+            session_id: 需要保存摘要的会话 ID。
+            summary: 待保存的摘要文本。
+
+        Returns:
+            保存成功返回 `True`，否则返回 `False`。
+        """
         summary = _truncate(summary.strip(), self.max_output_chars)
         if not summary:
             return False
@@ -552,10 +683,14 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         return True
 
     async def _schedule_retry(self, session_id: str) -> None:
-        """为失败的 session 安排一次延迟重试。
+        """为失败的会话摘要任务安排一次延迟重试。
 
-        同一个 session 在等待重试期间只允许存在一个延迟任务，避免错误高峰时
-        产生无意义的重试风暴。
+        与 `jargon_learner` 不同，这里的重试上限耗尽后不会主动丢弃批次，而是停止当前
+        这一轮自动重试。这样做更保守：摘要失败不会直接造成历史上下文丢失，只是暂时
+        不再继续自动推进，等待后续新的调度机会。
+
+        Args:
+            session_id: 需要重试的会话 ID。
         """
         if not self._pending_batches.get(session_id):
             self._retry_attempts.pop(session_id, None)
@@ -586,7 +721,12 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         session_id: str,
         delay_seconds: float,
     ) -> None:
-        """等待一段时间后，把失败 session 重新投回正常队列。"""
+        """在指定延迟后，把失败会话重新投递回正常处理队列。
+
+        Args:
+            session_id: 需要重新排队的会话 ID。
+            delay_seconds: 本轮重试前需要等待的秒数。
+        """
         try:
             await anyio.sleep(delay_seconds)
         finally:
@@ -600,7 +740,16 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
 
 
 def _truncate(text: str, limit: int) -> str:
-    """按字符数截断文本，并尽量保留省略号语义。"""
+    """按字符上限截断文本，并尽量保留省略语义。
+
+    Args:
+        text: 待截断的文本。
+        limit: 允许保留的最大字符数。
+
+    Returns:
+        若原文本未超限则原样返回；否则尽量在尾部附加 `...`。当 `limit <= 3` 时，
+        直接返回硬截断结果，避免出现负索引语义混乱。
+    """
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..." if limit > 3 else text[:limit]

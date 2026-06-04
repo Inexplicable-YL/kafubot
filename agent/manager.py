@@ -26,7 +26,7 @@ from agent.base import (
 from agent.builder import create_agent
 from agent.extensions import (
     ActivateLimitMiddleware,
-    JargonMiddleware,
+    JargonLearnerMiddleware,
     LongMemoryMiddleware,
     MemeSendingMiddleware,
     SummarizationMiddleware,
@@ -137,7 +137,7 @@ def get_model(
 
 
 async def create_agent_service():
-    jargon_middlewares: list[JargonMiddleware] = []
+    jargon_middlewares: list[JargonLearnerMiddleware] = []
     memory_middlewares: list[LongMemoryMiddleware] = []
     summary_middlewares: list[SummarizationMiddleware] = []
     conn = await aiosqlite.connect(
@@ -167,7 +167,7 @@ async def create_agent_service():
             )
             | interaction_config
         )
-        jargon_middleware = JargonMiddleware(analyze_model=get_model(0.3, "max"))
+        jargon_middleware = JargonLearnerMiddleware(analyze_model=get_model(0.3, "max"))
         jargon_middlewares.append(jargon_middleware)
         summary_middleware = SummarizationMiddleware(
             summary_model=get_model(0.3, "max")

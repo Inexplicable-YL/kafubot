@@ -258,7 +258,7 @@ _DEFAULT_NAMESPACE = "jargon"
 _DEFAULT_RETRY_BACKOFF = 5.0
 
 
-class JargonMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
+class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     """为代理提供异步黑话抽取、入库、推断与查询能力。
 
     这个中间件刻意不把黑话分析放在主对话的同步路径里，而是在消息被上游裁剪后
@@ -311,7 +311,8 @@ class JargonMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 邻近消息，用于帮助推断词条含义。
             max_retries: 同一会话的分析任务最多允许失败重试多少次。
             store: 可选的持久化存储。若未显式传入，会在运行时优先使用
-                `runtime.store`。
+                `runtime.store`。建议使用独立的 store 实例，以避免与主代理的
+                其他数据产生混淆。
             jargon_group_resolver: 会话作用域解析器。它用于把一个 `session_id`
                 扩展为一组“可共享黑话词库”的关联会话 ID，也可额外返回是否存在
                 全局共享语义。
@@ -1514,14 +1515,7 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _clean_text(value: Any) -> str:
-    """把任意输入规范化为单行紧凑文本。
-
-    Args:
-        value: 任意待清洗值。
-
-    Returns:
-        清洗后的字符串。连续空白会被压缩为单个空格，两端空白会被移除。
-    """
+    """把任意输入规范化为单行紧凑文本。"""
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
@@ -1560,4 +1554,4 @@ def _is_invalid_jargon_candidate(content: str) -> bool:
     return bool(":meme" in content or ":image" in content)
 
 
-__all__ = ["JargonMiddleware"]
+__all__ = ["JargonLearnerMiddleware"]
