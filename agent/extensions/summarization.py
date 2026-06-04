@@ -703,6 +703,12 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 session_id,
                 len(self._pending_batches.get(session_id, ())),
             )
+            pending = self._pending_batches.get(session_id)
+            if pending:
+                pending.popleft()
+                if not pending:
+                    self._pending_batches.pop(session_id, None)
+            self._retry_attempts.pop(session_id, None)
             return
 
         self._retry_attempts[session_id] = attempt

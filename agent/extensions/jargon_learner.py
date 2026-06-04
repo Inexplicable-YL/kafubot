@@ -1298,7 +1298,6 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             )
             pending = self._pending_batches.get(session_id)
             if pending:
-                # 超过最大重试后丢弃最旧批次，让后续新数据仍有机会继续被学习。
                 pending.popleft()
                 if not pending:
                     self._pending_batches.pop(session_id, None)
