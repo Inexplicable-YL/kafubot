@@ -19,16 +19,24 @@
 不决定何时裁剪、裁剪多少，也不改写当前轮正在参与推理的 live messages。
 """
 
-from __future__ import annotations
-
 import logging
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 from typing_extensions import override
 
 from cachetools import LRUCache
+from langchain.agents.middleware.types import (
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
+)
 from langchain.messages import HumanMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.messages.utils import get_buffer_string
+from langgraph.runtime import Runtime
+from langgraph.store.base import BaseStore
 
 from agent.base import ManagerContext, ManagerState
 from agent.middlewares.base import (
@@ -36,19 +44,6 @@ from agent.middlewares.base import (
     SessionProcessOutput,
 )
 from agent.utils import content_to_text
-
-if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
-
-    from langchain.agents.middleware.types import (
-        ExtendedModelResponse,
-        ModelRequest,
-        ModelResponse,
-    )
-    from langchain_core.language_models.chat_models import BaseChatModel
-    from langchain_core.messages import AIMessage, BaseMessage
-    from langgraph.runtime import Runtime
-    from langgraph.store.base import BaseStore
 
 logger = logging.getLogger(__name__)
 

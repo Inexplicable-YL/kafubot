@@ -18,21 +18,23 @@
 永久阻塞。
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import random
 import re
 from collections import defaultdict
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 from typing_extensions import override
 
 from json_repair import repair_json
-from langchain.tools import tool
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain.tools import ToolRuntime, tool
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langgraph.runtime import Runtime
+from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
 from agent.base import ManagerContext, ManagerState, UserMessage
@@ -44,13 +46,7 @@ from agent.prompts.manager import BOT_NAME
 from agent.utils import content_to_text
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
-
-    from langchain.tools import ToolRuntime
-    from langchain_core.language_models.chat_models import BaseChatModel
-    from langchain_core.messages import BaseMessage
-    from langgraph.runtime import Runtime
-    from langgraph.store.base import BaseStore, SearchItem
+    from langgraph.store.base import SearchItem
 
 logger = logging.getLogger(__name__)
 
