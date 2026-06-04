@@ -24,7 +24,7 @@ import json
 import logging
 import random
 import re
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
@@ -36,12 +36,15 @@ from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from agent.base import ManagerContext, ManagerState, UserMessage
-from agent.middlewares.base import BaseDaemonMiddleware
+from agent.middlewares.base import (
+    BaseDaemonMiddleware,
+    SessionProcessOutput,
+)
 from agent.prompts.manager import BOT_NAME
 from agent.utils import content_to_text
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from langchain.tools import ToolRuntime
     from langchain_core.language_models.chat_models import BaseChatModel
@@ -321,6 +324,7 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         super().__init__(
             max_sessions=max_sessions,
             max_retries=max_retries,
+            max_batch_window_size=max_batches,
             logger_config={
                 "worker_name": "JargonLearner",
                 "job_name": "jargon learning",
@@ -331,7 +335,6 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         self.analyze_model = analyze_model
         self.max_input_chars = max_input_chars
         self.max_raw_content_chars = max_raw_content_chars
-        self.max_batches = max_batches
         self.context_window_size = context_window_size
         self._store = store
         self.jargon_group_resolver = jargon_group_resolver
@@ -384,57 +387,52 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         return None
 
     @override
-    async def process_session(self, session_id: str) -> tuple[bool, bool]:
+    async def process_batches(
+        self,
+        session_id: str,
+        batches: tuple[PendingJargonAnalysisBatch, ...],
+    ) -> SessionProcessOutput:
         """分析单个会话当前积压的黑话批次。
 
-        该方法会不断从指定会话的待处理队列头部取出若干批次，构造成一次抽取输入，
-        然后执行“抽取候选词条 -> 入库 -> 必要时触发含义推断”的完整流程。
+        父类已经负责从会话队列中切出当前批次窗口，这里只处理本轮业务逻辑：
+        构造抽取输入，然后执行“抽取候选词条 -> 入库 -> 必要时触发含义推断”。
 
         Args:
-            session_id: 需要分析的会话 ID。
+            session_id: 当前会话 ID。
+            batches: 父类传入的当前批次窗口。
 
         Returns:
-            一个二元组 `(progressed, failed)`：
-            `progressed` 表示本次调用是否成功消费了至少一个批次；
-            `failed` 表示本次是否因为模型调用或解析失败而需要进入重试流程。
+            业务处理结果。父类会统一归一化返回值、出队和处理失败重试。
         """
         if self._store is None:
             logger.warning(
                 "Skipping jargon analysis for session %s because store is unavailable",
                 session_id,
             )
-            return False, False
+            return None
 
-        progressed = False
-        failed = False
-        while pending_batches := self._pending_batches.get(session_id):
-            batch_count, resolved_session_id, messages_text, source_map = (
-                self._build_extraction_input(pending_batches)
-            )
-            if not messages_text:
-                self._pop_processed_batches(session_id, batch_count)
-                progressed = True
-                continue
+        batch_count, messages_text, source_map = self._build_extraction_input(batches)
+        if batch_count <= 0:
+            return None
 
-            entries = await self._extract_entries(messages_text, source_map)
-            if entries is None:
-                failed = True
-                break
+        if not messages_text:
+            return batch_count
 
-            await self._process_entries(
-                session_id=resolved_session_id,
-                entries=entries,
-                store=self._store,
-            )
-            self._pop_processed_batches(session_id, batch_count)
-            progressed = True
+        entries = await self._extract_entries(messages_text, source_map)
+        if entries is None:
+            return 0, True
 
-        return progressed, failed
+        await self._process_entries(
+            session_id=session_id,
+            entries=entries,
+            store=self._store,
+        )
+        return batch_count
 
     def _build_extraction_input(
         self,
-        pending_batches: deque[PendingJargonAnalysisBatch],
-    ) -> tuple[int, str, str, dict[str, str]]:
+        batches: Sequence[PendingJargonAnalysisBatch],
+    ) -> tuple[int, str, dict[str, str]]:
         """把若干待处理批次压缩为一次抽取模型输入。
 
         该方法一边构建发给模型的消息文本，一边维护后续回查上下文所需的
@@ -442,22 +440,20 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         并使用带标签的文本格式提示模型进行抽取。
 
         Args:
-            pending_batches: 某个会话当前积压的待处理批次队列。
+            batches: 父类已经切好的当前批次窗口。
 
         Returns:
-            一个四元组 `(batch_count, session_id, messages_text, source_map)`，
-            其中 `batch_count` 是本次纳入分析的批次数，`messages_text` 是发给
-            抽取模型的文本，`source_map` 用于把模型返回的 `source_id` 重新映射
-            回上下文窗口。
+            一个三元组 `(batch_count, messages_text, source_map)`，其中
+            `batch_count` 是本次纳入分析的批次数，`messages_text` 是发给抽取模型
+            的文本，`source_map` 用于把模型返回的 `source_id` 重新映射回上下文
+            窗口。
         """
         selected_lines: list[str] = []
         selected_records: list[dict[str, Any]] = []
         batch_count = 0
-        session_id = ""
         synthetic_index = 0
 
-        for batch in list(pending_batches)[: self.max_batches]:
-            session_id = batch.session_id
+        for batch in batches:
             batch_records: list[dict[str, Any]] = []
 
             for message in batch.messages:
@@ -526,14 +522,12 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
                 messages_text = _truncate(candidate, self.max_input_chars)
                 return (
                     batch_count,
-                    session_id,
                     messages_text,
                     self._build_source_context_map(selected_records),
                 )
 
         return (
             batch_count,
-            session_id,
             "\n".join(selected_lines).strip(),
             self._build_source_context_map(selected_records),
         )

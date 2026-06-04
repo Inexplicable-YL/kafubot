@@ -3,7 +3,14 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import TYPE_CHECKING, Generic, NotRequired, TypedDict, TypeVar
+from dataclasses import dataclass
+from typing import (
+    TYPE_CHECKING,
+    Generic,
+    NotRequired,
+    TypedDict,
+    TypeVar,
+)
 
 import anyio
 from cachetools import LRUCache
@@ -27,12 +34,26 @@ class LoggerConfig(TypedDict):
     retry_exhausted_label: NotRequired[str | None]
 
 
+@dataclass(slots=True, frozen=True)
+class ProcessResult:
+    """Business result returned by subclasses for one batch window."""
+
+    consumed_batches: int = 0
+    failed: bool = False
+
+
+# `None` -> consumed_batches=0, failed=False
+# `int` -> consumed_batches=<int>, failed=False
+# `tuple[int, bool]` -> consumed_batches, failed
+SessionProcessOutput = int | tuple[int, bool] | ProcessResult | None
+
+
 class BaseDaemonMiddleware(
     AgentMiddleware[ManagerState, ManagerContext],
     ABC,
     Generic[BatchT],
 ):
-    """Shared session-scoped background queue lifecycle for middlewares."""
+    """Shared session-scoped queue/worker/retry system for background middlewares."""
 
     state_schema = ManagerState
 
@@ -41,6 +62,7 @@ class BaseDaemonMiddleware(
         *,
         max_sessions: int,
         max_retries: int,
+        max_batch_window_size: int,
         logger_config: LoggerConfig | None = None,
     ) -> None:
         super().__init__()
@@ -54,10 +76,13 @@ class BaseDaemonMiddleware(
         self._process_failure_log = logger_config.get(
             "process_failure_log", f"Failed to process {self._job_name}"
         )
-        self._retry_exhausted_label = logger_config.get("retry_exhausted_label")
+        self._retry_exhausted_label = (
+            logger_config.get("retry_exhausted_label") or self._worker_name
+        )
 
         self._queue_size = max(64, max_sessions * 2)
         self._max_batches_per_session = max(16, max_sessions * 2)
+        self._max_batch_window_size = max(1, max_batch_window_size)
 
         self._pending_batches: LRUCache[str, deque[BatchT]] = LRUCache(
             maxsize=max_sessions
@@ -127,7 +152,23 @@ class BaseDaemonMiddleware(
         async with receive_stream:
             while self._receive_stream is not None:
                 try:
-                    await self._worker(receive_stream)
+                    async for session_id in receive_stream:
+                        try:
+                            progressed, failed = await self._drain_session(session_id)
+                        except Exception:
+                            self._logger.exception(self._process_failure_log)
+                            progressed = False
+                            failed = True
+                        finally:
+                            self._scheduled_sessions.discard(session_id)
+
+                        if failed:
+                            await self._schedule_retry(session_id)
+                            continue
+
+                        self._retry_attempts.pop(session_id, None)
+                        if progressed and self._pending_batches.get(session_id):
+                            await self._queue_job(session_id)
                 except Exception:
                     if self._receive_stream is None:
                         break
@@ -138,27 +179,40 @@ class BaseDaemonMiddleware(
                     )
                     await anyio.sleep(_DEFAULT_RETRY_BACKOFF)
 
-    async def _worker(
-        self,
-        receive_stream: MemoryObjectReceiveStream[str],
-    ) -> None:
-        async for session_id in receive_stream:
-            try:
-                progressed, failed = await self.process_session(session_id)
-            except Exception:
-                self._logger.exception(self._process_failure_log)
-                progressed = False
-                failed = True
-            finally:
-                self._scheduled_sessions.discard(session_id)
-
-            if failed:
-                await self._schedule_retry(session_id)
+    async def _drain_session(self, session_id: str) -> tuple[bool, bool]:
+        progressed = False
+        while pending_batches := self._pending_batches.get(session_id):
+            batches = tuple(list(pending_batches)[: self._max_batch_window_size])
+            if not batches:
                 continue
 
-            self._retry_attempts.pop(session_id, None)
-            if progressed and self._pending_batches.get(session_id):
-                await self._queue_job(session_id)
+            result = await self.process_batches(session_id, batches)
+            if result is None:
+                result = ProcessResult()
+            elif isinstance(result, int):
+                result = ProcessResult(consumed_batches=result)
+            elif isinstance(result, tuple):
+                consumed_batches, failed = result
+                result = ProcessResult(
+                    consumed_batches=consumed_batches,
+                    failed=failed,
+                )
+            elif not isinstance(result, ProcessResult):
+                raise TypeError(
+                    f"Invalid process result type: {type(result)}; expected int, tuple[int, bool], ProcessResult, or None"
+                )
+
+            if result.failed:
+                return progressed, True
+            consumed_batches = min(
+                max(result.consumed_batches, 0),
+                len(batches),
+            )
+            if consumed_batches <= 0:
+                break
+            self._pop_processed_batches(session_id, consumed_batches)
+            progressed = True
+        return progressed, False
 
     async def _queue_job(self, session_id: str) -> None:
         if (
@@ -245,11 +299,20 @@ class BaseDaemonMiddleware(
             self._pending_batches.pop(session_id, None)
 
     @abstractmethod
-    async def process_session(self, session_id: str) -> tuple[bool, bool]:
+    async def process_batches(
+        self,
+        session_id: str,
+        batches: tuple[BatchT, ...],
+    ) -> SessionProcessOutput:
+        """Process one session batch window using business logic only."""
         raise NotImplementedError
 
     async def on_close(self) -> None:
         """Hook for subclasses to clear caches or references on close."""
 
 
-__all__ = ["BaseDaemonMiddleware"]
+__all__ = [
+    "BaseDaemonMiddleware",
+    "LoggerConfig",
+    "ProcessResult",
+]

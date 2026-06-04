@@ -31,12 +31,14 @@ from langchain.messages import HumanMessage
 from langchain_core.messages.utils import get_buffer_string
 
 from agent.base import ManagerContext, ManagerState
-from agent.middlewares.base import BaseDaemonMiddleware
+from agent.middlewares.base import (
+    BaseDaemonMiddleware,
+    SessionProcessOutput,
+)
 from agent.utils import content_to_text
 
 if TYPE_CHECKING:
-    from collections import deque
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from langchain.agents.middleware.types import (
         ExtendedModelResponse,
@@ -173,6 +175,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         super().__init__(
             max_sessions=max_sessions,
             max_retries=max_retries,
+            max_batch_window_size=max_batches,
             logger_config={
                 "worker_name": "Summary",
                 "job_name": "session summary",
@@ -183,7 +186,6 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         self.summary_model = summary_model
         self.max_input_chars = max_input_chars
         self.max_output_chars = max_output_chars
-        self.max_batches = max_batches
         self.summary_prompt = summary_prompt
 
         self._store = store
@@ -306,37 +308,29 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         )
 
     @override
-    async def process_session(self, session_id: str) -> tuple[bool, bool]:
-        progressed = False
-        failed = False
+    async def process_batches(
+        self,
+        session_id: str,
+        batches: tuple[list[BaseMessage], ...],
+    ) -> SessionProcessOutput:
+        batch_count, messages_text = self._build_summary_input(batches)
+        if batch_count <= 0:
+            return None
 
-        while pending_batches := self._pending_batches.get(session_id):
-            batch_count, messages_text = self._build_summary_input(pending_batches)
-            if batch_count <= 0:
-                break
+        if not messages_text:
+            return batch_count
 
-            if not messages_text:
-                self._pop_processed_batches(session_id, batch_count)
-                progressed = True
-                continue
+        summary = await self._create_summary(
+            current_summary=self._session_summaries.get(
+                session_id,
+                _DEFAULT_EMPTY_SUMMARY,
+            ),
+            messages_text=messages_text,
+        )
+        if summary is None or not await self._save_session_summary(session_id, summary):
+            return 0, True
 
-            summary = await self._create_summary(
-                current_summary=self._session_summaries.get(
-                    session_id,
-                    _DEFAULT_EMPTY_SUMMARY,
-                ),
-                messages_text=messages_text,
-            )
-            if summary is None or not await self._save_session_summary(
-                session_id, summary
-            ):
-                failed = True
-                break
-
-            self._pop_processed_batches(session_id, batch_count)
-            progressed = True
-
-        return progressed, failed
+        return batch_count
 
     async def _create_summary(
         self,
@@ -376,19 +370,19 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
 
     def _build_summary_input(
         self,
-        pending_batches: deque[list[BaseMessage]],
+        batches: Sequence[list[BaseMessage]],
     ) -> tuple[int, str]:
         """从待处理批次中构建一次摘要模型调用的输入。
 
         输入拼装策略与后台摘要的吞吐和成本直接相关，因此这里做了三层约束：
 
         1. 单条消息先按 `_max_message_chars` 截断，防止极长消息污染整批输入。
-        2. 单次最多合并 `max_batches` 个批次，限制单轮处理时延。
+        2. 父类会先按固定窗口大小切好批次，子类这里只处理当前窗口。
         3. 总文本超过 `max_input_chars` 后停止扩展；若超限发生在首批，则保留首批并
            做整体截断，确保任务仍然能够继续前进，而不是被一条超长历史永久卡住。
 
         Args:
-            pending_batches: 当前会话积压的待处理批次队列。
+            batches: 父类已经切好的当前批次窗口。
 
         Returns:
             一个二元组 `(batch_count, messages_text)`，其中 `batch_count` 表示本轮纳入
@@ -397,7 +391,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         selected_messages: list[BaseMessage] = []
         batch_count = 0
 
-        for batch in list(pending_batches)[: self.max_batches]:
+        for batch in batches:
             batch_messages = [
                 message.model_copy(
                     update={"content": _truncate(text, self._max_message_chars)}
