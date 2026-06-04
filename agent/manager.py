@@ -26,10 +26,8 @@ from agent.base import (
 from agent.builder import create_agent
 from agent.extensions import (
     ActivateLimitMiddleware,
-    JargonLearnerMiddleware,
     LongMemoryMiddleware,
     MemeSendingMiddleware,
-    SummarizationMiddleware,
     query_image,
     search_song,
     view_forward_message,
@@ -37,6 +35,10 @@ from agent.extensions import (
 from agent.extensions.limiter import ActivateLimiterConfig
 from agent.history import get_session_history
 from agent.interaction import InteractionConfig, InteractionMiddleware
+from agent.middlewares import (
+    JargonLearnerMiddleware,
+    SummarizationMiddleware,
+)
 from agent.prompts.manager import (
     BOT_NAME,
     IDENTITY,

@@ -22,22 +22,20 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-import anyio
 from cachetools import LRUCache
-from langchain.agents.middleware import AgentMiddleware
 from langchain.messages import HumanMessage
 from langchain_core.messages.utils import get_buffer_string
 
 from agent.base import ManagerContext, ManagerState
+from agent.middlewares.base import BaseDaemonMiddleware
 from agent.utils import content_to_text
 
 if TYPE_CHECKING:
-    from anyio.abc import TaskGroup
-    from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+    from collections import deque
+
     from langchain.agents.middleware import ModelRequest
     from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import BaseMessage
@@ -109,10 +107,9 @@ Here is a summary of the conversation to date:
 DEFAULT_NAMESPACE_ROOT = "session_memory"
 _DEFAULT_EMPTY_SUMMARY = "None."
 _SUMMARY_SOURCE = "session_summary"
-_DEFAULT_RETRY_BACKOFF = 5.0
 
 
-class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
+class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
     """为代理提供异步会话摘要能力。
 
     这个中间件的核心设计思想，是把“长期上下文压缩”作为一个独立的后台子系统来
@@ -167,36 +164,30 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             namespace_root: 持久化命名空间根名称。若包含点号，会被转换成下划线，
                 以避免不同 store 后端在命名空间解析上的差异。
         """
-        super().__init__()
+        super().__init__(
+            max_sessions=max_sessions,
+            max_retries=max_retries,
+            logger_config={
+                "worker_name": "Summary",
+                "job_name": "session summary",
+                "process_failure_log": "Failed to update session summary",
+                "retry_exhausted_label": "Session summary",
+            },
+        )
         self.summary_model = summary_model
         self.max_input_chars = max_input_chars
         self.max_output_chars = max_output_chars
         self.max_batches = max_batches
-        self.max_retries = max_retries
         self.summary_prompt = summary_prompt
 
         self._store = store
-        self._queue_size = max(64, max_sessions * 2)
-        self._max_batches_per_session = max(16, max_sessions * 2)
         self._max_message_chars = max(1, max_input_chars // max_batches)
         self.namespace = (
             str(namespace_root).strip().replace(".", "_") or DEFAULT_NAMESPACE_ROOT,
         )
 
-        self._pending_batches: LRUCache[str, deque[list[BaseMessage]]] = LRUCache(
-            maxsize=max_sessions
-        )
         self._session_summaries: LRUCache[str, str] = LRUCache(maxsize=max_sessions)
         self._loaded_sessions: LRUCache[str, bool] = LRUCache(maxsize=max_sessions)
-        self._retry_attempts: LRUCache[str, int] = LRUCache(maxsize=max_sessions)
-
-        self._scheduled_sessions: set[str] = set()
-        self._delayed_retry_sessions: set[str] = set()
-
-        self._start_lock = anyio.Lock()
-        self._task_group: TaskGroup | None = None
-        self._send_stream: MemoryObjectSendStream[str] | None = None
-        self._receive_stream: MemoryObjectReceiveStream[str] | None = None
 
     async def abefore_agent(
         self,
@@ -248,14 +239,7 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         if messages := cast(
             "list[BaseMessage] | None", state.get("summary_pruned_messages")
         ):
-            await self._ensure_service()
-            session_id = runtime.context["session_id"]
-            if session_id not in self._pending_batches:
-                self._pending_batches[session_id] = deque(
-                    maxlen=self._max_batches_per_session
-                )
-            self._pending_batches[session_id].append(list(messages))
-            await self._queue_job(session_id)
+            await self._enqueue_batch(runtime.context["session_id"], list(messages))
         return None
 
     async def awrap_model_call(
@@ -299,172 +283,7 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             )
         )
 
-    async def aclose(self) -> None:
-        """关闭后台摘要服务并清空进程内状态。
-
-        该方法只会清理当前进程持有的资源与缓存，不删除已经写入外部 store 的持久化
-        摘要数据。
-        """
-        if self._send_stream is not None:
-            await self._send_stream.aclose()
-        if self._receive_stream is not None:
-            await self._receive_stream.aclose()
-        if self._task_group is not None:
-            self._task_group.cancel_scope.cancel()
-            await self._task_group.__aexit__(None, None, None)
-
-        self._send_stream = None
-        self._receive_stream = None
-        self._task_group = None
-        self._store = None
-        self._loaded_sessions.clear()
-        self._scheduled_sessions.clear()
-        self._delayed_retry_sessions.clear()
-        self._pending_batches.clear()
-        self._session_summaries.clear()
-        self._retry_attempts.clear()
-
-    async def _ensure_service(self) -> None:
-        """确保后台摘要 worker 已启动。
-
-        该后台服务采用惰性启动策略：只有真正收到待总结消息时才创建内存流与
-        `TaskGroup`。这可以避免在完全不需要摘要能力的会话中平白持有后台资源。
-        """
-        if self._send_stream is not None:
-            return
-
-        async with self._start_lock:
-            if self._send_stream is not None:
-                return
-
-            send_stream, receive_stream = anyio.create_memory_object_stream[str](
-                self._queue_size
-            )
-            task_group = anyio.create_task_group()
-            await task_group.__aenter__()
-            task_group.start_soon(self._save_worker, receive_stream)
-
-            self._send_stream = send_stream
-            self._receive_stream = receive_stream
-            self._task_group = task_group
-
-    async def _save_worker(
-        self,
-        receive_stream: MemoryObjectReceiveStream[str],
-    ) -> None:
-        """作为外层监护循环运行摘要 worker。
-
-        真正的业务处理由 `_worker` 完成；这里的职责是隔离未捕获异常，并在 worker
-        崩溃后自动等待一小段时间再重启，避免偶发错误直接让整个摘要子系统永久停摆。
-
-        Args:
-            receive_stream: 接收待处理 `session_id` 的内存流。
-        """
-        async with receive_stream:
-            while self._receive_stream is not None:
-                try:
-                    await self._worker(receive_stream)
-                except Exception:
-                    if self._receive_stream is None:
-                        break
-                    logger.exception("Summary worker crashed, restarting in 1s")
-                    await anyio.sleep(1.0)
-
-    async def _queue_job(self, session_id: str) -> None:
-        """为指定会话投递一次摘要任务。
-
-        `_scheduled_sessions` 用于去重，保证同一 `session_id` 在任意时刻最多只存在
-        一个“已进入调度体系但尚未完成”的后台任务。至于这个任务内部会合并多少个批
-        次，则由 `_worker` 和 `_build_summary_input` 决定。
-
-        Args:
-            session_id: 需要安排摘要处理的会话 ID。
-        """
-        if (
-            self._send_stream is None
-            or self._task_group is None
-            or session_id in self._scheduled_sessions
-        ):
-            return
-
-        self._scheduled_sessions.add(session_id)
-        try:
-            self._send_stream.send_nowait(session_id)
-        except anyio.WouldBlock:
-            pass
-        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
-            self._scheduled_sessions.discard(session_id)
-            logger.exception("Failed to queue session summary job")
-            return
-        else:
-            return
-
-        async def _send_job(
-            send_stream: MemoryObjectSendStream[str],
-        ) -> None:
-            try:
-                await send_stream.send(session_id)
-            except (anyio.BrokenResourceError, anyio.ClosedResourceError):
-                self._scheduled_sessions.discard(session_id)
-                logger.exception("Failed to send session summary job")
-
-        try:
-            self._task_group.start_soon(
-                _send_job,
-                self._send_stream,
-            )
-        except RuntimeError:
-            self._scheduled_sessions.discard(session_id)
-            logger.exception("Failed to schedule session summary job")
-
-    async def _worker(
-        self,
-        receive_stream: MemoryObjectReceiveStream[str],
-    ) -> None:
-        """后台摘要 worker 主循环。
-
-        它按会话维度串行推进摘要更新：某个会话失败时进入延迟重试，成功时若该会话
-        仍然残留待处理批次，则继续重新排队，直到当前积压被尽可能消费完。
-
-        Args:
-            receive_stream: 从 `_queue_job` 投递过来的 `session_id` 流。
-        """
-        async for session_id in receive_stream:
-            try:
-                progressed, failed = await self._summarize_session(session_id)
-            except Exception:
-                logger.exception("Failed to update session summary")
-                progressed = False
-                failed = True
-            finally:
-                self._scheduled_sessions.discard(session_id)
-
-            if failed:
-                await self._schedule_retry(session_id)
-                continue
-
-            self._retry_attempts.pop(session_id, None)
-            if progressed and self._pending_batches.get(session_id):
-                await self._queue_job(session_id)
-
-    async def _summarize_session(self, session_id: str) -> tuple[bool, bool]:
-        """尽可能推进某个会话的摘要状态。
-
-        该方法会反复尝试消费当前会话积压的待处理批次。每一轮都执行：
-
-        1. 取若干批次并拼成一次摘要输入。
-        2. 调用摘要模型生成新的完整摘要。
-        3. 将结果写回缓存和 store。
-        4. 成功后从队列中移除对应批次。
-
-        Args:
-            session_id: 需要推进摘要状态的会话 ID。
-
-        Returns:
-            一个二元组 `(progressed, failed)`：
-            `progressed=True` 表示至少消费掉了一个批次或空批次；
-            `failed=True` 表示本轮遇到了需要进入重试流程的错误。
-        """
+    async def process_session(self, session_id: str) -> tuple[bool, bool]:
         progressed = False
         failed = False
 
@@ -474,10 +293,7 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 break
 
             if not messages_text:
-                for _ in range(min(batch_count, len(pending_batches))):
-                    pending_batches.popleft()
-                if not pending_batches:
-                    self._pending_batches.pop(session_id, None)
+                self._pop_processed_batches(session_id, batch_count)
                 progressed = True
                 continue
 
@@ -494,10 +310,7 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 failed = True
                 break
 
-            for _ in range(min(batch_count, len(pending_batches))):
-                pending_batches.popleft()
-            if not pending_batches:
-                self._pending_batches.pop(session_id, None)
+            self._pop_processed_batches(session_id, batch_count)
             progressed = True
 
         return progressed, failed
@@ -682,67 +495,10 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self._loaded_sessions[session_id] = True
         return True
 
-    async def _schedule_retry(self, session_id: str) -> None:
-        """为失败的会话摘要任务安排一次延迟重试。
-
-        与 `jargon_learner` 不同，这里的重试上限耗尽后不会主动丢弃批次，而是停止当前
-        这一轮自动重试。这样做更保守：摘要失败不会直接造成历史上下文丢失，只是暂时
-        不再继续自动推进，等待后续新的调度机会。
-
-        Args:
-            session_id: 需要重试的会话 ID。
-        """
-        if not self._pending_batches.get(session_id):
-            self._retry_attempts.pop(session_id, None)
-            return
-
-        attempt = self._retry_attempts.get(session_id, 0) + 1
-        if attempt > self.max_retries:
-            logger.error(
-                "Session summary retries exhausted for %s; pending batches=%s",
-                session_id,
-                len(self._pending_batches.get(session_id, ())),
-            )
-            pending = self._pending_batches.get(session_id)
-            if pending:
-                pending.popleft()
-                if not pending:
-                    self._pending_batches.pop(session_id, None)
-            self._retry_attempts.pop(session_id, None)
-            return
-
-        self._retry_attempts[session_id] = attempt
-        if session_id in self._delayed_retry_sessions or self._task_group is None:
-            return
-
-        self._delayed_retry_sessions.add(session_id)
-        self._task_group.start_soon(
-            self._retry_summary_job_after_delay,
-            session_id,
-            _DEFAULT_RETRY_BACKOFF * attempt,
-        )
-
-    async def _retry_summary_job_after_delay(
-        self,
-        session_id: str,
-        delay_seconds: float,
-    ) -> None:
-        """在指定延迟后，把失败会话重新投递回正常处理队列。
-
-        Args:
-            session_id: 需要重新排队的会话 ID。
-            delay_seconds: 本轮重试前需要等待的秒数。
-        """
-        try:
-            await anyio.sleep(delay_seconds)
-        finally:
-            self._delayed_retry_sessions.discard(session_id)
-
-        if not self._pending_batches.get(session_id):
-            self._retry_attempts.pop(session_id, None)
-            return
-
-        await self._queue_job(session_id)
+    async def on_close(self) -> None:
+        self._store = None
+        self._loaded_sessions.clear()
+        self._session_summaries.clear()
 
 
 def _truncate(text: str, limit: int) -> str:

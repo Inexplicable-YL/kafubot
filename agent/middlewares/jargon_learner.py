@@ -18,34 +18,35 @@
 永久阻塞。
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import random
 import re
 from collections import defaultdict, deque
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
-import anyio
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-from cachetools import LRUCache
 from json_repair import repair_json
-from langchain.agents.middleware import AgentMiddleware
-from langchain.tools import ToolRuntime, tool
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from langgraph.runtime import Runtime
-from langgraph.store.base import BaseStore, SearchItem
+from langchain.tools import tool
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from agent.base import ManagerContext, ManagerState, UserMessage
+from agent.middlewares.base import BaseDaemonMiddleware
 from agent.prompts.manager import BOT_NAME
 from agent.utils import content_to_text
 
 if TYPE_CHECKING:
-    from anyio.abc import TaskGroup
+    from collections.abc import Callable
+
+    from langchain.tools import ToolRuntime
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import BaseMessage
+    from langgraph.runtime import Runtime
+    from langgraph.store.base import BaseStore, SearchItem
 
 logger = logging.getLogger(__name__)
 
@@ -255,10 +256,9 @@ class PendingJargonAnalysisBatch:
 
 
 _DEFAULT_NAMESPACE = "jargon"
-_DEFAULT_RETRY_BACKOFF = 5.0
 
 
-class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
+class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
     """为代理提供异步黑话抽取、入库、推断与查询能力。
 
     这个中间件刻意不把黑话分析放在主对话的同步路径里，而是在消息被上游裁剪后
@@ -317,37 +317,31 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 扩展为一组“可共享黑话词库”的关联会话 ID，也可额外返回是否存在
                 全局共享语义。
         """
-        super().__init__()
+        super().__init__(
+            max_sessions=max_sessions,
+            max_retries=max_retries,
+            logger_config={
+                "worker_name": "JargonLearner",
+                "job_name": "jargon learning",
+                "process_failure_log": "Failed to analyze jargon entries",
+                "retry_exhausted_label": "Jargon learning",
+            },
+        )
         self.analyze_model = analyze_model
         self.max_input_chars = max_input_chars
         self.max_raw_content_chars = max_raw_content_chars
         self.max_batches = max_batches
         self.context_window_size = context_window_size
-        self.max_retries = max_retries
         self._store = store
         self.jargon_group_resolver = jargon_group_resolver
 
-        self._queue_size = max(64, max_sessions * 2)
         self._max_message_chars = max(1, max_input_chars // max_batches)
-        self._max_batches_per_session = max(16, max_sessions * 2)
         self.namespace_root = _DEFAULT_NAMESPACE
-
-        self._pending_batches: LRUCache[str, deque[PendingJargonAnalysisBatch]] = (
-            LRUCache(maxsize=max_sessions)
-        )
-        self._scheduled_sessions: set[str] = set()
-        self._delayed_retry_sessions: set[str] = set()
-        self._retry_attempts: LRUCache[str, int] = LRUCache(maxsize=max_sessions)
-
-        self._start_lock = anyio.Lock()
-        self._task_group: TaskGroup | None = None
-        self._send_stream: MemoryObjectSendStream[str] | None = None
-        self._receive_stream: MemoryObjectReceiveStream[str] | None = None
 
         self.tools = [
             tool(
                 "query_jargon",
-                description="查询当前聊天上下文中的黑话或词条含义。用法：当你认为某些词的含义不明确，或用户询问某些词的含义，需要进行查询。",
+                description="查询当前聊天上下文中的黑话或词条含义。用法：当你认为某些词的含义不明确，或者用户询问某些词的含义，需要进行查询。",
                 args_schema=QueryJargonInput,
             )(self._query_jargon_tool)
         ]
@@ -377,165 +371,17 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         if messages := cast(
             "list[BaseMessage] | None", state.get("summary_pruned_messages")
         ):
-            await self._ensure_service()
             session_id = runtime.context["session_id"]
-            if session_id not in self._pending_batches:
-                self._pending_batches[session_id] = deque(
-                    maxlen=self._max_batches_per_session
-                )
-            self._pending_batches[session_id].append(
+            await self._enqueue_batch(
+                session_id,
                 PendingJargonAnalysisBatch(
                     session_id=session_id,
                     messages=list(messages),
-                )
+                ),
             )
-            await self._queue_job(session_id)
         return None
 
-    async def aclose(self) -> None:
-        """关闭后台服务并清理所有内存状态。
-
-        该方法会依次关闭发送流、接收流和任务组，然后清空当前进程内维护的队列、
-        重试状态与缓存引用。它不删除已经写入外部 store 的持久化数据。
-        """
-        if self._send_stream is not None:
-            await self._send_stream.aclose()
-        if self._receive_stream is not None:
-            await self._receive_stream.aclose()
-        if self._task_group is not None:
-            self._task_group.cancel_scope.cancel()
-            await self._task_group.__aexit__(None, None, None)
-
-        self._send_stream = None
-        self._receive_stream = None
-        self._task_group = None
-        self._store = None
-        self._pending_batches.clear()
-        self._scheduled_sessions.clear()
-        self._delayed_retry_sessions.clear()
-        self._retry_attempts.clear()
-
-    async def _ensure_service(self) -> None:
-        """确保后台 worker 服务已经启动。
-
-        该方法采用双重检查和异步锁，避免并发情况下重复创建 `TaskGroup` 和
-        memory stream。
-        """
-        if self._send_stream is not None:
-            return
-
-        async with self._start_lock:
-            if self._send_stream is not None:
-                return
-
-            send_stream, receive_stream = anyio.create_memory_object_stream[str](
-                self._queue_size
-            )
-            task_group = anyio.create_task_group()
-            await task_group.__aenter__()
-            task_group.start_soon(self._save_worker, receive_stream)
-
-            self._send_stream = send_stream
-            self._receive_stream = receive_stream
-            self._task_group = task_group
-
-    async def _queue_job(self, session_id: str) -> None:
-        """把指定会话加入后台分析队列。
-
-        同一 `session_id` 在任意时刻最多只允许存在一个已排队但尚未完成的任务，
-        以避免对同一批待处理数据进行重复分析。
-
-        Args:
-            session_id: 需要排队分析的会话 ID。
-        """
-        if (
-            self._send_stream is None
-            or self._task_group is None
-            or session_id in self._scheduled_sessions
-        ):
-            return
-
-        self._scheduled_sessions.add(session_id)
-        try:
-            # 优先使用无阻塞发送；若队列已满，再退化为后台协程等待发送。
-            self._send_stream.send_nowait(session_id)
-        except anyio.WouldBlock:
-            pass
-        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
-            self._scheduled_sessions.discard(session_id)
-            logger.exception("Failed to queue jargon job")
-            return
-        else:
-            return
-
-        async def _send_job(
-            send_stream: MemoryObjectSendStream[str],
-        ) -> None:
-            try:
-                await send_stream.send(session_id)
-            except (anyio.BrokenResourceError, anyio.ClosedResourceError):
-                self._scheduled_sessions.discard(session_id)
-                logger.exception("Failed to send jargon job")
-
-        try:
-            self._task_group.start_soon(
-                _send_job,
-                self._send_stream,
-            )
-        except RuntimeError:
-            self._scheduled_sessions.discard(session_id)
-            logger.exception("Failed to schedule jargon job")
-
-    async def _save_worker(
-        self,
-        receive_stream: MemoryObjectReceiveStream[str],
-    ) -> None:
-        """运行最外层 worker 监护循环。
-
-        该层不直接处理业务，而是负责在内部 worker 异常退出时进行日志记录和自
-        恢复，避免一次偶发错误导致整个后台黑话服务永久停摆。
-
-        Args:
-            receive_stream: 接收待处理 `session_id` 的内存流。
-        """
-        async with receive_stream:
-            while self._receive_stream is not None:
-                try:
-                    await self._worker(receive_stream)
-                except Exception:
-                    if self._receive_stream is None:
-                        break
-                    logger.exception("Jargon worker crashed, restarting in 1s")
-                    await anyio.sleep(1.0)
-
-    async def _worker(
-        self,
-        receive_stream: MemoryObjectReceiveStream[str],
-    ) -> None:
-        """串行消费待分析会话，并协调重试与续跑。
-
-        Args:
-            receive_stream: 从 `_queue_job` 投递过来的会话 ID 流。
-        """
-        async for session_id in receive_stream:
-            try:
-                progressed, failed = await self._analyze_session(session_id)
-            except Exception:
-                logger.exception("Failed to analyze jargon batch")
-                progressed = False
-                failed = True
-            finally:
-                self._scheduled_sessions.discard(session_id)
-
-            if failed:
-                await self._schedule_retry(session_id)
-                continue
-
-            self._retry_attempts.pop(session_id, None)
-            if progressed and self._pending_batches.get(session_id):
-                await self._queue_job(session_id)
-
-    async def _analyze_session(self, session_id: str) -> tuple[bool, bool]:
+    async def process_session(self, session_id: str) -> tuple[bool, bool]:
         """分析单个会话当前积压的黑话批次。
 
         该方法会不断从指定会话的待处理队列头部取出若干批次，构造成一次抽取输入，
@@ -559,14 +405,11 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         progressed = False
         failed = False
         while pending_batches := self._pending_batches.get(session_id):
-            batch_count, session_id, messages_text, source_map = (
+            batch_count, resolved_session_id, messages_text, source_map = (
                 self._build_extraction_input(pending_batches)
             )
             if not messages_text:
-                for _ in range(min(batch_count, len(pending_batches))):
-                    pending_batches.popleft()
-                if not pending_batches:
-                    self._pending_batches.pop(session_id, None)
+                self._pop_processed_batches(session_id, batch_count)
                 progressed = True
                 continue
 
@@ -576,14 +419,11 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 break
 
             await self._process_entries(
-                session_id=session_id,
+                session_id=resolved_session_id,
                 entries=entries,
                 store=self._store,
             )
-            for _ in range(min(batch_count, len(pending_batches))):
-                pending_batches.popleft()
-            if not pending_batches:
-                self._pending_batches.pop(session_id, None)
+            self._pop_processed_batches(session_id, batch_count)
             progressed = True
 
         return progressed, failed
@@ -625,8 +465,6 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                     if not plain:
                         continue
 
-                    # 对没有原始 message_id 的消息补一个稳定的伪 source_id，
-                    # 这样抽取结果仍然可以回查到对应的上下文窗口。
                     source_id = (
                         _clean_text(raw.message_id)
                         or f"synthetic-{batch_count}-{synthetic_index}"
@@ -635,7 +473,11 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                     if raw.message_id:
                         extraction_line = raw.as_content()
                     else:
-                        extraction_line = f'<user-message source_id="{source_id}">\n{plain}\n</user-message>'
+                        extraction_line = (
+                            f'<user-message source_id="{source_id}">\n'
+                            f"{plain}\n"
+                            "</user-message>"
+                        )
 
                     batch_records.append(
                         {
@@ -857,8 +699,6 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
                 if record is None or record["content"] != content:
                     continue
 
-                # 选择“当前作用域下最可信”的现有记录：
-                # 人工维护优先，其次当前会话，再其次关联会话，最后按出现次数。
                 scope_rank = _record_scope_rank(
                     record, session_id, related_session_ids, has_global_share
                 )
@@ -916,12 +756,7 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             else:
                 continue
 
-            await store.aput(
-                namespace,
-                key,
-                dict(record),
-                index=False,
-            )
+            await store.aput(namespace, key, dict(record), index=False)
             if self._should_infer_meaning(record):
                 pending_inference.append((namespace, key, record))
 
@@ -988,7 +823,6 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             previous_meaning_instruction = "- 请参考上一次推断的含义，结合新的上下文信息，给出更准确或更新的推断结果"
 
         async def ask(prompt: str, source: str) -> dict[str, Any] | None:
-            """对分析模型发起一次 JSON 风格提问并解析结果。"""
             try:
                 response = await self.analyze_model.ainvoke(
                     prompt,
@@ -1019,12 +853,7 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         if inference1.get("no_info") or not _clean_text(inference1.get("meaning")):
             record["last_inference_count"] = record["count"]
             record["updated_at"] = datetime.now(UTC).isoformat()
-            await store.aput(
-                namespace,
-                key,
-                dict(record),
-                index=False,
-            )
+            await store.aput(namespace, key, dict(record), index=False)
             return
 
         inference2 = await ask(
@@ -1044,8 +873,6 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         if not comparison:
             return
 
-        # 若“带上下文推断”和“仅字面推断”高度相似，说明它更可能是普通词汇，
-        # 而非强依赖会话语境的黑话，因此不保留 meaning。
         record["is_jargon"] = not bool(comparison.get("is_similar"))
         record["meaning"] = (
             _clean_text(inference1.get("meaning")) if record["is_jargon"] else ""
@@ -1053,12 +880,7 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         record["last_inference_count"] = record["count"]
         record["is_complete"] = record["count"] >= JARGON_INFERENCE_THRESHOLDS[-1]
         record["updated_at"] = datetime.now(UTC).isoformat()
-        await store.aput(
-            namespace,
-            key,
-            dict(record),
-            index=False,
-        )
+        await store.aput(namespace, key, dict(record), index=False)
 
         if record["is_jargon"]:
             logger.info(
@@ -1276,66 +1098,6 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         related_session_ids.update(str(item) for item in raw_ids if str(item).strip())
         return related_session_ids, bool(has_global_share)
 
-    async def _schedule_retry(self, session_id: str) -> None:
-        """为失败的会话分析任务安排延迟重试。
-
-        当连续失败次数超过上限时，该方法会主动丢弃队列头部的一个批次，从而防止
-        某个始终无法成功解析的坏批次永久卡死整个会话的黑话学习流程。
-
-        Args:
-            session_id: 需要重试的会话 ID。
-        """
-        if not self._pending_batches.get(session_id):
-            self._retry_attempts.pop(session_id, None)
-            return
-
-        attempt = self._retry_attempts.get(session_id, 0) + 1
-        if attempt > self.max_retries:
-            logger.error(
-                "Jargon retries exhausted for %s; pending batches=%s",
-                session_id,
-                len(self._pending_batches.get(session_id, ())),
-            )
-            pending = self._pending_batches.get(session_id)
-            if pending:
-                pending.popleft()
-                if not pending:
-                    self._pending_batches.pop(session_id, None)
-            self._retry_attempts.pop(session_id, None)
-            return
-
-        self._retry_attempts[session_id] = attempt
-        if session_id in self._delayed_retry_sessions or self._task_group is None:
-            return
-
-        self._delayed_retry_sessions.add(session_id)
-        self._task_group.start_soon(
-            self._retry_jargon_job_after_delay,
-            session_id,
-            _DEFAULT_RETRY_BACKOFF * attempt,
-        )
-
-    async def _retry_jargon_job_after_delay(
-        self,
-        session_id: str,
-        delay_seconds: float,
-    ) -> None:
-        """在指定延迟后重新投递会话分析任务。
-
-        Args:
-            session_id: 需要重新排队的会话 ID。
-            delay_seconds: 延迟秒数。通常和当前重试次数成正比。
-        """
-        try:
-            await anyio.sleep(delay_seconds)
-        finally:
-            self._delayed_retry_sessions.discard(session_id)
-
-        if not self._pending_batches.get(session_id):
-            self._retry_attempts.pop(session_id, None)
-            return
-        await self._queue_job(session_id)
-
     @staticmethod
     def _should_infer_meaning(record: JargonRecord) -> bool:
         """判断某条记录当前是否应当触发新一轮含义推断。
@@ -1363,6 +1125,9 @@ class JargonLearnerMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             None,
         )
         return next_threshold is not None and record["count"] >= next_threshold
+
+    async def on_close(self) -> None:
+        self._store = None
 
 
 def _normalize_record(value: Any) -> JargonRecord | None:
@@ -1486,7 +1251,6 @@ def _parse_result(text: str) -> Any | None:
             logger.debug("Failed to parse jargon JSON candidate directly")
 
         try:
-            # 模型常会返回“几乎正确”的 JSON，这里做一次宽松修复以提升鲁棒性。
             repaired = repair_json(candidate)
             if isinstance(repaired, tuple):
                 repaired = repaired[0]
@@ -1499,37 +1263,16 @@ def _parse_result(text: str) -> Any | None:
 
 
 def _truncate(text: str, limit: int) -> str:
-    """按字符上限截断文本，并保留省略号。
-
-    Args:
-        text: 待截断的文本。
-        limit: 允许保留的最大字符数。
-
-    Returns:
-        若原文本未超限则原样返回；否则返回带 `...` 的截断结果。
-    """
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
 
 
 def _clean_text(value: Any) -> str:
-    """把任意输入规范化为单行紧凑文本。"""
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def _is_invalid_jargon_candidate(content: str) -> bool:
-    """判断一个候选词条是否明显不适合作为黑话记录。
-
-    这里过滤的是高置信度噪声，例如单字符、纯标点、URL、机器人名称、图片或
-    表情占位符等。该规则宁可保守一些，也不希望把明显无意义的词条写入 store。
-
-    Args:
-        content: 待判断的候选词条。
-
-    Returns:
-        若该候选应被直接忽略，则返回 `True`。
-    """
     content = _clean_text(content)
     if not content or (
         len(content) == 1
