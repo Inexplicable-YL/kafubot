@@ -183,7 +183,7 @@ async def create_agent_service():
                 ActivateLimitMiddleware(**limiter_config),
                 TimeGateMiddleware(**gate_config),
                 MemeSendingMiddleware(man_send_per_turn=1),
-                # jargon_middleware,
+                jargon_middleware,
                 # memory_middleware,
                 summary_middleware,
                 generate_prompt,
