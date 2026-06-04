@@ -3,6 +3,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from html import escape
 from typing import Any, NotRequired, TypedDict, cast
+from typing_extensions import override
 
 import pandas as pd
 from langchain.agents.middleware import (
@@ -304,6 +305,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         get_message_count = len(self.display_messages[session_id]) - message_count
         return f"获取到 {get_message_count} 条比当前可见的消息更早的消息。消息已添加到上下文中。"
 
+    @override
     async def abefore_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
@@ -372,6 +374,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             or None,
         }
 
+    @override
     async def aafter_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
@@ -379,6 +382,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         self.display_messages[runtime.context["session_id"]] = []
         self.reply_turn[runtime.context["session_id"]] = 0
 
+    @override
     @hook_config(can_jump_to=["end"])
     async def abefore_model(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
@@ -403,6 +407,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             "jump_to": "end",
         }
 
+    @override
     async def awrap_model_call(
         self,
         request: ModelRequest[ManagerContext],

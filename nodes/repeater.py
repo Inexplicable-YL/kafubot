@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any
+from typing_extensions import override
 
 from sekaibot import Node
 from sekaibot.adapter.cqhttp.event import GroupMessageEvent
@@ -13,6 +14,7 @@ REPEAT_THRESHOLD = 3
 class Repeater(Node[GroupMessageEvent, dict, Any]):
     priority = 5
 
+    @override
     async def handle(self) -> None:
         def del_file_id(msg: CQHTTPMessageSegment):
             msg.data.pop("file_id", None)
@@ -54,5 +56,6 @@ class Repeater(Node[GroupMessageEvent, dict, Any]):
                 "repeated": False,
             }
 
+    @override
     async def rule(self) -> bool:
         return (not self.event.is_tome()) and self.event.user_id != 2854196310  # noqa: PLR2004

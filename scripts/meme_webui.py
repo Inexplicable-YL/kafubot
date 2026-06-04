@@ -980,21 +980,6 @@ def _read_records_unlocked() -> list[MemeRecord]:
     return records
 
 
-def _record_response_for_id(id_: str) -> dict[str, Any]:
-    records = _read_records()
-    counts = _counts(records)
-    for index, record in enumerate(records):
-        if record.id == id_:
-            return {
-                "filter": "all",
-                "index": index,
-                "total": len(records),
-                "counts": counts,
-                "record": _serialize_record(record),
-            }
-    raise web.HTTPNotFound(text="record not found")
-
-
 def _pending_record_id(token: str) -> str:
     return _PENDING_NEW_ID_PREFIX + token
 

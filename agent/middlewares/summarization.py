@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
+from typing_extensions import override
 
 from cachetools import LRUCache
 from langchain.messages import HumanMessage
@@ -35,10 +36,15 @@ from agent.utils import content_to_text
 
 if TYPE_CHECKING:
     from collections import deque
+    from collections.abc import Awaitable, Callable
 
-    from langchain.agents.middleware import ModelRequest
+    from langchain.agents.middleware.types import (
+        ExtendedModelResponse,
+        ModelRequest,
+        ModelResponse,
+    )
     from langchain_core.language_models.chat_models import BaseChatModel
-    from langchain_core.messages import BaseMessage
+    from langchain_core.messages import AIMessage, BaseMessage
     from langgraph.runtime import Runtime
     from langgraph.store.base import BaseStore
 
@@ -189,6 +195,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         self._session_summaries: LRUCache[str, str] = LRUCache(maxsize=max_sessions)
         self._loaded_sessions: LRUCache[str, bool] = LRUCache(maxsize=max_sessions)
 
+    @override
     async def abefore_agent(
         self,
         state: ManagerState,
@@ -214,6 +221,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         await self._ensure_session_summary_loaded(runtime.context["session_id"])
         return None
 
+    @override
     async def aafter_agent(
         self,
         state: ManagerState,
@@ -242,11 +250,14 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
             await self._enqueue_batch(runtime.context["session_id"], list(messages))
         return None
 
+    @override
     async def awrap_model_call(
         self,
         request: ModelRequest[ManagerContext],
-        handler,
-    ) -> Any:
+        handler: Callable[
+            [ModelRequest[ManagerContext]], Awaitable[ModelResponse[Any]]
+        ],
+    ) -> ModelResponse[Any] | AIMessage | ExtendedModelResponse[Any]:
         """在主模型调用前注入当前会话摘要。
 
         这里刻意不去修改原始 system prompt，而是额外插入一条新的 `SystemMessage`。
@@ -283,6 +294,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
             )
         )
 
+    @override
     async def process_session(self, session_id: str) -> tuple[bool, bool]:
         progressed = False
         failed = False
@@ -495,6 +507,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         self._loaded_sessions[session_id] = True
         return True
 
+    @override
     async def on_close(self) -> None:
         self._store = None
         self._loaded_sessions.clear()

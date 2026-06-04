@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
+from typing_extensions import override
 
 from anyio import open_file
 from langchain.agents.middleware import (
@@ -59,6 +60,7 @@ class AgentDebugLogMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         async with await open_file(self.log_path, "a", encoding="utf-8") as file:
             await file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+    @override
     async def awrap_model_call(
         self,
         request: ModelRequest[ManagerContext],
@@ -90,6 +92,7 @@ class AgentDebugLogMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
 
         return response
 
+    @override
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,

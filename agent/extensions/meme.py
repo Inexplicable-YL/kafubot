@@ -1,5 +1,6 @@
 from collections import defaultdict, deque
 from typing import Any
+from typing_extensions import override
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.messages import ToolMessage
@@ -146,6 +147,7 @@ class MemeSendingMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             }
         )
 
+    @override
     async def abefore_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
@@ -153,6 +155,7 @@ class MemeSendingMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self.send_count[runtime.context["session_id"]] = 0
         self.meme_id_map[runtime.context["session_id"]] = {}
 
+    @override
     async def aafter_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:

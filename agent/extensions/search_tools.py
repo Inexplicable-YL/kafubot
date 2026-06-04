@@ -1,6 +1,7 @@
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
+from typing_extensions import override
 
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -124,21 +125,7 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
             tool_call_id=runtime.tool_call_id,
         )
 
-    def wrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: Callable[[ToolCallRequest], Any],
-    ) -> Any:
-        if request.tool is None:
-            assert request.runtime.context
-            display_tools_dict = {
-                tool.name: tool
-                for tool in self.display_tools[request.runtime.context["session_id"]]
-            }
-            if tool := display_tools_dict.get(request.tool_call["name"]):
-                return handler(request.override(tool=tool))
-        return handler(request)
-
+    @override
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
@@ -154,6 +141,7 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
                 return await handler(request.override(tool=tool))
         return await handler(request)
 
+    @override
     async def awrap_model_call(
         self,
         request: ModelRequest[ManagerContext],
@@ -187,12 +175,14 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
             )
         )
 
+    @override
     async def abefore_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
         _ = state
         self.display_tools[runtime.context["session_id"]] = []
 
+    @override
     async def aafter_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:

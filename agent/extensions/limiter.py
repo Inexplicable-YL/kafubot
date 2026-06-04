@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from typing import Any, NotRequired, TypedDict
+from typing_extensions import override
 
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -106,7 +107,7 @@ class _ActivateLimiter:
     def _now(self) -> float:
         return datetime.now(tz=UTC).timestamp()
 
-    async def _purge(self, session, sid: str, before: float) -> None:
+    async def _purge(self, session: AsyncSession, sid: str, before: float) -> None:
         await session.execute(
             delete(_Record).where(
                 _Record.session_id == sid, _Record.timestamp <= before
@@ -223,6 +224,7 @@ class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             rate_limit=rate_limit,
         )
 
+    @override
     @hook_config(can_jump_to=["end"])
     async def abefore_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
@@ -249,6 +251,7 @@ class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             }
         return None
 
+    @override
     async def aafter_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:

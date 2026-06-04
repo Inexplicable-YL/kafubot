@@ -1,4 +1,5 @@
 import os
+from collections.abc import Callable
 from datetime import datetime
 from functools import cache
 from typing import Any, Literal, cast
@@ -89,7 +90,9 @@ def generate_prompt(request: ModelRequest[ManagerContext]) -> str:
 
 
 @wrap_model_call_async(state_schema=ManagerState)
-async def add_time(request: ModelRequest[ManagerContext], handler) -> ModelResponse:
+async def add_time(
+    request: ModelRequest[ManagerContext], handler: Callable
+) -> ModelResponse:
     return await handler(
         request.override(
             messages=request.messages

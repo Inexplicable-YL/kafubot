@@ -56,6 +56,7 @@ class ChatMessageRecord(ChatMessageBase):
 
 
 class MessageConverter(BaseMessageConverter):
+    @override
     def get_sql_model_class(self) -> Any:
         return ChatMessageRecord
 

@@ -7,6 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing_extensions import override
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -291,6 +292,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self._receive_stream: MemoryObjectReceiveStream[str] | None = None
         self.tools = self._build_tools()
 
+    @override
     async def aafter_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:
@@ -305,6 +307,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         )
         return None
 
+    @override
     async def awrap_model_call(
         self,
         request: ModelRequest[ManagerContext],

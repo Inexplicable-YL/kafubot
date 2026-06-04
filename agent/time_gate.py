@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from collections.abc import Sequence
 from enum import Enum, auto
 from typing import Any, ClassVar, NotRequired, TypedDict
+from typing_extensions import override
 
 import numpy as np
 from langchain.agents.middleware import (
@@ -287,6 +288,7 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         )
         self.initialized = defaultdict(lambda: False)
 
+    @override
     @hook_config(can_jump_to=["end"])
     async def abefore_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
@@ -310,6 +312,7 @@ class TimeGateMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             }
         return None
 
+    @override
     async def aafter_agent(
         self, state: ManagerState, runtime: Runtime[ManagerContext]
     ) -> dict[str, Any] | None:

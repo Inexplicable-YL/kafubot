@@ -4,6 +4,7 @@ import re
 from collections import OrderedDict
 from math import exp, sqrt, tanh
 from typing import TYPE_CHECKING, Any, ClassVar
+from typing_extensions import override
 
 import anyio
 from langchain_community.chat_message_histories.sql import (
@@ -61,6 +62,7 @@ class LimitedSQLChatMessageHistory(SQLChatMessageHistory):
         self.max_messages = max_messages
         super().__init__(*args, **kwargs)
 
+    @override
     async def aget_messages(self) -> list[BaseMessage]:
         lock = await self._get_session_lock(self.session_id)
         async with lock:
@@ -101,6 +103,7 @@ class LimitedSQLChatMessageHistory(SQLChatMessageHistory):
             self._messages_cache[self.session_id] = messages
             return list(messages)
 
+    @override
     async def aadd_message(self, message: BaseMessage) -> None:
         lock = await self._get_session_lock(self.session_id)
         async with lock:
@@ -119,6 +122,7 @@ class LimitedSQLChatMessageHistory(SQLChatMessageHistory):
                     new_cache = new_cache[-self.max_messages :]
                 self._messages_cache[self.session_id] = new_cache
 
+    @override
     async def aadd_messages(self, messages: Sequence[BaseMessage]) -> None:
         lock = await self._get_session_lock(self.session_id)
         async with lock:
@@ -137,6 +141,7 @@ class LimitedSQLChatMessageHistory(SQLChatMessageHistory):
                     new_cache = new_cache[-self.max_messages :]
                 self._messages_cache[self.session_id] = new_cache
 
+    @override
     async def aclear(self) -> None:
         lock = await self._get_session_lock(self.session_id)
         async with lock:

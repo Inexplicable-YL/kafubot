@@ -28,6 +28,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing_extensions import override
 
 from json_repair import repair_json
 from langchain.tools import tool
@@ -346,6 +347,7 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
             )(self._query_jargon_tool)
         ]
 
+    @override
     async def aafter_agent(
         self,
         state: ManagerState,
@@ -381,6 +383,7 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
             )
         return None
 
+    @override
     async def process_session(self, session_id: str) -> tuple[bool, bool]:
         """分析单个会话当前积压的黑话批次。
 
@@ -1126,6 +1129,7 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         )
         return next_threshold is not None and record["count"] >= next_threshold
 
+    @override
     async def on_close(self) -> None:
         self._store = None
 

@@ -31,7 +31,7 @@ def get_image_analyzer() -> Runnable[dict[str, Any], str]:
         if not query or not isinstance(query, str):
             raise ValueError("Invalid query input: expected a non-empty string")
 
-        content = [
+        content: list[Any] = [
             *(
                 {
                     "type": "image_url",

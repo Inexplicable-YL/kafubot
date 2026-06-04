@@ -25,7 +25,7 @@ with SqliteStore.from_conn_string(
     all_items = []
     while True:
         items = store.search(
-            ("jargon",), filter={"count": 3}, offset=offset, limit=limit
+            ("jargon",), filter={"count": 4}, offset=offset, limit=limit
         )
         all_items.extend(items)
         if len(items) < limit:
