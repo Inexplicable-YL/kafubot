@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, cast
 import anyio
 from cachetools import LRUCache
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain.messages import HumanMessage
 from langchain_core.messages.utils import get_buffer_string
 
 from agent.base import ManagerContext, ManagerState
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
     from langchain.agents.middleware import ModelRequest
     from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import BaseMessage
     from langgraph.runtime import Runtime
     from langgraph.store.base import BaseStore
 
@@ -284,11 +285,10 @@ class SummarizationMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         await self._ensure_session_summary_loaded(session_id)
         if not (summary := self._session_summaries.get(session_id)):
             return await handler(request)
-
         return await handler(
             request.override(
                 messages=[
-                    SystemMessage(
+                    HumanMessage(
                         content=SESSION_SUMMARY_INJECTION_PROMPT.format(
                             summary=summary
                         ),
