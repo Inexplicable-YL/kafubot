@@ -51,6 +51,9 @@ class ManagerState(AgentState):
 
     summary_pruned_messages: NotRequired[list[BaseMessage] | None]
 
+    reply_top_messages: NotRequired[Annotated[list[BaseMessage], add]]
+    reply_bottom_messages: NotRequired[Annotated[list[BaseMessage], add]]
+
 
 class ManagerContext(TypedDict):
     node: Any

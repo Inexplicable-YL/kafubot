@@ -219,6 +219,17 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         if runtime.store is not None:
             self._store = self._store or runtime.store
         await self._ensure_session_summary_loaded(runtime.context["session_id"])
+        if summary := self._session_summaries.get(runtime.context["session_id"]):
+            return {
+                "reply_top_messages": [
+                    HumanMessage(
+                        content=SESSION_SUMMARY_INJECTION_PROMPT.format(
+                            summary=summary
+                        ),
+                        additional_kwargs={"lc_source": _SUMMARY_SOURCE},
+                    )
+                ]
+            }
         return None
 
     @override

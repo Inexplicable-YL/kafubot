@@ -225,6 +225,8 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             {
                 "messages": runtime.state["currents"],
                 "history": self.history_caches[runtime.context["session_id"]],
+                "top_messages": runtime.state.get("reply_top_messages", []) or [],
+                "bottom_messages": runtime.state.get("reply_bottom_messages", []) or [],
                 "focus_message": focus_output,
                 "reference_info": reference_info,
                 "language_style": language_style,
@@ -466,6 +468,8 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
                 payload["reply_style"] = LESS_REPLY
             else:
                 payload["reply_style"] = MORE_REPLY
+            payload.setdefault("top_messages", [])
+            payload.setdefault("bottom_messages", [])
             return payload
 
         prompt = ChatPromptTemplate.from_messages(
@@ -474,8 +478,10 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
                     "system",
                     GROUP_SYSTEM_PROMPT.format(bot_name=BOT_NAME, identity=IDENTITY),
                 ),
+                MessagesPlaceholder("top_messages"),
                 MessagesPlaceholder("history"),
                 MessagesPlaceholder("messages"),
+                MessagesPlaceholder("bottom_messages"),
                 ("human", REPLY_USER_PROMPT),
             ]
         )
