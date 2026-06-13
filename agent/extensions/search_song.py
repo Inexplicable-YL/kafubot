@@ -1,3 +1,5 @@
+from difflib import SequenceMatcher
+
 import opencc
 from langchain.tools import tool
 
@@ -225,50 +227,46 @@ BIGRAM_SIZE = 2
 
 def sort_by_common_bigrams(
     text: str, string_list: list[str]
-) -> list[tuple[str, int, int]]:
-    if len(text) < BIGRAM_SIZE:
-        return []
-    bigram_pos: dict[str, int] = {}
-    for i in range(len(text) - 1):
-        bg = text[i : i + BIGRAM_SIZE]
-        bigram_pos[bg] = i
+) -> list[tuple[str, float]]:
+    def _jaccard_bigram(a: str, b: str) -> float:
+        a_bg = {a[i : i + BIGRAM_SIZE] for i in range(len(a) - 1)}
+        b_bg = {b[i : i + BIGRAM_SIZE] for i in range(len(b) - 1)}
+        union = len(a_bg | b_bg)
+        return len(a_bg & b_bg) / union if union else 0.0
 
-    scored: list[tuple[str, int, int]] = []
+    scored = []
     for s in string_list:
-        if len(s) < BIGRAM_SIZE:
-            continue
-        s_bigrams = {s[i : i + BIGRAM_SIZE] for i in range(len(s) - 1)}
-        total_weight = 0
-        common_cnt = 0
-        for bg in s_bigrams:
-            pos = bigram_pos.get(bg)
-            if pos is not None:
-                total_weight += pos
-                common_cnt += 1
-        if common_cnt > 0:
-            scored.append((s, total_weight, common_cnt))
-
-    scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        score = (
+            SequenceMatcher(None, text, s).ratio() * 0.5
+            + _jaccard_bigram(text, s) * 0.5
+        )
+        scored.append((s, score))
     return scored
-
-
-def get_kafu_songs(text: str) -> str:
-    t_text, s_text = (
-        opencc.OpenCC("s2t").convert(text),
-        opencc.OpenCC("t2s").convert(text),
-    )
-    t_sorted_songs = sort_by_common_bigrams(t_text, SONGS_LIST)
-    s_sorted_songs = sort_by_common_bigrams(s_text, SONGS_LIST)
-    sorted_songs = t_sorted_songs + s_sorted_songs
-    if not sorted_songs:
-        return "Can't find any songs."
-    sorted_songs.sort(key=lambda x: (x[1], x[2]), reverse=True)
-    top_songs = list(dict.fromkeys([item[0] for item in sorted_songs[:5]]))
-    return KAFU_SONGS_PROMPT + "\n".join(f"- {song}" for song in top_songs)
 
 
 @tool(
     description="根据关键词搜索歌曲，请输入关键词，多个关键词用空格或逗号分隔。与歌曲相关的问题，必须要使用此工具。"
 )
 def search_song(keywords: str) -> str:
-    return get_kafu_songs(keywords)
+    t_text, s_text = (
+        opencc.OpenCC("s2t").convert(keywords),
+        opencc.OpenCC("t2s").convert(keywords),
+    )
+    t_songs = sort_by_common_bigrams(t_text, SONGS_LIST)
+    s_songs = sort_by_common_bigrams(s_text, SONGS_LIST)
+    all_songs = t_songs + s_songs
+    if not all_songs:
+        return "Can't find any songs."
+    best_score: dict[str, float] = {}
+    for song, score in all_songs:
+        if song not in best_score or score > best_score[song]:
+            best_score[song] = score
+    sorted_songs = list(best_score.items())
+    sorted_songs.sort(key=lambda x: x[1], reverse=True)
+    print(sorted_songs[:5])
+    top_songs = [song for song, _ in sorted_songs[:5]]
+    return KAFU_SONGS_PROMPT + "\n".join(f"- {song}" for song in top_songs)
+
+
+if __name__ == "__main__":
+    print(search_song.invoke({"keywords": "可不 星界"}))

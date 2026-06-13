@@ -59,5 +59,4 @@ class ManagerContext(TypedDict):
     node: Any
     session_id: str
     is_tome: bool
-    chat_id: str
     unrestricted: bool

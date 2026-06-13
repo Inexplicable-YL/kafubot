@@ -261,7 +261,6 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 session_id=group_event.session_id,
                 is_tome=group_event.message.is_tome,
                 node=self,
-                chat_id=str(self.event.group_id),
                 unrestricted=(self.event.group_id in self.config.unrestricted_groups),
             ),
         )

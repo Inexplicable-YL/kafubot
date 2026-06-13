@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Any,
     Generic,
     NotRequired,
     TypedDict,
@@ -19,7 +21,6 @@ from langchain.agents.middleware import AgentMiddleware
 from agent.base import ManagerContext, ManagerState
 
 if TYPE_CHECKING:
-    from anyio.abc import TaskGroup
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
 BatchT = TypeVar("BatchT")
@@ -93,7 +94,8 @@ class BaseDaemonMiddleware(
         self._delayed_retry_sessions: set[str] = set()
 
         self._start_lock = anyio.Lock()
-        self._task_group: TaskGroup | None = None
+        self._worker_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self._send_stream: MemoryObjectSendStream[str] | None = None
         self._receive_stream: MemoryObjectReceiveStream[str] | None = None
 
@@ -102,13 +104,18 @@ class BaseDaemonMiddleware(
             await self._send_stream.aclose()
         if self._receive_stream is not None:
             await self._receive_stream.aclose()
-        if self._task_group is not None:
-            self._task_group.cancel_scope.cancel()
-            await self._task_group.__aexit__(None, None, None)
+        tasks = list(self._background_tasks)
+        if self._worker_task is not None:
+            tasks.append(self._worker_task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         self._send_stream = None
         self._receive_stream = None
-        self._task_group = None
+        self._worker_task = None
+        self._background_tasks.clear()
 
         self._pending_batches.clear()
         self._scheduled_sessions.clear()
@@ -116,6 +123,19 @@ class BaseDaemonMiddleware(
         self._retry_attempts.clear()
 
         await self.on_close()
+
+    def _clear_worker_task(self, task: asyncio.Task[None]) -> None:
+        if self._worker_task is task:
+            self._worker_task = None
+
+    def _start_background_task(
+        self,
+        coro: Any,
+    ) -> asyncio.Task[None]:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _ensure_service(self) -> None:
         if self._send_stream is not None:
@@ -128,13 +148,11 @@ class BaseDaemonMiddleware(
             send_stream, receive_stream = anyio.create_memory_object_stream[str](
                 self._queue_size
             )
-            task_group = anyio.create_task_group()
-            await task_group.__aenter__()
-            task_group.start_soon(self._save_worker, receive_stream)
-
             self._send_stream = send_stream
             self._receive_stream = receive_stream
-            self._task_group = task_group
+            worker_task = asyncio.create_task(self._save_worker(receive_stream))
+            worker_task.add_done_callback(self._clear_worker_task)
+            self._worker_task = worker_task
 
     async def _enqueue_batch(self, session_id: str, batch: BatchT) -> None:
         await self._ensure_service()
@@ -217,7 +235,7 @@ class BaseDaemonMiddleware(
     async def _queue_job(self, session_id: str) -> None:
         if (
             self._send_stream is None
-            or self._task_group is None
+            or self._worker_task is None
             or session_id in self._scheduled_sessions
         ):
             return
@@ -244,7 +262,7 @@ class BaseDaemonMiddleware(
                 self._logger.exception("Failed to send %s job", self._job_name)
 
         try:
-            self._task_group.start_soon(__send_job, self._send_stream)
+            self._start_background_task(__send_job(self._send_stream))
         except RuntimeError:
             self._scheduled_sessions.discard(session_id)
             self._logger.exception("Failed to schedule %s job", self._job_name)
@@ -267,7 +285,7 @@ class BaseDaemonMiddleware(
             return
 
         self._retry_attempts[session_id] = attempt
-        if session_id in self._delayed_retry_sessions or self._task_group is None:
+        if session_id in self._delayed_retry_sessions or self._worker_task is None:
             return
 
         async def __retry_job() -> None:
@@ -283,7 +301,11 @@ class BaseDaemonMiddleware(
             await self._queue_job(session_id)
 
         self._delayed_retry_sessions.add(session_id)
-        self._task_group.start_soon(__retry_job)
+        try:
+            self._start_background_task(__retry_job())
+        except RuntimeError:
+            self._delayed_retry_sessions.discard(session_id)
+            self._logger.exception("Failed to schedule %s retry", self._job_name)
 
     def _pop_processed_batches(self, session_id: str, batch_count: int) -> None:
         if batch_count <= 0:

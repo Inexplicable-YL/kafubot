@@ -1,17 +1,15 @@
 import logging
 import re
 import uuid
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 from typing_extensions import override
 
-import anyio
-from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
-from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
+from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.agents.middleware.types import ExtendedModelResponse
 from langchain.tools import BaseTool, ToolRuntime, tool
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -27,9 +25,7 @@ from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from agent.base import MODEL_VISIBLE_TZ, ManagerContext, ManagerState, UserMessage
 from agent.builder import create_agent
-
-if TYPE_CHECKING:
-    from anyio.abc import TaskGroup
+from agent.middlewares.base import BaseDaemonMiddleware, SessionProcessOutput
 
 logger = logging.getLogger(__name__)
 
@@ -248,27 +244,47 @@ class NormalizedUserResolution:
 
 @dataclass(slots=True)
 class PendingMemoryAnalysisBatch:
-    chat_id: str
+    session_id: str
     user_messages: list[UserMessage]
 
 
-class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
+class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
     state_schema = ManagerState
 
     def __init__(
         self,
         *,
         analyze_model: BaseChatModel,
-        queue_size: int = 100,
+        queue_size: int | None = None,
+        max_sessions: int = 100,
+        max_batches: int = 1,
+        max_retries: int = 0,
         memory_extraction_max_writes: int = MEMORY_EXTRACTION_MAX_WRITES,
         recent_memory_context_limit: int = RECENT_MEMORY_CONTEXT_LIMIT,
         namespace_root: str = "long_memory",
         inject_memory_hint: bool = True,
         store: BaseStore | None = None,
     ) -> None:
-        super().__init__()
+        if queue_size is not None:
+            max_sessions = self._validate_positive_int(queue_size, "queue_size")
+        max_sessions = self._validate_positive_int(max_sessions, "max_sessions")
+        max_batches = self._validate_positive_int(max_batches, "max_batches")
+        if max_retries < 0:
+            raise ValueError(
+                f"max_retries must be greater than or equal to 0, got {max_retries}."
+            )
+        super().__init__(
+            max_sessions=max_sessions,
+            max_retries=max_retries,
+            max_batch_window_size=max_batches,
+            logger_config={
+                "worker_name": "LongMemory",
+                "job_name": "long memory analysis",
+                "process_failure_log": "Failed to analyze long memory entries",
+                "retry_exhausted_label": "Long memory analysis",
+            },
+        )
         self.analyze_model = analyze_model
-        self.queue_size = self._validate_positive_int(queue_size, "queue_size")
         self.memory_extraction_max_writes = self._validate_positive_int(
             memory_extraction_max_writes,
             "memory_extraction_max_writes",
@@ -281,15 +297,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self.inject_memory_hint = inject_memory_hint
         self._user_maps: dict[str, dict[str, str]] = defaultdict(dict)
         self._recent_memory_cache: dict[tuple[str, ...], list[LongMemoryHit]] = {}
-        self._pending_batches: dict[str, deque[PendingMemoryAnalysisBatch]] = (
-            defaultdict(deque)
-        )
-        self._scheduled_sessions: set[str] = set()
         self._store: BaseStore | None = store
-        self._start_lock = anyio.Lock()
-        self._task_group: TaskGroup | None = None
-        self._send_stream: MemoryObjectSendStream[str] | None = None
-        self._receive_stream: MemoryObjectReceiveStream[str] | None = None
         self.tools = self._build_tools()
 
     @override
@@ -302,7 +310,6 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self._remember_users_from_state(state, session_id)
         await self._handle_pruned_messages(
             session_id=session_id,
-            chat_id=runtime.context["chat_id"],
             messages=state.get("summary_pruned_messages"),
         )
         return None
@@ -325,7 +332,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         if request.runtime.store:
             recent_memory_text = await self._format_recent_memory_context(
                 related_messages=state.get("inputs", []),
-                chat_id=request.runtime.context["chat_id"],
+                session_id=request.runtime.context["session_id"],
                 store=request.runtime.store,
             )
         hint = HumanMessage(
@@ -333,24 +340,6 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         )
         request = request.override(messages=[*request.messages, hint])
         return await handler(request)
-
-    async def aclose(self) -> None:
-        if self._send_stream is not None:
-            await self._send_stream.aclose()
-        if self._receive_stream is not None:
-            await self._receive_stream.aclose()
-        if self._task_group is not None:
-            self._task_group.cancel_scope.cancel()
-            await self._task_group.__aexit__(None, None, None)
-
-        self._send_stream = None
-        self._receive_stream = None
-        self._task_group = None
-        self._store = None
-        self._pending_batches.clear()
-        self._scheduled_sessions.clear()
-        self._user_maps.clear()
-        self._recent_memory_cache.clear()
 
     def _build_tools(self) -> list[BaseTool]:
         query_tool = tool(
@@ -360,30 +349,10 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         )(self._query_memory)
         return [query_tool]
 
-    async def _ensure_service(self) -> None:
-        if self._send_stream is not None:
-            return
-
-        async with self._start_lock:
-            if self._send_stream is not None:
-                return
-
-            send_stream, receive_stream = anyio.create_memory_object_stream[str](
-                self.queue_size
-            )
-            task_group = anyio.create_task_group()
-            await task_group.__aenter__()
-            task_group.start_soon(self._memory_worker, receive_stream)
-
-            self._send_stream = send_stream
-            self._receive_stream = receive_stream
-            self._task_group = task_group
-
     async def _handle_pruned_messages(
         self,
         *,
         session_id: str,
-        chat_id: str,
         messages: list[BaseMessage] | None,
     ) -> None:
         if messages is None:
@@ -393,99 +362,52 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             return
 
         self._remember_users_from_user_messages(session_id, user_messages)
-        await self._ensure_service()
-        self._pending_batches[session_id].append(
+        await self._enqueue_batch(
+            session_id,
             PendingMemoryAnalysisBatch(
-                chat_id=chat_id,
+                session_id=session_id,
                 user_messages=user_messages,
-            )
+            ),
         )
-        await self._queue_memory_job(session_id)
 
-    async def _queue_memory_job(self, session_id: str) -> None:
-        send_stream = self._send_stream
-        task_group = self._task_group
-        if send_stream is None or task_group is None:
-            return
-        if session_id in self._scheduled_sessions:
-            return
-
-        self._scheduled_sessions.add(session_id)
-        try:
-            send_stream.send_nowait(session_id)
-        except anyio.WouldBlock:
-            pass
-        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
-            self._scheduled_sessions.discard(session_id)
-            logger.exception("Failed to queue long memory analysis job")
-            return
-        else:
-            return
-
-        try:
-            task_group.start_soon(self._send_memory_job, send_stream, session_id)
-        except RuntimeError:
-            self._scheduled_sessions.discard(session_id)
-            logger.exception("Failed to schedule long memory analysis job")
-
-    async def _send_memory_job(
+    @override
+    async def process_batches(
         self,
-        send_stream: MemoryObjectSendStream[str],
         session_id: str,
-    ) -> None:
-        try:
-            await send_stream.send(session_id)
-        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
-            self._scheduled_sessions.discard(session_id)
-            logger.exception("Failed to send long memory analysis job")
-
-    async def _memory_worker(
-        self,
-        receive_stream: MemoryObjectReceiveStream[str],
-    ) -> None:
-        async with receive_stream:
-            async for session_id in receive_stream:
-                try:
-                    progressed = await self._analyze_session(session_id)
-                except Exception:
-                    logger.exception("Failed to analyze long memory batch")
-                    progressed = False
-                finally:
-                    self._scheduled_sessions.discard(session_id)
-
-                if progressed and self._pending_batches.get(session_id):
-                    await self._queue_memory_job(session_id)
-
-    async def _analyze_session(self, session_id: str) -> bool:
+        batches: tuple[PendingMemoryAnalysisBatch, ...],
+    ) -> SessionProcessOutput:
         store = self._store
         if store is None:
             logger.warning(
                 "Skipping long memory analysis for session %s because store is unavailable",
                 session_id,
             )
-            return False
+            return len(batches)
 
-        progressed = False
-        pending_batches = self._pending_batches.get(session_id)
-        if not pending_batches:
-            return False
-
-        while pending_batches:
-            batch = pending_batches.popleft()
+        consumed_batches = 0
+        for batch in batches:
+            consumed_batches += 1
             if not batch.user_messages:
-                progressed = True
                 continue
 
-            await self._run_memory_subagent(
-                messages=batch.user_messages,
-                session_id=session_id,
-                chat_id=batch.chat_id,
-                store=store,
-            )
-            progressed = True
+            try:
+                await self._run_memory_subagent(
+                    messages=batch.user_messages,
+                    session_id=session_id,
+                    store=store,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to analyze long memory batch for session %s",
+                    session_id,
+                )
+        return consumed_batches
 
-        self._pending_batches.pop(session_id, None)
-        return progressed
+    @override
+    async def on_close(self) -> None:
+        self._store = None
+        self._user_maps.clear()
+        self._recent_memory_cache.clear()
 
     @staticmethod
     def _validate_positive_int(value: int, name: str) -> int:
@@ -563,7 +485,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             )
 
         namespaces = self._get_query_namespaces(
-            chat_id=ctx["chat_id"],
+            sess_id=ctx["session_id"],
             user_id=resolution.user_id,
         )
 
@@ -721,13 +643,12 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         *,
         messages: list[UserMessage],
         session_id: str,
-        chat_id: str,
         store: BaseStore,
     ) -> list[LongMemoryEvent]:
         messages_text = "\n".join(message.as_content() for message in messages)
         recent_memory_text = await self._format_recent_memory_context(
             related_messages=messages,
-            chat_id=chat_id,
+            session_id=session_id,
             store=store,
         )
         events: list[LongMemoryEvent] = []
@@ -757,7 +678,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             resolved = self._resolve_candidate_user(candidate, session_id)
             event = await self._store_memory_candidate(
                 candidate=resolved,
-                chat_id=chat_id,
+                session_id=session_id,
                 store=store,
             )
             events.append(event)
@@ -788,13 +709,13 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         *,
         related_messages: list[UserMessage],
-        chat_id: str,
+        session_id: str,
         store: BaseStore,
     ) -> str:
         sections: list[str] = []
         chat_hits = await self._recent_memory_hits(
             store=store,
-            namespace=(self.namespace_root, "chats", chat_id),
+            namespace=(self.namespace_root, "chats", session_id),
             limit=self.recent_memory_context_limit,
         )
         sections.append(
@@ -812,7 +733,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         for user_id, user_name in user_names_by_id.items():
             user_hits = await self._recent_memory_hits(
                 store=store,
-                namespace=(self.namespace_root, "users", user_id, chat_id),
+                namespace=(self.namespace_root, "users", user_id, session_id),
                 limit=self.recent_memory_context_limit,
             )
             title = f"{user_name}({user_id})" if user_name else user_id
@@ -897,7 +818,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         self,
         *,
         candidate: MemoryCandidate,
-        chat_id: str,
+        session_id: str,
         store: BaseStore,
     ) -> LongMemoryEvent:
         def normalize_time_string(value: str) -> str | None:
@@ -909,9 +830,9 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         memory_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         namespace = (
-            (self.namespace_root, "users", candidate.user_id, chat_id)
+            (self.namespace_root, "users", candidate.user_id, session_id)
             if candidate.user_id
-            else (self.namespace_root, "chats", chat_id)
+            else (self.namespace_root, "chats", session_id)
         )
 
         value: dict[str, Any] = {
@@ -921,7 +842,7 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             "user_id": candidate.user_id or None,
             "user_name": candidate.user_name or None,
             "source_message_ids": candidate.source_message_ids,
-            "chat_id": chat_id,
+            "chat_id": session_id,
             "tags": candidate.tags,
             "event_time_start": normalize_time_string(candidate.time_start),
             "event_time_end": normalize_time_string(candidate.time_end),
@@ -1065,15 +986,15 @@ class LongMemoryMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
     def _get_query_namespaces(
         self,
         *,
-        chat_id: str,
+        sess_id: str,
         user_id: str,
     ) -> list[tuple[str, ...]]:
-        chat_namespace = (self.namespace_root, "chats", chat_id)
+        chat_namespace = (self.namespace_root, "chats", sess_id)
         if not user_id:
             return [chat_namespace]
 
         return [
-            (self.namespace_root, "users", user_id, chat_id),
+            (self.namespace_root, "users", user_id, sess_id),
             (self.namespace_root, "users", user_id),
             chat_namespace,
         ]

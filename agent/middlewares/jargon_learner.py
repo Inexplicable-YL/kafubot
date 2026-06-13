@@ -32,7 +32,7 @@ from typing_extensions import override
 from json_repair import repair_json
 from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
@@ -456,6 +456,8 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
                 if isinstance(message, HumanMessage) and isinstance(
                     raw := message.additional_kwargs.get("raw"), UserMessage
                 ):
+                    if any(m.type in {"image", "meme"} for m in raw.message):
+                        continue
                     plain = _clean_text(raw.as_plain_content())
                     if not plain:
                         continue
@@ -483,23 +485,6 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
                         }
                     )
                     continue
-
-                text = _clean_text(content_to_text(message.content))
-                if not text:
-                    continue
-
-                if isinstance(message, AIMessage):
-                    batch_records.append(
-                        {
-                            "line": _truncate(
-                                f"<bot-message user={BOT_NAME}>\n{text}\n</bot-message>",
-                                self._max_message_chars,
-                            ),
-                            "plain": f"{BOT_NAME}: {text}",
-                            "source_id": "",
-                            "is_user_source": False,
-                        }
-                    )
 
             if not batch_records:
                 batch_count += 1

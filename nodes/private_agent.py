@@ -326,7 +326,6 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
                 session_id=session_id,
                 is_tome=True,
                 node=self,
-                chat_id=str(self.event.user_id),
                 unrestricted=False,
             ),
         )

@@ -42,13 +42,14 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
     ) -> None:
         self.deferred_tools = list(deferred_tools)
         self.display_tools = defaultdict(list)
-        self.tools = [
-            tool(
-                "search_tool",
-                args_schema=SearchTool,
-                description="在 deferred tools 列表中按名称或关键词搜索工具，并将命中的工具加入后续轮次的可用工具列表。",
-            )(self.search_tool)
-        ]
+        if self.deferred_tools:
+            self.tools = [
+                tool(
+                    "search_tool",
+                    args_schema=SearchTool,
+                    description="在 deferred tools 列表中按名称或关键词搜索工具，并将命中的工具加入后续轮次的可用工具列表。",
+                )(self.search_tool)
+            ]
 
     def search_tool(
         self,
@@ -161,6 +162,8 @@ class DeferredToolMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any])
             }.values()
         )
         display_tools = list(display_tools_dict.values())
+        if not deferred_tools and not display_tools:
+            return await handler(request)
         remind_message = HumanMessage(
             content=SYSTEM_REMINDER.format(
                 deferred_tools="\n".join(

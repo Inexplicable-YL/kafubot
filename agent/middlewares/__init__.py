@@ -4,6 +4,7 @@ from agent.middlewares.base import (
     SessionProcessOutput,
 )
 from agent.middlewares.jargon_learner import JargonLearnerMiddleware
+from agent.middlewares.memory import LongMemoryMiddleware
 from agent.middlewares.summarization import SummarizationMiddleware
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "ProcessResult",
     "JargonLearnerMiddleware",
     "SummarizationMiddleware",
+    "LongMemoryMiddleware",
 ]

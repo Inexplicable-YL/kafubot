@@ -27,8 +27,8 @@ from agent.base import (
 from agent.builder import create_agent
 from agent.extensions import (
     ActivateLimitMiddleware,
-    LongMemoryMiddleware,
     MemeSendingMiddleware,
+    query_expert,
     query_image,
     search_song,
     view_forward_message,
@@ -38,6 +38,7 @@ from agent.history import get_session_history
 from agent.interaction import InteractionConfig, InteractionMiddleware
 from agent.middlewares import (
     JargonLearnerMiddleware,
+    LongMemoryMiddleware,
     SummarizationMiddleware,
 )
 from agent.prompts.manager import (
@@ -142,15 +143,17 @@ def get_model(
 
 
 async def create_agent_service():
+    database_conns: list[aiosqlite.Connection] = []
     jargon_middlewares: list[JargonLearnerMiddleware] = []
     memory_middlewares: list[LongMemoryMiddleware] = []
     summary_middlewares: list[SummarizationMiddleware] = []
-    conn = await aiosqlite.connect(
+    memory_conn = await aiosqlite.connect(
         "./.database/long_memory.db",
         isolation_level=None,
     )
-    store = AsyncSqliteStore(
-        conn=conn,
+    database_conns.append(memory_conn)
+    memory_store = AsyncSqliteStore(
+        conn=memory_conn,
         index={
             "embed": OpenAIEmbeddings(
                 model="text-embedding-3-large",
@@ -159,6 +162,18 @@ async def create_agent_service():
             "dims": 3072,
         },
     )
+    jargon_conn = await aiosqlite.connect(
+        "./.database/jargon_learner.db",
+        isolation_level=None,
+    )
+    database_conns.append(jargon_conn)
+    jargon_store = AsyncSqliteStore(conn=jargon_conn)
+    summary_conn = await aiosqlite.connect(
+        "./.database/summary_store.db",
+        isolation_level=None,
+    )
+    database_conns.append(summary_conn)
+    summary_store = AsyncSqliteStore(conn=summary_conn)
 
     async def get_agent(
         interaction_config: InteractionConfig,
@@ -172,31 +187,34 @@ async def create_agent_service():
             )
             | interaction_config
         )
-        jargon_middleware = JargonLearnerMiddleware(analyze_model=get_model(0.3, "max"))
+        jargon_middleware = JargonLearnerMiddleware(
+            analyze_model=get_model(0.3, "max"), store=jargon_store
+        )
         jargon_middlewares.append(jargon_middleware)
         summary_middleware = SummarizationMiddleware(
-            summary_model=get_model(0.3, "max")
+            summary_model=get_model(0.3, "max"), store=summary_store
         )
         summary_middlewares.append(summary_middleware)
-        memory_middleware = LongMemoryMiddleware(analyze_model=get_model(0.3, "max"))
+        memory_middleware = LongMemoryMiddleware(
+            analyze_model=get_model(0.3, "max"), store=memory_store
+        )
         memory_middlewares.append(memory_middleware)
         return create_agent(
             model=get_model(0.6, "max"),
-            tools=[query_image, search_song, view_forward_message],
+            tools=[query_image, search_song, view_forward_message, query_expert],
             middleware=[
                 InteractionMiddleware(**interaction_config),
                 ActivateLimitMiddleware(**limiter_config),
                 TimeGateMiddleware(**gate_config),
                 MemeSendingMiddleware(man_send_per_turn=1),
                 jargon_middleware,
-                # memory_middleware,
+                memory_middleware,
                 summary_middleware,
                 generate_prompt,
                 add_time,
             ],
             state_schema=ManagerState,
             context_schema=ManagerContext,
-            store=store,
         )
 
     async def shutdown():
@@ -206,6 +224,7 @@ async def create_agent_service():
             await memory_middleware.aclose()
         for summary_middleware in summary_middlewares:
             await summary_middleware.aclose()
-        await conn.close()
+        for database_conn in database_conns:
+            await database_conn.close()
 
     return get_agent, shutdown
