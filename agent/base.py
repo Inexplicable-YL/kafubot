@@ -53,6 +53,7 @@ class ManagerState(AgentState):
 
     reply_top_messages: NotRequired[Annotated[list[BaseMessage], add]]
     reply_bottom_messages: NotRequired[Annotated[list[BaseMessage], add]]
+    reply_bottom_message_factories: NotRequired[Annotated[list[Any], add]]
 
 
 class ManagerContext(TypedDict):

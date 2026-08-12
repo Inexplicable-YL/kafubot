@@ -285,6 +285,66 @@ HTML = r"""<!doctype html>
     .keep-toggle input {
       accent-color: var(--accent);
     }
+    .bulk-panel {
+      margin: 0 28px 10px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: rgba(255, 250, 240, 0.82);
+      box-shadow: 0 12px 30px var(--shadow);
+      overflow: hidden;
+    }
+    .bulk-panel[hidden] {
+      display: none;
+    }
+    .bulk-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 12px;
+      max-height: 72vh;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .bulk-card {
+      display: grid;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 10px;
+      background: #fffdf8;
+      cursor: pointer;
+      transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+    }
+    .bulk-card.selected {
+      border-color: var(--accent);
+      box-shadow: 0 10px 24px rgba(47, 107, 95, 0.18);
+      transform: translateY(-1px);
+    }
+    .bulk-card img {
+      width: 100%;
+      height: 150px;
+      object-fit: contain;
+      border-radius: 10px;
+      box-shadow: none;
+      background: white;
+    }
+    .bulk-card .analysis-preview {
+      min-height: 3.6em;
+      max-height: 6.8em;
+      overflow: auto;
+      color: var(--ink);
+      line-height: 1.45;
+      font-size: 12px;
+    }
+    .bulk-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--ink);
+      font-size: 14px;
+    }
+    .bulk-toggle input {
+      accent-color: var(--accent);
+    }
     .image-wrap {
       padding: 18px;
       min-height: 440px;
@@ -371,6 +431,7 @@ HTML = r"""<!doctype html>
       main { grid-template-columns: 1fr; padding: 8px 14px 18px; }
       .add-panel { margin: 0 14px 10px; }
       .duplicate-panel { margin: 0 14px 10px; }
+      .bulk-panel { margin: 0 14px 10px; }
       .add-grid { grid-template-columns: 1fr; }
       .image-wrap { min-height: 300px; }
     }
@@ -397,6 +458,7 @@ HTML = r"""<!doctype html>
       </label>
       <button class="secondary" id="prev">上一条</button>
       <button class="secondary" id="next">跳过/下一条</button>
+      <button class="secondary" id="bulk-review">批量保留未标注</button>
       <button class="secondary" id="dedupe">全库查重</button>
     </div>
   </header>
@@ -432,11 +494,32 @@ HTML = r"""<!doctype html>
       <div class="toolbar">
         <button class="secondary" id="duplicate-prev">上一组</button>
         <button class="secondary" id="duplicate-next">下一组</button>
+        <button class="secondary" id="duplicate-select-all">全选</button>
+        <button class="secondary" id="duplicate-select-none">全不选</button>
+        <button class="secondary" id="duplicate-select-invert">反选</button>
         <button id="duplicate-resolve">保留勾选并删除其余</button>
         <button class="secondary" id="duplicate-close">关闭</button>
       </div>
       <div class="status" id="duplicate-status"></div>
       <div class="duplicate-grid" id="duplicate-grid"></div>
+    </div>
+  </section>
+  <section class="bulk-panel" id="bulk-panel" hidden>
+    <div class="panel-head">
+      <strong>未标注批量保留</strong>
+      <span class="pill" id="bulk-position">-</span>
+    </div>
+    <div class="duplicate-body">
+      <div class="toolbar">
+        <button class="secondary" id="bulk-load">加载未标注缩略图</button>
+        <button class="secondary" id="bulk-select-all">全选</button>
+        <button class="secondary" id="bulk-select-none">全不选</button>
+        <button class="secondary" id="bulk-select-invert">反选</button>
+        <button id="bulk-resolve">保留勾选并删除未勾选</button>
+        <button class="secondary" id="bulk-close">关闭</button>
+      </div>
+      <div class="status" id="bulk-status"></div>
+      <div class="bulk-grid" id="bulk-grid"></div>
     </div>
   </section>
   <main>
@@ -480,6 +563,7 @@ HTML = r"""<!doctype html>
       total: 0,
       duplicateGroups: [],
       duplicateIndex: 0,
+      bulkRecords: [],
     };
     const el = (id) => document.getElementById(id);
 
@@ -490,8 +574,11 @@ HTML = r"""<!doctype html>
 
     function setBusy(busy) {
       for (const id of [
-        "prev", "next", "save", "delete", "filter", "dedupe",
-        "duplicate-prev", "duplicate-next", "duplicate-resolve",
+        "prev", "next", "save", "delete", "filter", "dedupe", "bulk-review",
+        "duplicate-prev", "duplicate-next", "duplicate-select-all",
+        "duplicate-select-none", "duplicate-select-invert", "duplicate-resolve",
+        "bulk-load", "bulk-select-all", "bulk-select-none",
+        "bulk-select-invert", "bulk-resolve", "bulk-close",
       ]) {
         el(id).disabled = busy;
       }
@@ -500,6 +587,11 @@ HTML = r"""<!doctype html>
     function setDuplicateStatus(text, isError = false) {
       el("duplicate-status").textContent = text;
       el("duplicate-status").style.color = isError ? "var(--danger)" : "var(--muted)";
+    }
+
+    function setBulkStatus(text, isError = false) {
+      el("bulk-status").textContent = text;
+      el("bulk-status").style.color = isError ? "var(--danger)" : "var(--muted)";
     }
 
     function setAddBusy(busy) {
@@ -620,6 +712,71 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function updateDuplicateSelectionSummary(
+      prefix = "取消勾选要删除的记录；可保留零个、一个或多个。",
+    ) {
+      const total = document.querySelectorAll("#duplicate-grid input[type='checkbox']").length;
+      const selected = document.querySelectorAll(
+        "#duplicate-grid input[type='checkbox']:checked",
+      ).length;
+      if (!total) {
+        setDuplicateStatus("没有发现需要审核的重复组");
+        return;
+      }
+      setDuplicateStatus(`${prefix} 已选 ${selected} / ${total}。`);
+    }
+
+    function applyDuplicateSelection(mode) {
+      const checkboxes = Array.from(
+        document.querySelectorAll("#duplicate-grid input[type='checkbox']"),
+      );
+      for (const checkbox of checkboxes) {
+        if (mode === "all") {
+          checkbox.checked = true;
+        } else if (mode === "none") {
+          checkbox.checked = false;
+        } else {
+          checkbox.checked = !checkbox.checked;
+        }
+      }
+      updateDuplicateSelectionSummary();
+    }
+
+    function updateBulkSelectionSummary(
+      prefix = "勾选需要保留的记录；未勾选项会被删除。",
+    ) {
+      for (const card of document.querySelectorAll("#bulk-grid .bulk-card")) {
+        const checkbox = card.querySelector("input[type='checkbox']");
+        card.classList.toggle("selected", Boolean(checkbox?.checked));
+      }
+      const total = state.bulkRecords.length;
+      const selected = document.querySelectorAll(
+        "#bulk-grid input[type='checkbox']:checked",
+      ).length;
+      el("bulk-position").textContent = `${selected} / ${total}`;
+      if (!total) {
+        setBulkStatus("没有未人工标注记录");
+        return;
+      }
+      setBulkStatus(`${prefix} 已选 ${selected} / ${total}。`);
+    }
+
+    function applyBulkSelection(mode) {
+      const checkboxes = Array.from(
+        document.querySelectorAll("#bulk-grid input[type='checkbox']"),
+      );
+      for (const checkbox of checkboxes) {
+        if (mode === "all") {
+          checkbox.checked = true;
+        } else if (mode === "none") {
+          checkbox.checked = false;
+        } else {
+          checkbox.checked = !checkbox.checked;
+        }
+      }
+      updateBulkSelectionSummary();
+    }
+
     function renderDuplicateGroup() {
       el("duplicate-panel").hidden = false;
       const grid = el("duplicate-grid");
@@ -638,7 +795,6 @@ HTML = r"""<!doctype html>
       const group = state.duplicateGroups[state.duplicateIndex];
       el("duplicate-position").textContent =
         `${state.duplicateIndex + 1} / ${state.duplicateGroups.length} · 距离 ${group.min_distance}-${group.max_distance}`;
-      setDuplicateStatus("取消勾选要删除的记录；可保留一个或多个。");
 
       for (const record of group.records) {
         const card = document.createElement("article");
@@ -647,6 +803,7 @@ HTML = r"""<!doctype html>
           const img = document.createElement("img");
           img.src = record.image_src;
           img.alt = "meme";
+          img.loading = "lazy";
           card.appendChild(img);
         }
         const keep = document.createElement("label");
@@ -655,6 +812,8 @@ HTML = r"""<!doctype html>
         checkbox.type = "checkbox";
         checkbox.checked = true;
         checkbox.value = record.id;
+        checkbox.addEventListener("change", () => updateDuplicateSelectionSummary());
+        keep.addEventListener("click", (event) => event.stopPropagation());
         keep.appendChild(checkbox);
         keep.appendChild(document.createTextNode("保留"));
         card.appendChild(keep);
@@ -668,8 +827,74 @@ HTML = r"""<!doctype html>
         analysis.className = "analysis-preview";
         analysis.textContent = record.analysis || "";
         card.appendChild(analysis);
+        card.addEventListener("click", () => {
+          checkbox.checked = !checkbox.checked;
+          updateDuplicateSelectionSummary();
+        });
         grid.appendChild(card);
       }
+      updateDuplicateSelectionSummary();
+    }
+
+    function renderBulkPanel() {
+      el("bulk-panel").hidden = false;
+      const grid = el("bulk-grid");
+      grid.replaceChildren();
+
+      if (!state.bulkRecords.length) {
+        el("bulk-position").textContent = "0 / 0";
+        setBulkStatus("没有未人工标注记录");
+        return;
+      }
+
+      for (const record of state.bulkRecords) {
+        const card = document.createElement("article");
+        card.className = "bulk-card";
+
+        if (record.image_src) {
+          const img = document.createElement("img");
+          img.src = record.image_src;
+          img.alt = "meme";
+          img.loading = "lazy";
+          card.appendChild(img);
+        } else {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "该记录没有 base64 图片";
+          card.appendChild(empty);
+        }
+
+        const keep = document.createElement("label");
+        keep.className = "bulk-toggle";
+        keep.addEventListener("click", (event) => event.stopPropagation());
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = false;
+        checkbox.value = record.id;
+        checkbox.addEventListener("change", () => updateBulkSelectionSummary());
+        keep.appendChild(checkbox);
+        keep.appendChild(document.createTextNode("保留"));
+        card.appendChild(keep);
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = `ID: ${record.id} · phash: ${record.phash || "-"}${record.url ? ` · URL: ${record.url}` : ""}`;
+        card.appendChild(meta);
+
+        if (record.analysis_preview) {
+          const analysis = document.createElement("div");
+          analysis.className = "analysis-preview";
+          analysis.textContent = record.analysis_preview;
+          card.appendChild(analysis);
+        }
+
+        card.addEventListener("click", () => {
+          checkbox.checked = !checkbox.checked;
+          updateBulkSelectionSummary();
+        });
+        grid.appendChild(card);
+      }
+      updateBulkSelectionSummary();
     }
 
     async function loadDuplicates() {
@@ -690,6 +915,24 @@ HTML = r"""<!doctype html>
       }
     }
 
+    async function loadBulkUnlabeled() {
+      setBusy(true);
+      el("bulk-panel").hidden = false;
+      setBulkStatus("加载未标注缩略图中...");
+      try {
+        const resp = await fetch("/api/bulk-unlabeled");
+        const payload = await resp.json();
+        if (!resp.ok) throw new Error(payload.error || "加载未标注缩略图失败");
+        state.bulkRecords = payload.records || [];
+        renderBulkPanel();
+        updateCounts(payload.counts || { all: 0, unlabeled: 0, labeled: 0 });
+      } catch (err) {
+        setBulkStatus(err.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
     async function resolveDuplicateGroup() {
       if (!state.duplicateGroups.length) return;
       const group = state.duplicateGroups[state.duplicateIndex];
@@ -697,8 +940,8 @@ HTML = r"""<!doctype html>
         document.querySelectorAll("#duplicate-grid input[type='checkbox']:checked"),
       ).map((input) => input.value);
       if (!keepIds.length) {
-        setDuplicateStatus("至少保留一条记录", true);
-        return;
+        const confirmed = confirm("当前没有勾选任何记录，将删除整个重复组。确定继续？");
+        if (!confirmed) return;
       }
       setBusy(true);
       setDuplicateStatus("处理中...");
@@ -715,9 +958,48 @@ HTML = r"""<!doctype html>
         const payload = await resp.json();
         if (!resp.ok) throw new Error(payload.error || "处理失败");
         await loadDuplicates();
+        await loadRecord(state.index);
         setDuplicateStatus(`已删除 ${payload.deleted} 条，保留 ${payload.kept} 条`);
       } catch (err) {
         setDuplicateStatus(err.message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function resolveBulkUnlabeled() {
+      if (!state.bulkRecords.length) return;
+      const keepIds = Array.from(
+        document.querySelectorAll("#bulk-grid input[type='checkbox']:checked"),
+      ).map((input) => input.value);
+      if (!keepIds.length) {
+        const confirmed = confirm(
+          "当前没有勾选任何记录，将删除这批未标注表情包。确定继续？",
+        );
+        if (!confirmed) return;
+      }
+      setBusy(true);
+      setBulkStatus("处理中...");
+      try {
+        const resp = await fetch("/api/bulk-unlabeled/resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            record_ids: state.bulkRecords.map((record) => record.id),
+            keep_ids: keepIds,
+          }),
+        });
+        const payload = await resp.json();
+        if (!resp.ok) throw new Error(payload.error || "批量处理失败");
+        await loadBulkUnlabeled();
+        await loadRecord(state.index);
+        const summary = [`已删除 ${payload.deleted} 条，保留 ${payload.kept} 条`];
+        if (payload.skipped_labeled) {
+          summary.push(`跳过 ${payload.skipped_labeled} 条已人工标注记录`);
+        }
+        setBulkStatus(summary.join("，"));
+      } catch (err) {
+        setBulkStatus(err.message, true);
       } finally {
         setBusy(false);
       }
@@ -859,6 +1141,7 @@ HTML = r"""<!doctype html>
     });
     el("prev").addEventListener("click", () => loadRecord(Math.max(0, state.index - 1)));
     el("next").addEventListener("click", () => loadRecord(state.index + 1));
+    el("bulk-review").addEventListener("click", loadBulkUnlabeled);
     el("dedupe").addEventListener("click", loadDuplicates);
     el("save").addEventListener("click", saveRecord);
     el("delete").addEventListener("click", deleteRecord);
@@ -870,9 +1153,20 @@ HTML = r"""<!doctype html>
       state.duplicateIndex += 1;
       renderDuplicateGroup();
     });
+    el("duplicate-select-all").addEventListener("click", () => applyDuplicateSelection("all"));
+    el("duplicate-select-none").addEventListener("click", () => applyDuplicateSelection("none"));
+    el("duplicate-select-invert").addEventListener("click", () => applyDuplicateSelection("invert"));
     el("duplicate-resolve").addEventListener("click", resolveDuplicateGroup);
     el("duplicate-close").addEventListener("click", () => {
       el("duplicate-panel").hidden = true;
+    });
+    el("bulk-load").addEventListener("click", loadBulkUnlabeled);
+    el("bulk-select-all").addEventListener("click", () => applyBulkSelection("all"));
+    el("bulk-select-none").addEventListener("click", () => applyBulkSelection("none"));
+    el("bulk-select-invert").addEventListener("click", () => applyBulkSelection("invert"));
+    el("bulk-resolve").addEventListener("click", resolveBulkUnlabeled);
+    el("bulk-close").addEventListener("click", () => {
+      el("bulk-panel").hidden = true;
     });
     el("add-path-btn").addEventListener("click", () => {
       const path = el("add-path").value.trim();
@@ -1171,6 +1465,13 @@ def _counts(records: list[MemeRecord]) -> dict[str, int]:
     }
 
 
+def _truncate_text(text: str, *, limit: int = 180) -> str:
+    normalized = " ".join((text or "").split()).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
+
+
 def _record_phash(record: MemeRecord) -> imagehash.ImageHash | None:
     value = record.metadata.get("phash")
     if not isinstance(value, str) or not value:
@@ -1256,6 +1557,16 @@ def _serialize_record(record: MemeRecord) -> dict[str, Any]:
     }
 
 
+def _serialize_bulk_record(record: MemeRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "image_src": _image_src(record.metadata.get("base64")),
+        "url": record.metadata.get("url", ""),
+        "phash": record.metadata.get("phash", ""),
+        "analysis_preview": _truncate_text(record.analysis),
+    }
+
+
 def _serialize_duplicate_group(group: DuplicateGroup) -> dict[str, Any]:
     records = [_serialize_record(record) for record in group.records]
     if group.pending_token is not None:
@@ -1278,6 +1589,47 @@ def _serialize_duplicate_group(group: DuplicateGroup) -> dict[str, Any]:
         "min_distance": int(group.min_distance),
         "max_distance": int(group.max_distance),
         "records": records,
+    }
+
+
+def _build_record_payload(filter_name: FilterName, index: int) -> dict[str, Any]:
+    records = _read_records()
+    filtered = _filter_records(records, filter_name)
+    total = len(filtered)
+    if total == 0:
+        return {
+            "filter": filter_name,
+            "index": 0,
+            "total": 0,
+            "counts": _counts(records),
+            "record": None,
+        }
+
+    index = min(index, total - 1)
+    return {
+        "filter": filter_name,
+        "index": index,
+        "total": total,
+        "counts": _counts(records),
+        "record": _serialize_record(filtered[index]),
+    }
+
+
+def _build_duplicates_payload() -> dict[str, Any]:
+    records = _read_records()
+    groups = _find_duplicate_groups(records)
+    return {
+        "distance": int(MEME_PHASH_DISTANCE),
+        "groups": [_serialize_duplicate_group(group) for group in groups],
+    }
+
+
+def _build_bulk_unlabeled_payload() -> dict[str, Any]:
+    records = _read_records()
+    unlabeled = _filter_records(records, "unlabeled")
+    return {
+        "counts": _counts(records),
+        "records": [_serialize_bulk_record(record) for record in unlabeled],
     }
 
 
@@ -1333,8 +1685,6 @@ def _resolve_duplicate_group(
     keep_set = set(keep_ids)
     if not group_ids:
         raise web.HTTPBadRequest(text="group_ids is required")
-    if not keep_set:
-        raise web.HTTPBadRequest(text="keep_ids is required")
     if not keep_set.issubset(set(group_ids)):
         raise web.HTTPBadRequest(text="keep_ids must be part of group_ids")
 
@@ -1372,8 +1722,6 @@ def _resolve_pending_duplicate_add(
     keep_set = set(keep_ids)
     if pending_id not in group_ids:
         raise web.HTTPBadRequest(text="pending record is not part of group_ids")
-    if not keep_set:
-        raise web.HTTPBadRequest(text="keep_ids is required")
     if not keep_set.issubset(set(group_ids)):
         raise web.HTTPBadRequest(text="keep_ids must be part of group_ids")
 
@@ -1429,6 +1777,40 @@ def _resolve_pending_duplicate_add(
         "deleted": len(delete_ids),
         "added": 1 if new_id is not None else 0,
         "new_id": new_id,
+    }
+
+
+def _resolve_bulk_unlabeled(
+    record_ids: list[str],
+    keep_ids: list[str],
+) -> dict[str, int]:
+    keep_set = set(keep_ids)
+    if not record_ids:
+        raise web.HTTPBadRequest(text="record_ids is required")
+    if not keep_set.issubset(set(record_ids)):
+        raise web.HTTPBadRequest(text="keep_ids must be part of record_ids")
+
+    with _chroma_operation_lock():
+        records = [record for id_ in record_ids if (record := _get_record_by_id(id_))]
+        existing_ids = {record.id for record in records}
+        if not keep_set.issubset(existing_ids):
+            raise web.HTTPNotFound(text="kept record not found")
+
+        skipped_labeled_ids = [
+            record.id for record in records if record.manually_annotated
+        ]
+        delete_ids = [
+            record.id
+            for record in records
+            if record.id not in keep_set and not record.manually_annotated
+        ]
+        if delete_ids:
+            _collection().delete(ids=delete_ids)
+
+    return {
+        "kept": len(keep_set),
+        "deleted": len(delete_ids),
+        "skipped_labeled": len(skipped_labeled_ids),
     }
 
 
@@ -1493,33 +1875,10 @@ async def get_record(request: web.Request) -> web.Response:
     index = _parse_index(request.query.get("index"))
 
     try:
-        records = await asyncio.to_thread(_read_records)
+        payload = await asyncio.to_thread(_build_record_payload, filter_name, index)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
-
-    filtered = _filter_records(records, filter_name)
-    total = len(filtered)
-    if total == 0:
-        return web.json_response(
-            {
-                "filter": filter_name,
-                "index": 0,
-                "total": 0,
-                "counts": _counts(records),
-                "record": None,
-            }
-        )
-
-    index = min(index, total - 1)
-    return web.json_response(
-        {
-            "filter": filter_name,
-            "index": index,
-            "total": total,
-            "counts": _counts(records),
-            "record": _serialize_record(filtered[index]),
-        }
-    )
+    return web.json_response(payload)
 
 
 async def save_record(request: web.Request) -> web.Response:
@@ -1569,16 +1928,18 @@ async def delete_record(request: web.Request) -> web.Response:
 
 async def get_duplicates(_: web.Request) -> web.Response:
     try:
-        records = await asyncio.to_thread(_read_records)
-        groups = await asyncio.to_thread(_find_duplicate_groups, records)
+        payload = await asyncio.to_thread(_build_duplicates_payload)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
-    return web.json_response(
-        {
-            "distance": int(MEME_PHASH_DISTANCE),
-            "groups": [_serialize_duplicate_group(group) for group in groups],
-        }
-    )
+    return web.json_response(payload)
+
+
+async def get_bulk_unlabeled(_: web.Request) -> web.Response:
+    try:
+        payload = await asyncio.to_thread(_build_bulk_unlabeled_payload)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response(payload)
 
 
 async def resolve_duplicates(request: web.Request) -> web.Response:
@@ -1605,15 +1966,30 @@ async def resolve_duplicates(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **result})
 
 
+async def resolve_bulk_unlabeled(request: web.Request) -> web.Response:
+    try:
+        payload = await _read_json(request)
+        record_ids = _required_string_list(payload, "record_ids")
+        keep_ids = _required_string_list(payload, "keep_ids") if "keep_ids" in payload else []
+        result = await asyncio.to_thread(_resolve_bulk_unlabeled, record_ids, keep_ids)
+    except web.HTTPException as exc:
+        return web.json_response({"error": exc.text}, status=exc.status)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+    return web.json_response({"ok": True, **result})
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/api/record", get_record)
     app.router.add_get("/api/duplicates", get_duplicates)
+    app.router.add_get("/api/bulk-unlabeled", get_bulk_unlabeled)
     app.router.add_post("/api/add", add_record)
     app.router.add_post("/api/save", save_record)
     app.router.add_post("/api/delete", delete_record)
     app.router.add_post("/api/duplicates/resolve", resolve_duplicates)
+    app.router.add_post("/api/bulk-unlabeled/resolve", resolve_bulk_unlabeled)
     return app
 
 

@@ -1,3 +1,4 @@
+import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
@@ -52,6 +53,8 @@ from agent.prompts.replyer import (
     REPLY_USER_PROMPT,
 )
 from agent.utils import content_to_text, to_reply
+
+logger = logging.getLogger(__name__)
 
 
 class InteractionConfig(TypedDict):
@@ -166,7 +169,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             )(self.get_early_messages),
         ]
 
-    async def reply(
+    async def reply(  # noqa: PLR0915
         self,
         focus: str,
         use_reply: bool,
@@ -182,6 +185,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         ):
             return "本轮系统允许的回复次数已用完，请等待下一轮。"
         focus_output: str | None = None
+        target_message = ""
         meme_msgs: list[str] = [
             str(content).replace("已发送表情包", "当前系统已自动发送表情包")
             for output in runtime.state["outputs"]
@@ -189,6 +193,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
         ]
         for msg in runtime.state["inputs"]:
             if msg.message_id == focus.strip():
+                target_message = msg.message.get_msgcode()
                 focus_output = (
                     f"- 时间：{msg.timestamp.astimezone(MODEL_VISIBLE_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"- 发送人：{escape(msg.user, quote=True)}>\n"
@@ -220,13 +225,40 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             ),
             "",
         )
+        top_messages = list(runtime.state.get("reply_top_messages", []) or [])
+        bottom_messages = list(runtime.state.get("reply_bottom_messages", []) or [])
+        visible_messages = [
+            *self.history_caches[runtime.context["session_id"]],
+            *runtime.state["currents"],
+        ]
+        reply_bottom_message_factories = cast(
+            "list[Callable[[dict[str, Any]], Awaitable[list[BaseMessage]]]]",
+            runtime.state.get("reply_bottom_message_factories", []) or [],
+        )
+        if reply_bottom_message_factories:
+            factory_payload = {
+                "session_id": runtime.context["session_id"],
+                "messages": visible_messages,
+                "target_message": target_message,
+                "reply_reason": reference_info,
+                "reasoning_content": reasoning_content,
+                "language_style": language_style,
+                "focus_message": focus_output,
+            }
+            for factory in reply_bottom_message_factories:
+                try:
+                    extra_messages = await factory(factory_payload)
+                except Exception:
+                    logger.exception("Failed to build reply bottom messages")
+                    continue
+                bottom_messages.extend(extra_messages)
         full_text = ""
         async for reply in self.chat_app.astream(
             {
                 "messages": runtime.state["currents"],
                 "history": self.history_caches[runtime.context["session_id"]],
-                "top_messages": runtime.state.get("reply_top_messages", []) or [],
-                "bottom_messages": runtime.state.get("reply_bottom_messages", []) or [],
+                "top_messages": top_messages,
+                "bottom_messages": bottom_messages,
                 "focus_message": focus_output,
                 "reference_info": reference_info,
                 "language_style": language_style,
@@ -491,11 +523,39 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             | RunnableGenerator(to_reply)
         )
 
+    @staticmethod
+    def _stamp_history_messages(
+        messages: Sequence[BaseMessage],
+        *,
+        timestamp: datetime | None = None,
+    ) -> list[BaseMessage]:
+        history_timestamp = (timestamp or datetime.now(tz=MODEL_VISIBLE_TZ)).isoformat()
+        stamped_messages: list[BaseMessage] = []
+        for message in messages:
+            if isinstance(message, AIMessage):
+                stamped_messages.append(
+                    message.model_copy(
+                        update={
+                            "additional_kwargs": {
+                                **message.additional_kwargs,
+                                "history_timestamp": (
+                                    message.additional_kwargs.get("history_timestamp")
+                                    or history_timestamp
+                                ),
+                            }
+                        }
+                    )
+                )
+                continue
+            stamped_messages.append(message)
+        return stamped_messages
+
     async def _aexit_history(self, run: Run, config: RunnableConfig) -> None:
         new_messages: list[BaseMessage] = []
         input_essages = run.inputs.get("messages", [])
         output_val = load(run.outputs, allowed_objects="messages")
         output_messages = self._get_output_messages(output_val)
+        output_messages = self._stamp_history_messages(output_messages)
 
         new_messages = input_essages + output_messages
         configurable = config.get("configurable", {})

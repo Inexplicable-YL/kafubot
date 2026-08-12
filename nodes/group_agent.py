@@ -24,7 +24,6 @@ from agent.multimodal.image import (
     get_analyzer,
     read_image,
 )
-from agent.multimodal.meme import add_memes
 
 MESSAGES_LIMIT = 30
 BACKUP_MESSAGES_LIMIT = 20
@@ -106,7 +105,7 @@ class GroupAgentState(BaseModel):
 
     agent: Any | None = None
     image_analyzer: Runnable[dict[str, Any], str] = Field(
-        default_factory=lambda _: get_analyzer(True, add_memes_hook=add_memes)
+        default_factory=lambda _: get_analyzer(True)
     )
     storages: dict[str, Histories] = Field(default_factory=dict)
     storages_lock: anyio.Lock = Field(default_factory=anyio.Lock)
@@ -348,7 +347,7 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             return None
         timestamp = datetime.fromtimestamp(self.event.time, tz=UTC)
         user = self.event.sender.nickname or DEFAULT_USERNAME
-        msg_data = {
+        msg_data: dict[str, Any] = {
             "role": "user",
             "timestamp": timestamp,
             "user": user,
@@ -377,7 +376,7 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
                 msg_with_image += seg
 
         msg = (
-            UserMessage(**(msg_data | {"message": msg_with_image, "images": images}))
+            UserMessage(**(msg_data | {"message": msg_with_image, "images": images}))  # type: ignore
             if images
             else UserMessage(**msg_data)
         )

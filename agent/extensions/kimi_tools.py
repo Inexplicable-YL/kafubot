@@ -3,6 +3,7 @@
 
 import json
 import os
+from typing import Any
 
 import httpx
 from langchain.tools import BaseTool, tool
@@ -65,7 +66,7 @@ async def get_langchain_tool(formula_uri: str) -> type[BaseTool]:
     if not tools:
         raise ValueError(f"No tools found for formula {formula_uri}")
 
-    async def _run_tool(**kwargs):
+    async def _run_tool(**kwargs: Any):
         return await client.call_tool(
             formula_uri, function=tools[0]["function"]["name"], args=kwargs
         )

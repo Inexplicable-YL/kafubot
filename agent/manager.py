@@ -208,7 +208,7 @@ async def create_agent_service():
                 TimeGateMiddleware(**gate_config),
                 MemeSendingMiddleware(man_send_per_turn=1),
                 jargon_middleware,
-                memory_middleware,
+                # memory_middleware,
                 summary_middleware,
                 generate_prompt,
                 add_time,

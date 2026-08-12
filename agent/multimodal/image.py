@@ -35,7 +35,7 @@ USER_AGENT = "Mozilla/5.0"
 IMAGE_DB_URL = os.getenv(
     "IMAGE_DB_URL", "sqlite+aiosqlite:///./.database/image_cache.db"
 )
-MAX_RECORDS = 100
+MAX_RECORDS = 1024
 PHASH_DISTANCE = 5
 
 IMAGE_SYSTEM_PROMPT = """

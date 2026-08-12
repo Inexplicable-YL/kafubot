@@ -23,7 +23,6 @@ from agent.multimodal.image import (
     get_analyzer,
     read_image,
 )
-from agent.multimodal.meme import add_memes
 
 LIMITER_DB = "sqlite+aiosqlite:///./.database/private_limiter.db"
 DEFAULT_CLEAR_KEYWORDS = {"/clear", "/清除"}
@@ -201,7 +200,7 @@ class PrivateAgentState(BaseModel):
 
     agent: Any | None = None
     image_analyzer: Runnable[dict[str, Any], str] = Field(
-        default_factory=lambda _: get_analyzer(True, add_memes_hook=add_memes)
+        default_factory=lambda _: get_analyzer(True)
     )
     sessions: dict[str, SessionQueueState] = Field(default_factory=dict)
     sessions_lock: anyio.Lock = Field(default_factory=anyio.Lock)
@@ -365,7 +364,7 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
         if not message:
             return None
 
-        msg_data = {
+        msg_data: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(self.event.time, tz=UTC),
             "user": self.event.sender.nickname or "",
             "user_id": str(self.event.user_id),
@@ -386,7 +385,7 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
             else:
                 msg_with_image += seg
         msg = (
-            UserMessage(**(msg_data | {"message": msg_with_image, "images": images}))
+            UserMessage(**(msg_data | {"message": msg_with_image, "images": images}))  # type: ignore
             if images
             else UserMessage(**msg_data)
         )

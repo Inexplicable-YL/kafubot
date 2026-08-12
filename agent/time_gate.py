@@ -198,7 +198,7 @@ class _TimeGate(BaseModel):
             )
         self.last_timestamp = timestamp
 
-        self.pressure += 0.8 * (0.8**self.ignore_count + relevance)
+        self.pressure += (0.5 * 0.8**self.ignore_count + 0.5) + relevance
 
         if self.state is _State.IDLE:
             probs = self._idle_probs(self.pressure, relevance)
