@@ -144,9 +144,12 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         try:
             history_storage.messages.append(message)
             history_storage.backup_messages.append(message)
-            if group_event.message.images:
+            if group_event.message.images and not is_tome:
                 return None
-            if not group_event.message.message.get_plain_text().strip():
+            if (
+                not group_event.message.message.get_plain_text().strip()
+                and not (group_event.message.images and is_tome)
+            ):
                 return None
             if self.event.group_id not in self.config.auto_reply_groups and not is_tome:
                 return None
@@ -258,7 +261,7 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             ),
             context=ManagerContext(
                 session_id=group_event.session_id,
-                is_tome=group_event.message.is_tome,
+                is_tome=any(message.is_tome for message in current_messages),
                 node=self,
                 unrestricted=(self.event.group_id in self.config.unrestricted_groups),
             ),
@@ -292,19 +295,17 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         await self.reply("[SYSTEM]已清除历史", at_sender=True)
 
     async def get_message_or_clear_chat(
-        self, session_id: str, history_storage: Histories, to_me: bool
+        self, session_id: str, history_storage: Histories
     ) -> QQMessage | None:
-        if (text := self.event.message.get_plain_text()) and any(
-            keyw in text for keyw in self.config.clear_keywords
-        ):
+        if (
+            text := self.event.message.get_plain_text().strip()
+        ) and text in self.config.clear_keywords:
             await self.delete_chat(session_id=session_id)
             return None
         message = await QQMessage.from_cqhttp_message(
             self.event.message, history_storage.backup_messages, self.get_image
         )
 
-        if to_me:
-            message = QQMessageSegment.at("可不") + message
         if self.event.reply and (reply_time := int(self.event.reply.time)):
             time_text = (
                 datetime.fromtimestamp(reply_time, tz=UTC)
@@ -341,7 +342,7 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
         history_storage = await self.get_history_storage(session_id)
         is_tome = self.event.is_tome()
         message = await self.get_message_or_clear_chat(
-            session_id, history_storage, is_tome
+            session_id, history_storage
         )
         if not message:
             return None
@@ -355,6 +356,7 @@ class GroupAgent(Node[GroupMessageEvent, GroupAgentState, GroupAgentConfig]):
             "user_id": str(self.event.user_id),
             "message_id": str(self.event.message_id),
             "is_tome": is_tome,
+            "chat_type": "group",
         }
         images: list[tuple[ImageReadResult, bool]] = []
         msg_with_image = QQMessage()

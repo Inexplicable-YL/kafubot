@@ -61,7 +61,6 @@ dependencies = [
     "tenacity>=9.1.4",
     "networkx>=3.6.1",
     "pyarrow>=24.0.0",
-    "nest-asyncio>=1.6.0",
     "fastapi>=0.137.1",
     "python-multipart>=0.0.32",
 ]
@@ -75,6 +74,7 @@ dev-dependencies = [
     "tomli>=2",
     # lint
     "ruff>=0.6",
+    "pyright>=1.1.411",
     "mypy>=1",
     "pylint>=3",
     "pylint-pydantic>=0.3",
@@ -145,6 +145,8 @@ keep-runtime-typing = true
 
 [tool.pyright]
 exclude = ["**/.conda", "**/.venv", "**/__pycache__", "**/node_modules", "**/.*"]
+venvPath = "."
+venv = ".venv"
 pythonVersion = "3.11"
 pythonPlatform = "All"
 typeCheckingMode = "strict"

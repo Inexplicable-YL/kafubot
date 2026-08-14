@@ -3,10 +3,10 @@
 
 import json
 import re
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from typing_extensions import override
 
@@ -64,6 +64,7 @@ from .manager import (
     build_profile_tag_distribution,
     load_tag_cluster_lookup,
     logger,
+    mark_behavior_pattern_selected,
     upsert_behavior_graph_refs,
 )
 from .prompt import BEHAVIOR_FEEDBACK_PROMPT, BEHAVIOR_LEARN_PROMPT
@@ -76,7 +77,9 @@ from .utils import (
     strip_json_code_fence,
 )
 
-_USER_TAG_PATTERN = re.compile(r"(?is)^<user-message\b[^>]*>(.*?)</user-message>$")
+_USER_TAG_PATTERN = re.compile(
+    r"(?is)^<(?:qq-)?user-message\b[^>]*>(.*?)</(?:qq-)?user-message>$"
+)
 _BOT_TAG_PATTERN = re.compile(r"(?is)^<bot-message\b[^>]*>(.*?)</bot-message>$")
 BEHAVIOR_SCENE_TEMPERATURE = 0.2
 BEHAVIOR_LEARN_TEMPERATURE = 0.25
@@ -164,6 +167,15 @@ class BehaviorFeedbackContext:
 class PendingBehaviorAnalysisBatch:
     session_id: str
     messages: list[BaseMessage]
+    selected_references: list[BehaviorReferenceCandidate] = field(
+        default_factory=list
+    )
+
+
+@dataclass(frozen=True)
+class PreparedBehaviorSelection:
+    selection: BehaviorPatternRetrievalResult
+    prepared_at: datetime
 
 
 @dataclass(frozen=True)
@@ -838,6 +850,9 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         min_messages_for_extraction: int = 10,
         max_concurrent_learners: int = DEFAULT_MAX_CONCURRENT_LEARNERS,
         max_feedback_attempts: int = DEFAULT_MAX_FEEDBACK_ATTEMPTS,
+        enable_realtime_scene_analysis: bool = True,
+        selection_refresh_seconds: float = 10.0,
+        selection_max_stale_seconds: float = 45.0,
         behavior_group_resolver: Callable[[str], set[str] | tuple[set[str], bool]]
         | None = None,
     ) -> None:
@@ -845,6 +860,8 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             max_sessions=max_sessions,
             max_retries=max_retries,
             max_batch_window_size=max_batches,
+            coalesce_seconds=0.8,
+            max_concurrent_sessions=max_concurrent_learners,
             logger_config={
                 "worker_name": "BehaviorLearner",
                 "job_name": "behavior learning",
@@ -857,6 +874,11 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         self.feedback_model = feedback_model or analyze_model
         self.min_messages_for_extraction = min_messages_for_extraction
         self.max_feedback_attempts = max_feedback_attempts
+        self.enable_realtime_scene_analysis = enable_realtime_scene_analysis
+        self.selection_refresh_seconds = max(1.0, selection_refresh_seconds)
+        self.selection_max_stale_seconds = max(
+            self.selection_refresh_seconds, selection_max_stale_seconds
+        )
         self._db = BehaviorDatabase(engine=engine, db_url=db_url)
         self._maintenance = BehaviorPatternMaintenanceService(self._db)
         self._selector = BehaviorPatternSelector(
@@ -868,6 +890,8 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         self._turn_selection_cache: dict[
             str, BehaviorPatternRetrievalResult | None
         ] = {}
+        self._prepared_selection_cache: dict[str, PreparedBehaviorSelection] = {}
+        self._learning_backlog: dict[str, deque[BehaviorMessageRecord]] = {}
         self._pending_feedback: dict[str, list[PendingBehaviorFeedbackState]] = {}
 
     @override
@@ -877,7 +901,17 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         runtime: Runtime[ManagerContext],
     ) -> dict[str, Any] | None:
         del state
-        self._turn_selection_cache.pop(runtime.context["session_id"], None)
+        session_id = runtime.context["session_id"]
+        prepared = self._prepared_selection_cache.get(session_id)
+        if (
+            prepared is not None
+            and (datetime.now(UTC) - prepared.prepared_at).total_seconds()
+            > self.selection_max_stale_seconds
+        ):
+            prepared = None
+        self._turn_selection_cache[session_id] = (
+            prepared.selection if prepared is not None else BehaviorPatternRetrievalResult()
+        )
         return None
 
     @override
@@ -886,15 +920,36 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         state: ManagerState,
         runtime: Runtime[ManagerContext],
     ) -> dict[str, Any] | None:
-        if messages := cast(
-            "list[BaseMessage] | None", state.get("summary_pruned_messages")
-        ):
-            session_id = runtime.context["session_id"]
+        session_id = runtime.context["session_id"]
+        selection = self._turn_selection_cache.get(session_id)
+        replied = any(output["type"] == "reply" for output in state["outputs"])
+        if replied and selection and selection.references:
+            for output in state["outputs"]:
+                if output["type"] == "reply":
+                    output["data"]["selected_behavior_ids"] = [
+                        item.behavior_id for item in selection.references
+                    ]
+            self._enqueue_pending_feedback(
+                session_id, selection.references, selection.reference_text
+            )
+        messages = (
+            list(state.get("currents") or [])
+            if replied
+            else cast(
+                "list[BaseMessage] | None", state.get("summary_pruned_messages")
+            )
+        )
+        if messages:
             await self._enqueue_batch(
                 session_id,
                 PendingBehaviorAnalysisBatch(
                     session_id=session_id,
                     messages=list(messages),
+                    selected_references=(
+                        list(selection.references)
+                        if replied and selection is not None
+                        else []
+                    ),
                 ),
             )
         self._turn_selection_cache.pop(runtime.context["session_id"], None)
@@ -911,26 +966,10 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         session_id = request.runtime.context["session_id"]
         selection = self._turn_selection_cache.get(session_id)
         if selection is None:
-            visible_messages = self._extract_visible_behavior_messages(request.messages)
-            context_text = self._build_behavior_selector_context_text(visible_messages)
-            if context_text:
-                selection = await self._selector.retrieve_for_planner(
-                    session_id=session_id,
-                    scenario_agent_runner=lambda system_prompt: self._run_selection_scene_prompt(
-                        visible_messages,
-                        system_prompt,
-                    ),
-                    context_text=context_text,
-                    include_context_in_prompt=False,
-                )
-                if selection.references:
-                    self._enqueue_pending_feedback(
-                        session_id,
-                        selection.references,
-                        selection.reference_text,
-                    )
-            else:
-                selection = BehaviorPatternRetrievalResult()
+            # Never start scene analysis from a model wrapper: one agent turn
+            # may enter this hook multiple times.  Only consume a prepared
+            # result; the post-turn batch prepares the next one.
+            selection = BehaviorPatternRetrievalResult()
             self._turn_selection_cache[session_id] = selection
 
         if selection and selection.reference_text:
@@ -946,7 +985,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         return await handler(request)
 
     @override
-    async def process_batches(
+    async def process_batches(  # noqa: PLR0915
         self,
         session_id: str,
         batches: tuple[PendingBehaviorAnalysisBatch, ...],
@@ -955,25 +994,83 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         if not records:
             return len(batches)
 
+        learning_backlog = self._learning_backlog.setdefault(
+            session_id,
+            deque(maxlen=max(40, self.min_messages_for_extraction * 4)),
+        )
+        learning_backlog.extend(records)
+        learning_records = list(learning_backlog)
+
         task_errors: list[Exception] = []
         written_behavior_ids: set[int] = set()
         evaluated_behavior_ids: set[int] = set()
 
+        async def prepare_next_selection() -> None:
+            try:
+                prepared = self._prepared_selection_cache.get(session_id)
+                if (
+                    prepared is not None
+                    and (datetime.now(UTC) - prepared.prepared_at).total_seconds()
+                    < self.selection_refresh_seconds
+                ):
+                    return
+                context_text = self._build_behavior_selector_context_text(records)
+                if not context_text:
+                    return
+                if self.enable_realtime_scene_analysis:
+                    selection = await self._selector.retrieve_for_planner(
+                        session_id=session_id,
+                        scenario_agent_runner=lambda system_prompt: self._run_selection_scene_prompt(
+                            records,
+                            system_prompt,
+                        ),
+                        context_text=context_text,
+                        include_context_in_prompt=False,
+                    )
+                else:
+                    selection = await self._selector.retrieve_fast_for_planner(
+                        session_id=session_id,
+                        context_text=context_text,
+                    )
+                self._prepared_selection_cache[session_id] = PreparedBehaviorSelection(
+                    selection=selection,
+                    prepared_at=datetime.now(UTC),
+                )
+            except Exception as exc:
+                task_errors.append(exc)
+
+        selected_references = {
+            reference.behavior_id: reference
+            for batch in batches
+            for reference in batch.selected_references
+        }
+
+        async def mark_selected_references() -> None:
+            try:
+                for reference in selected_references.values():
+                    await mark_behavior_pattern_selected(
+                        self._db, reference.behavior_id
+                    )
+            except Exception as exc:
+                task_errors.append(exc)
+
         async def run_learning() -> None:
             try:
                 await self._learn_from_session_messages(
-                    records,
+                    learning_records,
                     learning_session_id=session_id,
                 )
             except Exception as exc:
                 task_errors.append(exc)
 
-        run_learning_task = len(records) >= self.min_messages_for_extraction
+        run_learning_task = (
+            len(learning_records) >= self.min_messages_for_extraction
+        )
         if not run_learning_task:
             logger.debug(
                 "%s 行为学习消息不足: 可学习=%s 阈值=%s",
                 session_id,
-                len(records),
+                len(learning_records),
                 self.min_messages_for_extraction,
             )
 
@@ -1001,13 +1098,33 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
                 task_errors.append(exc)
 
         if not run_learning_task and not run_feedback_task:
-            return len(batches)
+            # Selection preparation is itself useful work for the next turn.
+            pass
 
         async with anyio.create_task_group() as task_group:
+            if not run_learning_task:
+                task_group.start_soon(prepare_next_selection)
+            if selected_references:
+                task_group.start_soon(mark_selected_references)
             if run_learning_task:
                 task_group.start_soon(run_learning)
             if run_feedback_task:
                 task_group.start_soon(run_feedback)
+
+        if run_learning_task:
+            # The learner has already spent model tokens understanding this
+            # batch.  Avoid a second semantic scene call; rank the freshly
+            # updated patterns locally for the next turn.
+            context_text = self._build_behavior_selector_context_text(records)
+            selection = await self._selector.retrieve_fast_for_planner(
+                session_id=session_id,
+                context_text=context_text,
+            )
+            self._prepared_selection_cache[session_id] = PreparedBehaviorSelection(
+                selection=selection,
+                prepared_at=datetime.now(UTC),
+            )
+            learning_backlog.clear()
 
         if run_feedback_task:
             self._reconcile_pending_feedback(
@@ -1023,8 +1140,57 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
     @override
     async def on_close(self) -> None:
         self._turn_selection_cache.clear()
+        self._prepared_selection_cache.clear()
+        self._learning_backlog.clear()
         self._pending_feedback.clear()
         await self._db.dispose()
+
+    async def clear_session(self, session_id: str) -> None:
+        self._turn_selection_cache.pop(session_id, None)
+        self._prepared_selection_cache.pop(session_id, None)
+        self._learning_backlog.pop(session_id, None)
+        self._pending_feedback.pop(session_id, None)
+
+    async def apply_observable_effect(
+        self,
+        *,
+        behavior_ids: Sequence[int],
+        session_id: str,
+        metrics: dict[str, Any],
+        confidence: float,
+        source_ids: Sequence[str],
+    ) -> None:
+        """Apply bounded QQ-window feedback only to behavior actually used."""
+        if not behavior_ids or confidence < 0.3:
+            return
+        reward = float(metrics.get("observable_reward", 0.0))
+        score_delta = max(-0.75, min(0.75, reward * confidence * 0.35))
+        if reward >= 0.75:
+            status = FEEDBACK_STATUS_SUCCESS
+        elif reward <= -0.75:
+            status = FEEDBACK_STATUS_FAILED
+        elif reward > 0:
+            status = FEEDBACK_STATUS_PARTIAL_SUCCESS
+        else:
+            status = FEEDBACK_STATUS_NEUTRAL
+        reason = (
+            "QQ后续窗口可观测反馈；非因果归因。"
+            f"target_continued={metrics.get('target_continued')}, "
+            f"corrections={metrics.get('correction_count')}, "
+            f"negative={metrics.get('negative_signal_count')}, "
+            f"confidence={confidence:.2f}"
+        )
+        for behavior_id in behavior_ids:
+            await apply_behavior_feedback(
+                self._db,
+                pattern_id=behavior_id,
+                score_delta=score_delta,
+                status=status,
+                reason=reason,
+                outcome=str(metrics),
+                session_id=session_id,
+                source_ids=source_ids,
+            )
 
     def _extract_visible_behavior_messages(
         self,
@@ -1104,7 +1270,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
                 content=(
                     f"{system_prompt}\n\n"
                     "注意：聊天记录会在后续多条 user message 中给出。每条消息内的 source_id "
-                    "是本轮场景概括的来源编号；speaker=SELF 表示这条真实聊天消息由麦麦发出。"
+                    f"是本轮场景概括的来源编号；speaker=SELF 表示这条真实聊天消息由{BOT_NAME}发出。"
                 )
             )
         ]
@@ -1253,7 +1419,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         queue.append(
             PendingBehaviorFeedbackState(
                 references=new_references,
-                created_at=datetime.now(),
+                created_at=datetime.now(UTC),
                 reference_text=reference_text,
             )
         )

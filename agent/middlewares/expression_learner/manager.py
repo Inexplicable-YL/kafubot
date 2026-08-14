@@ -12,11 +12,13 @@ from enum import Enum
 from typing import Any
 
 import anyio
+import jieba
 from json_repair import repair_json
 from langchain_core.language_models.chat_models import BaseChatModel
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
@@ -41,9 +43,7 @@ from .constants import (
     EXPRESSION_REVIEW_LOG_PATH,
     EXPRESSION_SELECTOR_SOURCE,
     MANUAL_RESCUE_EVENT,
-    MAX_HIGH_COUNT_SAMPLE_SIZE,
     MAX_PRECISE_SELECTED_EXPRESSIONS,
-    MAX_RANDOM_SAMPLE_SIZE,
     MAX_VISIBLE_CONTEXT_MESSAGES,
     MIN_CANDIDATE_POOL_SIZE,
 )
@@ -54,7 +54,6 @@ from .utils import (
     load_json_list,
     normalize_expression_runtime_config,
     normalize_expression_scope,
-    weighted_sample,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,6 +125,7 @@ class ExpressionRecord(_ExpressionBase):
         Integer,
         primary_key=True,
         autoincrement=True,
+        nullable=False,
     )
     situation: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     style: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
@@ -158,6 +158,16 @@ class ExpressionRecord(_ExpressionBase):
         nullable=True,
         default=None,
     )
+
+
+class ExpressionEffectRecord(_ExpressionBase):
+    __tablename__ = "expression_effects"
+
+    expression_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    observations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reward_sum: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    last_confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class ExpressionDatabase:
@@ -443,6 +453,7 @@ class ExpressionSelector:
     async def _load_expression_candidates(
         self,
         session_id: str,
+        context_text: str,
     ) -> list[dict[str, Any]]:
         related_session_ids, has_global_share = self._resolve_expression_group_scope(
             session_id
@@ -462,6 +473,21 @@ class ExpressionSelector:
                     ExpressionRecord.modified_by == ModifiedBy.USER,
                 )
             expressions = list((await session.scalars(statement)).all())
+            expression_ids = [
+                expression.id
+                for expression in expressions
+                if expression.id is not None
+            ]
+            effect_rows = {
+                row.expression_id: row
+                for row in (
+                    await session.scalars(
+                        select(ExpressionEffectRecord).where(
+                            ExpressionEffectRecord.expression_id.in_(expression_ids)
+                        )
+                    )
+                ).all()
+            }
 
         all_candidates = [
             {
@@ -469,38 +495,46 @@ class ExpressionSelector:
                 "situation": expression.situation,
                 "style": expression.style,
                 "count": expression.count if expression.count is not None else 1,
+                "effect_score": (
+                    effect_rows[expression.id].reward_sum
+                    / max(1, effect_rows[expression.id].observations)
+                    if expression.id in effect_rows
+                    else 0.0
+                ),
+                "context_score": 0.0,
             }
             for expression in expressions
             if expression.id is not None and expression.situation and expression.style
         ]
-        if len(all_candidates) < MIN_CANDIDATE_POOL_SIZE:
+        if not all_candidates:
             return []
-
-        high_count_candidates = [
-            item for item in all_candidates if int(item.get("count", 1)) > 1
-        ]
-        selected_high = (
-            weighted_sample(
-                high_count_candidates,
-                min(len(high_count_candidates), MAX_HIGH_COUNT_SAMPLE_SIZE),
+        context_tokens = {
+            token.casefold().strip()
+            for token in jieba.lcut(clean_text(context_text))
+            if len(token.strip()) >= 2
+        }
+        for candidate in all_candidates:
+            candidate_tokens = {
+                token.casefold().strip()
+                for token in jieba.lcut(
+                    f"{candidate['situation']} {candidate['style']}"
+                )
+                if len(token.strip()) >= 2
+            }
+            union = context_tokens | candidate_tokens
+            candidate["context_score"] = (
+                len(context_tokens & candidate_tokens) / len(union) if union else 0.0
             )
-            if len(high_count_candidates) >= MIN_CANDIDATE_POOL_SIZE
-            else []
+        all_candidates.sort(
+            key=lambda item: (
+                float(item.get("context_score", 0.0)),
+                float(item.get("effect_score", 0.0)),
+                int(item.get("count", 1)),
+                -int(item.get("id", 0)),
+            ),
+            reverse=True,
         )
-        selected_random = weighted_sample(
-            all_candidates,
-            min(len(all_candidates), MAX_RANDOM_SAMPLE_SIZE),
-        )
-
-        candidate_pool: list[dict[str, Any]] = []
-        seen_ids: set[int] = set()
-        for candidate in [*selected_high, *selected_random]:
-            candidate_id = candidate.get("id")
-            if not isinstance(candidate_id, int) or candidate_id in seen_ids:
-                continue
-            seen_ids.add(candidate_id)
-            candidate_pool.append(candidate)
-        return candidate_pool
+        return all_candidates[: max(MIN_CANDIDATE_POOL_SIZE, 12)]
 
     @staticmethod
     def _format_candidate_preview(candidates: list[dict[str, Any]]) -> str:
@@ -614,13 +648,12 @@ class ExpressionSelector:
     ) -> ExpressionSelectionResult:
         selected_ids = [
             candidate["id"]
-            for candidate in candidates
+            for candidate in candidates[:MAX_PRECISE_SELECTED_EXPRESSIONS]
             if isinstance(candidate.get("id"), int)
         ]
         selected_expressions = [
             candidate for candidate in candidates if candidate.get("id") in selected_ids
         ]
-        await self._update_last_active_time(selected_ids)
         logger.debug(
             "表达方式直接注入：session_id=%s 已选数=%s selected_ids=%r 已选预览=%s",
             session_id,
@@ -650,7 +683,6 @@ class ExpressionSelector:
             for expression_id in selected_ids
             if expression_id in candidate_map
         ]
-        await self._update_last_active_time(selected_ids)
         return ExpressionSelectionResult(
             expression_habits=self.build_expression_habits_block(selected_expressions),
             selected_expression_ids=selected_ids,
@@ -740,7 +772,10 @@ class ExpressionSelector:
             )
             return ExpressionSelectionResult()
 
-        candidates = await self._load_expression_candidates(session_id)
+        context_text = "\n".join(
+            message.content for message in chat_history[-MAX_VISIBLE_CONTEXT_MESSAGES:]
+        )
+        candidates = await self._load_expression_candidates(session_id, context_text)
         if not candidates:
             logger.info("表达方式选择已跳过：本地候选不足，session_id=%s", session_id)
             return ExpressionSelectionResult()
@@ -756,6 +791,7 @@ class ExpressionSelector:
 
 __all__ = [
     "ExpressionDatabase",
+    "ExpressionEffectRecord",
     "ExpressionEntry",
     "ExpressionMessageRecord",
     "ExpressionRecord",

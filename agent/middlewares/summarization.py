@@ -49,53 +49,41 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_SUMMARY_PROMPT = """<role>
-Context Extraction Assistant
+你是多人互联网聊天的结构化上下文压缩器。旧消息将离开实时窗口，你需要生成可追溯、说话者归属明确的完整替代摘要。
 </role>
 
-<primary_objective>
-Your sole objective in this task is to extract the highest quality/most relevant context from the pruned conversation history below.
-</primary_objective>
+<required-format>
+严格使用以下小节；无内容写“无”：
 
-<objective_information>
-The pruned conversation history below has already been removed from the live context window.
-The context you extract in this step will overwrite the existing session summary and be injected back into future model calls.
-Because of this, ensure the context you extract is only the most important information needed to continue the conversation effectively.
-</objective_information>
+## 活动话题与线程
+分别记录并行话题、参与者、最新进展、热度变化，不要把不同话题合并。
 
-<instructions>
-The pruned conversation history below will be replaced with the context you extract in this step.
-You want to ensure that future replies do not lose important progress or repeat work, so the context you extract should focus only on the most important information.
+## 未完成互动
+记录尚未回答的问题、承诺、等待中的回应，并写出相关 message_id。
 
-You should structure your summary using the following sections. Each section acts as a checklist. You must populate it with relevant information or explicitly state "None" if there is nothing to report for that section:
+## 说话者归属的信息
+使用“用户A说/认为/玩笑称……”而不是把个人说法压成客观事实；保留冲突观点和来源。
 
-## SESSION INTENT
-What is the user's primary ongoing goal, request, or discussion thread? This should be concise but complete enough to understand the purpose of the session.
+## 关系、情绪与边界
+只记录有消息证据的可观察变化，如互相调侃、安慰、冲突或修复；不要诊断人格和心理。
 
-## SUMMARY
-Extract and record the most important durable context from the pruned messages. Include important choices, conclusions, strategies, constraints, and facts worth preserving. Keep only information that improves future replies.
+## 群内梗、称呼与表达
+保留正在形成或反复出现的梗、别称、黑话、使用者、语境、含义假设和来源。短暂玩笑在群聊里可能是重要状态，不得仅因短暂而删除。
 
-## ARTIFACTS
-What files, resources, tool results, external facts, or references were created, modified, accessed, or learned in these messages? If none, say "None."
+## 机器人行动与群体影响
+记录机器人说过什么、回应了哪个话题、群友如何反应，以及是否可能打断、误解或修复。
+</required-format>
 
-## NEXT STEPS
-What unresolved questions, pending tasks, likely follow-ups, or commitments should the agent remember?
+<rules>
+- 合并现有摘要与新消息，输出能完全替代旧摘要的新版本。
+- 事实、推断、玩笑必须区分；低置信度写明“可能”。
+- 不得把私聊内容推断到群聊，也不得丢失姓名/用户与 message_id 的来源关系。
+- 删除无社会意义的重复、工具噪声和格式噪声，但保留会影响关系、指代、群梗和后续接话的内容。
+- 仅输出摘要，不添加说明。
+</rules>
 
-</instructions>
-
-Carefully read both the current session summary and the newly pruned messages, then produce a new session summary that fully replaces the previous one.
-Do not keep filler, repeated wording, transient jokes, raw tool noise, or formatting noise.
-Do not invent facts that are not supported by the messages.
-Respond ONLY with the extracted context. Do not include any additional information, or text before or after the extracted context.
-
-<existing_summary>
-Current session summary:
-{current_summary}
-</existing_summary>
-
-<messages>
-Messages to summarize:
-{messages}
-</messages>"""  # noqa: E501
+<existing_summary>{current_summary}</existing_summary>
+<messages>{messages}</messages>"""
 
 
 SESSION_SUMMARY_INJECTION_PROMPT = """
@@ -506,6 +494,13 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         self._session_summaries[session_id] = summary
         self._loaded_sessions[session_id] = True
         return True
+
+    async def clear_session(self, session_id: str) -> None:
+        """Delete both cached and persisted summary state for one QQ session."""
+        self._session_summaries.pop(session_id, None)
+        self._loaded_sessions.pop(session_id, None)
+        if self._store is not None:
+            await self._store.adelete(self.namespace, session_id)
 
     @override
     async def on_close(self) -> None:

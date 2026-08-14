@@ -28,6 +28,7 @@ from math import exp, log
 from typing import Any, Literal, cast
 
 import anyio
+import jieba
 from json_repair import repair_json
 from sqlalchemy import (
     Boolean,
@@ -151,6 +152,7 @@ class BehaviorExperiencePath(_BehaviorBase):
         Integer,
         primary_key=True,
         autoincrement=True,
+        nullable=False,
     )
     session_id: Mapped[str | None] = mapped_column(
         String(255),
@@ -221,6 +223,7 @@ class BehaviorSceneCluster(_BehaviorBase):
         Integer,
         primary_key=True,
         autoincrement=True,
+        nullable=False,
     )
     session_id: Mapped[str | None] = mapped_column(
         String(255),
@@ -252,6 +255,7 @@ class BehaviorSceneTagCluster(_BehaviorBase):
         Integer,
         primary_key=True,
         autoincrement=True,
+        nullable=False,
     )
     tag_kind: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     tag: Mapped[str] = mapped_column(Text, nullable=False)
@@ -277,6 +281,7 @@ class BehaviorAction(_BehaviorBase):
         Integer,
         primary_key=True,
         autoincrement=True,
+        nullable=False,
     )
     session_id: Mapped[str | None] = mapped_column(
         String(255),
@@ -314,6 +319,7 @@ class BehaviorOutcome(_BehaviorBase):
         Integer,
         primary_key=True,
         autoincrement=True,
+        nullable=False,
     )
     session_id: Mapped[str | None] = mapped_column(
         String(255),
@@ -2304,6 +2310,19 @@ class BehaviorPatternSelector:
         related_session_ids.update(str(item) for item in raw_ids if str(item).strip())
         return related_session_ids, bool(has_global_share)
 
+    async def has_candidates(self, session_id: str) -> bool:
+        """Cheap demand gate used before spending a scene-analysis model call."""
+
+        related_session_ids, has_global_share = self._resolve_behavior_group_scope(
+            session_id
+        )
+        patterns = await list_behavior_patterns_for_sessions(
+            self._db,
+            session_ids=related_session_ids,
+            include_global=has_global_share,
+        )
+        return bool(patterns)
+
     @staticmethod
     def _candidate_weight(candidate: dict[str, Any]) -> float:
         count = max(float(candidate.get("count") or 0.0), 0.0)
@@ -2448,15 +2467,18 @@ class BehaviorPatternSelector:
         session_id: str,
         *,
         scenario_profile: BehaviorScenarioProfile | None = None,
+        context_text: str = "",
+        run_maintenance: bool = True,
         max_count: int = MAX_SELECTOR_CANDIDATES,
     ) -> list[dict[str, Any]]:
         related_session_ids, has_global_share = self._resolve_behavior_group_scope(
             session_id
         )
-        await self._maintenance.maybe_maintain_session(
-            session_id=session_id,
-            related_session_ids=related_session_ids,
-        )
+        if run_maintenance:
+            await self._maintenance.maybe_maintain_session(
+                session_id=session_id,
+                related_session_ids=related_session_ids,
+            )
         patterns = await list_behavior_patterns_for_sessions(
             self._db,
             session_ids=related_session_ids,
@@ -2489,6 +2511,43 @@ class BehaviorPatternSelector:
             )
             if scene_cluster_ranked_candidates:
                 return scene_cluster_ranked_candidates
+        if scenario_profile is None and context_text.strip():
+            context_tokens = {
+                token.casefold().strip()
+                for token in jieba.lcut(context_text)
+                if len(token.strip()) >= 2
+            }
+            matched_candidates: list[dict[str, Any]] = []
+            for candidate in candidates:
+                candidate_tokens = {
+                    token.casefold().strip()
+                    for token in jieba.lcut(
+                        " ".join(
+                            str(candidate.get(field) or "")
+                            for field in ("action", "outcome", "scenario_summary")
+                        )
+                    )
+                    if len(token.strip()) >= 2
+                }
+                shared_count = len(context_tokens & candidate_tokens)
+                if shared_count <= 0:
+                    continue
+                ranked = dict(candidate)
+                ranked["behavior_retrieval_score"] = round(
+                    shared_count / max(1, len(context_tokens))
+                    * self._candidate_weight(candidate),
+                    4,
+                )
+                matched_candidates.append(ranked)
+            matched_candidates.sort(
+                key=lambda candidate: (
+                    float(candidate.get("behavior_retrieval_score") or 0.0),
+                    int(candidate.get("success_count") or 0),
+                    int(candidate.get("id") or 0),
+                ),
+                reverse=True,
+            )
+            return matched_candidates[:max_count]
         return []
 
     @staticmethod
@@ -2535,6 +2594,8 @@ class BehaviorPatternSelector:
     ) -> BehaviorPatternRetrievalResult:
         if not session_id:
             return BehaviorPatternRetrievalResult()
+        if not await self.has_candidates(session_id):
+            return BehaviorPatternRetrievalResult()
         scenario_profile = await behavior_scenario_analyzer.analyze(
             context_text=context_text,
             sub_agent_runner=scenario_agent_runner,
@@ -2552,16 +2613,7 @@ class BehaviorPatternSelector:
         selected_behaviors: list[dict[str, Any]] = []
         references: list[BehaviorReferenceCandidate] = []
         for candidate in candidates[: max(1, min(3, int(max_count)))]:
-            candidate_id = int(candidate.get("id") or 0)
-            marked_pattern = await mark_behavior_pattern_selected(
-                self._db,
-                candidate_id,
-            )
-            selected_behavior = (
-                await behavior_pattern_to_dict(self._db, marked_pattern)
-                if marked_pattern is not None
-                else candidate
-            )
+            selected_behavior = candidate
             if selected_behavior:
                 for score_key in (
                     "scene_cluster_score",
@@ -2603,6 +2655,47 @@ class BehaviorPatternSelector:
         return BehaviorPatternRetrievalResult(
             reference_text=reference_text,
             behaviors=selected_behaviors,
+            scenario_profile=scenario_profile,
+            references=references,
+        )
+
+    async def retrieve_fast_for_planner(
+        self,
+        *,
+        session_id: str,
+        context_text: str,
+        max_count: int = 3,
+    ) -> BehaviorPatternRetrievalResult:
+        """Recall high-overlap habits without another model call on the hot path."""
+
+        if not session_id or not context_text.strip():
+            return BehaviorPatternRetrievalResult()
+        scenario_profile = BehaviorScenarioProfile()
+        candidates = await self._load_behavior_candidates(
+            session_id,
+            context_text=context_text,
+            run_maintenance=False,
+            max_count=max(1, min(3, int(max_count))),
+        )
+        if not candidates:
+            return BehaviorPatternRetrievalResult(scenario_profile=scenario_profile)
+        references = [
+            BehaviorReferenceCandidate(
+                behavior_id=int(candidate["id"]),
+                action=str(candidate.get("action") or "").strip(),
+                outcome=str(candidate.get("outcome") or "").strip(),
+                actor_type=str(candidate.get("actor_type") or "").strip(),
+                learning_type=str(candidate.get("learning_type") or "").strip(),
+                session_id=str(candidate.get("session_id") or "").strip(),
+            )
+            for candidate in candidates
+            if isinstance(candidate.get("id"), int)
+        ]
+        return BehaviorPatternRetrievalResult(
+            reference_text=self._build_group_reference_text(
+                behaviors=candidates, scenario_profile=scenario_profile
+            ),
+            behaviors=candidates,
             scenario_profile=scenario_profile,
             references=references,
         )

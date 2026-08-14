@@ -139,8 +139,14 @@ class QQMessageSegment(MessageSegment["QQMessage"]):
                 if str(item.user_id) == qq_number:
                     at_name = item.user
                     break
-            if at_name:
-                return QQMessageSegment.at(name=at_name)
+            return QQMessageSegment.at(name=at_name or "", user_id=qq_number)
+        if segment.type == "reply" and (
+            reply_id := str(segment.data.get("id", "")).strip()
+        ):
+            return QQMessageSegment.reply(
+                message_id=reply_id,
+                include={"message_id"},
+            )
         if segment.type == "forward" and (id_ := str(segment.data.get("id", ""))):
             return QQMessageSegment(type="forward", data={"id": id_})
         return None
@@ -171,12 +177,28 @@ class QQMessageSegment(MessageSegment["QQMessage"]):
                 file = meme_result.base64
             if file:
                 return CQHTTPMessageSegment.image(file, sub_type=1)
-        elif self.type == "at" and (name := self.data.get("name", "")):
+        elif self.type == "at":
+            if user_id := str(self.data.get("user_id", "")).strip():
+                if not any(str(item.user_id) == user_id for item in messages):
+                    return None
+                try:
+                    return CQHTTPMessageSegment.at(int(user_id))
+                except ValueError:
+                    return None
+            name = self.data.get("name", "")
             for item in messages:
                 if item.user == name:
                     user_id = int(item.user_id)
                     return CQHTTPMessageSegment.at(user_id)
-        elif self.type == "reply" and (time := self.data.get("time", "")):
+        elif self.type == "reply":
+            if message_id := str(self.data.get("message_id", "")).strip():
+                if not any(str(item.message_id) == message_id for item in messages):
+                    return None
+                try:
+                    return CQHTTPMessageSegment.reply(int(message_id))
+                except ValueError:
+                    return None
+            time = self.data.get("time", "")
             for item in messages:
                 t = cast("datetime", item.timestamp).astimezone(
                     ZoneInfo("Asia/Shanghai")
@@ -223,9 +245,13 @@ class QQMessageSegment(MessageSegment["QQMessage"]):
         )
 
     @classmethod
-    def at(cls, name: str) -> Self:
+    def at(cls, name: str = "", user_id: str | None = None) -> Self:
         """@某人"""
-        return cls(type="at", data={"name": name})
+        return cls(
+            type="at",
+            data={"name": name, "user_id": user_id},
+            include={"name", "user_id"},
+        )
 
     @classmethod
     def reply(

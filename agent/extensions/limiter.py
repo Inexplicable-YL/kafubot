@@ -1,8 +1,8 @@
-import asyncio
 from datetime import UTC, datetime
 from typing import Any, NotRequired, TypedDict
 from typing_extensions import override
 
+import anyio
 from langchain.agents.middleware import (
     AgentMiddleware,
     hook_config,
@@ -92,7 +92,7 @@ class _ActivateLimiter:
         self._engine: AsyncEngine = create_async_engine(db_url, **kw)
         self._sessionmaker = async_sessionmaker(self._engine, expire_on_commit=False)
         self._ready = False
-        self._lock = asyncio.Lock()
+        self._lock = anyio.Lock()
 
     async def _ensure_schema(self) -> None:
         if self._ready:

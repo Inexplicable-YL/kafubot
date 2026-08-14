@@ -1,7 +1,9 @@
 import json
+import re
 from datetime import UTC, datetime
 from functools import cache
-from typing import Any
+from html import unescape
+from typing import Any, Literal
 from typing_extensions import override
 
 import imagehash
@@ -14,6 +16,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from agent.base import UserMessage
 from agent.message import QQMessage
 from agent.multimodal.image import ImageReadResult
+from agent.session import clear_runtime_session
 from agent.utils import LimitedSQLChatMessageHistory, content_to_text
 
 DB_URL = "sqlite+aiosqlite:///./.database/agent_history.db"
@@ -21,6 +24,20 @@ TABLE_NAME = "agent_history"
 
 MODEL_VISIBLE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 CHAT_HISTORY_MAX_MESSAGES = 100
+_QQ_METADATA_RE = re.compile(
+    r"<qq-user-message\s+metadata=(['\"])(.*?)\1>", re.DOTALL
+)
+
+
+def _extract_qq_metadata(content: str) -> dict[str, Any]:
+    match = _QQ_METADATA_RE.search(content)
+    if not match:
+        return {}
+    try:
+        payload = json.loads(unescape(match.group(2)))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 @cache
@@ -65,17 +82,32 @@ class MessageConverter(BaseMessageConverter):
         role = sql_message.role
         if role == "human":
             if sql_message.timestamp is not None and sql_message.message is not None:
+                metadata = _extract_qq_metadata(sql_message.content)
+                chat_type: Literal["group", "private"] = (
+                    "private"
+                    if metadata.get("chat_type") == "private"
+                    else (
+                        "group"
+                        if metadata.get("chat_type") == "group"
+                        or sql_message.session_id.startswith("group_")
+                        else "private"
+                    )
+                )
                 images: list[tuple[ImageReadResult, bool]] = []
                 if sql_message.images:
+                    # Backward compatibility for old rows. New rows deliberately do
+                    # not duplicate image base64; the image description is already
+                    # represented in `message`/`content`.
                     images = [
                         (
                             ImageReadResult(
                                 base64=item["base64"],
                                 phash=imagehash.hex_to_hash(item["phash"]),
                             ),
-                            item["flag"],
+                            bool(item["flag"]),
                         )
                         for item in json.loads(sql_message.images)
+                        if item.get("base64")
                     ]
                 user_msg = UserMessage(
                     timestamp=sql_message.timestamp,
@@ -85,6 +117,17 @@ class MessageConverter(BaseMessageConverter):
                     message_id=sql_message.message_id or "",
                     is_tome=sql_message.is_tome,
                     images=images,
+                    chat_type=chat_type,
+                    reply_to_id=(
+                        str(metadata["reply_to_id"])
+                        if metadata.get("reply_to_id")
+                        else None
+                    ),
+                    mention_user_ids=[
+                        str(item)
+                        for item in metadata.get("mention_user_ids", [])
+                        if item
+                    ],
                 )
                 return HumanMessage(
                     content=sql_message.content,
@@ -92,9 +135,15 @@ class MessageConverter(BaseMessageConverter):
                 )
             return HumanMessage(content=sql_message.content)
         if role == "ai":
+            timestamp = sql_message.created_at
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
             return AIMessage(
                 content=sql_message.content,
-                additional_kwargs={"created_at": sql_message.created_at},
+                additional_kwargs={
+                    "created_at": timestamp,
+                    "history_timestamp": timestamp.isoformat(),
+                },
             )
         raise ValueError(f"Unknown message role: {role}")
 
@@ -122,7 +171,6 @@ class MessageConverter(BaseMessageConverter):
                     json.dumps(
                         [
                             {
-                                "base64": img.base64,
                                 "phash": str(img.phash),
                                 "flag": flag,
                             }
@@ -163,3 +211,4 @@ def get_session_history(session_id: str) -> LimitedSQLChatMessageHistory:
 
 async def clear_session_history(session_id: str) -> None:
     await get_session_history(session_id).aclear()
+    await clear_runtime_session(session_id)

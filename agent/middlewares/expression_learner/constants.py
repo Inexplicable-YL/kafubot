@@ -12,7 +12,7 @@ MAX_VISIBLE_CONTEXT_MESSAGES = 10
 MAX_LEARNED_EXPRESSIONS_PER_BATCH = 20
 SIMILARITY_THRESHOLD = 0.75
 
-EXPRESSION_REVIEW_LOG_PATH = "logs/expression_review/review_logs.json"
+EXPRESSION_REVIEW_LOG_PATH = ".logs/expression_review/review_logs.json"
 AI_REVIEW_EVENT = "ai_review"
 MANUAL_RESCUE_EVENT = "manual_rescue"
 

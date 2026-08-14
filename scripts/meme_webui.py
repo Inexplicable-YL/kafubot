@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextlib
 import importlib
 import json
@@ -16,7 +15,7 @@ from typing import Any, Literal
 import imagehash
 from aiohttp import web
 from aiohttp.multipart import BodyPartReader
-from langchain_core.documents import Document
+from anyio.to_thread import run_sync
 
 from agent.multimodal.image import (
     get_analyzer,
@@ -1657,16 +1656,18 @@ def _save_record(id_: str, analysis: str, original_analysis: str | None) -> bool
 
         metadata = dict(record.metadata)
         metadata["manually_annotated"] = True
-
-        if analysis != record.analysis:
-            get_vectorstore().update_documents(
-                ids=[id_],
-                documents=[Document(page_content=analysis, metadata=metadata)],
-            )
-            return True
-
-        _collection().update(ids=[id_], metadatas=[metadata])
-        return False
+        vectorstore = get_vectorstore()
+        embedding_function = vectorstore.embeddings
+        if embedding_function is None:
+            raise RuntimeError("Meme vector store has no embedding function")
+        embedding = embedding_function.embed_query(analysis)
+        _collection().upsert(
+            ids=[id_],
+            embeddings=[embedding],
+            documents=[analysis],
+            metadatas=[metadata],
+        )
+        return True
 
 
 def _delete_record(id_: str, original_analysis: str | None) -> None:
@@ -1875,7 +1876,7 @@ async def get_record(request: web.Request) -> web.Response:
     index = _parse_index(request.query.get("index"))
 
     try:
-        payload = await asyncio.to_thread(_build_record_payload, filter_name, index)
+        payload = await run_sync(_build_record_payload, filter_name, index)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
     return web.json_response(payload)
@@ -1887,7 +1888,7 @@ async def save_record(request: web.Request) -> web.Response:
         id_ = _required_string(payload, "id")
         analysis = _required_non_empty_text(payload, "analysis")
         original_analysis = _optional_string(payload, "original_analysis")
-        reembedded = await asyncio.to_thread(
+        reembedded = await run_sync(
             _save_record,
             id_,
             analysis,
@@ -1918,7 +1919,7 @@ async def delete_record(request: web.Request) -> web.Response:
         payload = await _read_json(request)
         id_ = _required_string(payload, "id")
         original_analysis = _optional_string(payload, "original_analysis")
-        await asyncio.to_thread(_delete_record, id_, original_analysis)
+        await run_sync(_delete_record, id_, original_analysis)
     except web.HTTPException as exc:
         return web.json_response({"error": exc.text}, status=exc.status)
     except Exception as exc:
@@ -1928,7 +1929,7 @@ async def delete_record(request: web.Request) -> web.Response:
 
 async def get_duplicates(_: web.Request) -> web.Response:
     try:
-        payload = await asyncio.to_thread(_build_duplicates_payload)
+        payload = await run_sync(_build_duplicates_payload)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
     return web.json_response(payload)
@@ -1936,7 +1937,7 @@ async def get_duplicates(_: web.Request) -> web.Response:
 
 async def get_bulk_unlabeled(_: web.Request) -> web.Response:
     try:
-        payload = await asyncio.to_thread(_build_bulk_unlabeled_payload)
+        payload = await run_sync(_build_bulk_unlabeled_payload)
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
     return web.json_response(payload)
@@ -1949,16 +1950,14 @@ async def resolve_duplicates(request: web.Request) -> web.Response:
         keep_ids = _required_string_list(payload, "keep_ids")
         pending_token = _optional_string(payload, "pending_token")
         if pending_token:
-            result = await asyncio.to_thread(
+            result = await run_sync(
                 _resolve_pending_duplicate_add,
                 pending_token,
                 group_ids,
                 keep_ids,
             )
         else:
-            result = await asyncio.to_thread(
-                _resolve_duplicate_group, group_ids, keep_ids
-            )
+            result = await run_sync(_resolve_duplicate_group, group_ids, keep_ids)
     except web.HTTPException as exc:
         return web.json_response({"error": exc.text}, status=exc.status)
     except Exception as exc:
@@ -1970,8 +1969,10 @@ async def resolve_bulk_unlabeled(request: web.Request) -> web.Response:
     try:
         payload = await _read_json(request)
         record_ids = _required_string_list(payload, "record_ids")
-        keep_ids = _required_string_list(payload, "keep_ids") if "keep_ids" in payload else []
-        result = await asyncio.to_thread(_resolve_bulk_unlabeled, record_ids, keep_ids)
+        keep_ids = (
+            _required_string_list(payload, "keep_ids") if "keep_ids" in payload else []
+        )
+        result = await run_sync(_resolve_bulk_unlabeled, record_ids, keep_ids)
     except web.HTTPException as exc:
         return web.json_response({"error": exc.text}, status=exc.status)
     except Exception as exc:

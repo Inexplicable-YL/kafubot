@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 BatchT = TypeVar("BatchT")
 
 _DEFAULT_RETRY_BACKOFF = 5.0
+_GLOBAL_BACKGROUND_SESSION_LIMITER = anyio.CapacityLimiter(4)
 
 
 class LoggerConfig(TypedDict):
@@ -67,6 +68,8 @@ class BaseDaemonMiddleware(
         max_sessions: int,
         max_retries: int,
         max_batch_window_size: int,
+        coalesce_seconds: float = 0.18,
+        max_concurrent_sessions: int = 4,
         logger_config: LoggerConfig | None = None,
     ) -> None:
         super().__init__()
@@ -87,6 +90,10 @@ class BaseDaemonMiddleware(
         self._queue_size = max(64, max_sessions * 2)
         self._max_batches_per_session = max(16, max_sessions * 2)
         self._max_batch_window_size = max(1, max_batch_window_size)
+        self._coalesce_seconds = max(0.0, coalesce_seconds)
+        self._session_limiter = anyio.CapacityLimiter(
+            max(1, max_concurrent_sessions)
+        )
 
         self._pending_batches: LRUCache[str, deque[BatchT]] = LRUCache(
             maxsize=max_sessions
@@ -95,6 +102,7 @@ class BaseDaemonMiddleware(
 
         self._scheduled_sessions: set[str] = set()
         self._delayed_retry_sessions: set[str] = set()
+        self._enqueue_versions: dict[str, int] = {}
 
         self._start_lock = anyio.Lock()
         self._task_group: TaskGroup | None = None
@@ -131,6 +139,7 @@ class BaseDaemonMiddleware(
         self._scheduled_sessions.clear()
         self._delayed_retry_sessions.clear()
         self._retry_attempts.clear()
+        self._enqueue_versions.clear()
 
         await self.on_close()
 
@@ -191,6 +200,7 @@ class BaseDaemonMiddleware(
                 maxlen=self._max_batches_per_session
             )
         self._pending_batches[session_id].append(batch)
+        self._enqueue_versions[session_id] = self._enqueue_versions.get(session_id, 0) + 1
         await self._queue_job(session_id)
 
     async def _save_worker(
@@ -201,22 +211,11 @@ class BaseDaemonMiddleware(
             while self._receive_stream is not None:
                 try:
                     async for session_id in receive_stream:
-                        try:
-                            progressed, failed = await self._drain_session(session_id)
-                        except Exception:
-                            self._logger.exception(self._process_failure_log)
-                            progressed = False
-                            failed = True
-                        finally:
-                            self._scheduled_sessions.discard(session_id)
-
-                        if failed:
-                            await self._schedule_retry(session_id)
-                            continue
-
-                        self._retry_attempts.pop(session_id, None)
-                        if progressed and self._pending_batches.get(session_id):
-                            await self._queue_job(session_id)
+                        # The receiver only dispatches.  Slow model analysis for
+                        # one QQ session must never serialize every other group.
+                        self._start_background_task(
+                            self._process_session_job, session_id
+                        )
                 except Exception:
                     if self._receive_stream is None:
                         break
@@ -227,40 +226,66 @@ class BaseDaemonMiddleware(
                     )
                     await anyio.sleep(_DEFAULT_RETRY_BACKOFF)
 
-    async def _drain_session(self, session_id: str) -> tuple[bool, bool]:
-        progressed = False
-        while pending_batches := self._pending_batches.get(session_id):
-            batches = tuple(list(pending_batches)[: self._max_batch_window_size])
-            if not batches:
-                continue
+    async def _process_session_job(self, session_id: str) -> None:
+        async with self._session_limiter, _GLOBAL_BACKGROUND_SESSION_LIMITER:
+            # A small debounce window turns bursts of one-message events into a
+            # single model request without adding latency to the reply path.
+            if self._coalesce_seconds:
+                await anyio.sleep(self._coalesce_seconds)
+            start_version = self._enqueue_versions.get(session_id, 0)
+            try:
+                progressed, failed = await self._drain_session(session_id)
+            except Exception:
+                self._logger.exception(self._process_failure_log)
+                progressed = False
+                failed = True
+            finally:
+                self._scheduled_sessions.discard(session_id)
 
-            result = await self.process_batches(session_id, batches)
-            if result is None:
-                result = ProcessResult()
-            elif isinstance(result, int):
-                result = ProcessResult(consumed_batches=result)
-            elif isinstance(result, tuple):
-                consumed_batches, failed = result
-                result = ProcessResult(
-                    consumed_batches=consumed_batches,
-                    failed=failed,
-                )
-            elif not isinstance(result, ProcessResult):
-                raise TypeError(
-                    f"Invalid process result type: {type(result)}; expected int, tuple[int, bool], ProcessResult, or None"
-                )
+            if failed:
+                await self._schedule_retry(session_id)
+                return
 
-            if result.failed:
-                return progressed, True
-            consumed_batches = min(
-                max(result.consumed_batches, 0),
-                len(batches),
+            self._retry_attempts.pop(session_id, None)
+            received_during_processing = (
+                self._enqueue_versions.get(session_id, 0) != start_version
             )
-            if consumed_batches <= 0:
-                break
-            self._pop_processed_batches(session_id, consumed_batches)
-            progressed = True
-        return progressed, False
+            if (progressed or received_during_processing) and self._pending_batches.get(
+                session_id
+            ):
+                await self._queue_job(session_id)
+
+    async def _drain_session(self, session_id: str) -> tuple[bool, bool]:
+        pending_batches = self._pending_batches.get(session_id)
+        if not pending_batches:
+            return False, False
+        batches = tuple(list(pending_batches)[: self._max_batch_window_size])
+        if not batches:
+            return False, False
+
+        result = await self.process_batches(session_id, batches)
+        if result is None:
+            result = ProcessResult()
+        elif isinstance(result, int):
+            result = ProcessResult(consumed_batches=result)
+        elif isinstance(result, tuple):
+            consumed_batches, failed = result
+            result = ProcessResult(
+                consumed_batches=consumed_batches,
+                failed=failed,
+            )
+        elif not isinstance(result, ProcessResult):
+            raise TypeError(
+                f"Invalid process result type: {type(result)}; expected int, tuple[int, bool], ProcessResult, or None"
+            )
+
+        if result.failed:
+            return False, True
+        consumed_batches = min(max(result.consumed_batches, 0), len(batches))
+        if consumed_batches <= 0:
+            return False, False
+        self._pop_processed_batches(session_id, consumed_batches)
+        return True, False
 
     async def _queue_job(self, session_id: str) -> None:
         if (

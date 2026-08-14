@@ -88,9 +88,15 @@ MEMORY_EXTRACTION_SYSTEM_PROMPT = """
 5. 群聊共同出现不等于认识、朋友、同事或存在关系。
 6. 如果你认为需要写入的记忆，已经存在于近期已生成记忆中，那么请不要写入。杜绝重复接入的情况。
 7. 宁可少写，也不要污染长期记忆。
+8. 每条记忆必须给出当前批次真实存在的 source_message_ids；证据不足则不写。
+9. epistemic_owner 表示这是谁的说法/经历，不等于客观事实；群友A说群友B如何，owner应是A，confidence应降低。
+10. confidence 只表示证据可信度；玩笑、反话、群内梗和复杂指代未消歧时不得写成高置信事实。
+11. sensitivity 应按内容标为 normal/personal/sensitive；私聊与群聊命名空间隔离，敏感内容不得跨会话复述。
+12. valid_from/valid_to 用于有时效的信息，supersedes 用于明确替代旧记忆。普通稳定事实可留空。
+13. 群内梗只有在反复出现、含义稳定且未来确实有用时才可保存，并标明其适用会话和证据，不能当作现实关系事实。
 
 如果发现适合写入的记忆，必须逐条调用 add_memory 工具写入。"
-如果没有适合写入的内容，不要调用工具，直接说明无需写入。"
+如果没有适合写入的内容，不要调用工具，直接说明无需写入。
 """
 
 MEMORY_EXTRACTION_HUMAN_PROMPT = """
@@ -100,7 +106,7 @@ MEMORY_EXTRACTION_HUMAN_PROMPT = """
 【近期已生成记忆】
 {recent_memory_text}
 
-请判断是否有适合写入长期记忆的内容；如有，逐条调用 add_memory 工具。"
+请判断是否有适合写入长期记忆的内容；如有，逐条调用 add_memory 工具。
 """
 
 
@@ -117,6 +123,12 @@ class LongMemoryHit(TypedDict):
     updated_at: str | None
     event_time_start: str | None
     event_time_end: str | None
+    epistemic_owner: str | None
+    confidence: float
+    sensitivity: str
+    valid_from: str | None
+    valid_to: str | None
+    supersedes: list[str]
 
 
 class LongMemoryQueryResult(TypedDict):
@@ -200,13 +212,22 @@ class AddMemoryManualInput(BaseModel):
         description="事件结束时间，可为空；可填写时间戳或 ISO 时间。",
     )
     source_message_ids: list[str] = Field(
-        default_factory=list,
+        min_length=1,
         description="支撑该记忆的原始 message_id 列表。",
     )
     tags: list[str] = Field(
         default_factory=list,
         description="可选标签。",
     )
+    epistemic_owner: str = Field(
+        default="",
+        description="该信息的认识主体。用户个人说法应填对应用户，不能写成无来源客观事实。",
+    )
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    sensitivity: Literal["normal", "personal", "sensitive"] = "normal"
+    valid_from: str = ""
+    valid_to: str = ""
+    supersedes: list[str] = Field(default_factory=list)
 
 
 class MemoryCandidate(BaseModel):
@@ -218,6 +239,12 @@ class MemoryCandidate(BaseModel):
     time_end: str = Field(default="")
     source_message_ids: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    epistemic_owner: str = Field(default="")
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    sensitivity: Literal["normal", "personal", "sensitive"] = "normal"
+    valid_from: str = Field(default="")
+    valid_to: str = Field(default="")
+    supersedes: list[str] = Field(default_factory=list)
 
     @field_validator("content", "user_name", "user_id", "time_start", "time_end")
     @classmethod
@@ -257,7 +284,7 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
         analyze_model: BaseChatModel,
         queue_size: int | None = None,
         max_sessions: int = 100,
-        max_batches: int = 1,
+        max_batches: int = 3,
         max_retries: int = 0,
         memory_extraction_max_writes: int = MEMORY_EXTRACTION_MAX_WRITES,
         recent_memory_context_limit: int = RECENT_MEMORY_CONTEXT_LIMIT,
@@ -277,6 +304,7 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
             max_sessions=max_sessions,
             max_retries=max_retries,
             max_batch_window_size=max_batches,
+            coalesce_seconds=0.8,
             logger_config={
                 "worker_name": "LongMemory",
                 "job_name": "long memory analysis",
@@ -384,30 +412,54 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
             )
             return len(batches)
 
-        consumed_batches = 0
-        for batch in batches:
-            consumed_batches += 1
-            if not batch.user_messages:
-                continue
-
-            try:
-                await self._run_memory_subagent(
-                    messages=batch.user_messages,
-                    session_id=session_id,
-                    store=store,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to analyze long memory batch for session %s",
-                    session_id,
-                )
-        return consumed_batches
+        messages_by_id = {
+            message.message_id: message
+            for batch in batches
+            for message in batch.user_messages
+        }
+        if not messages_by_id:
+            return len(batches)
+        try:
+            await self._run_memory_subagent(
+                messages=list(messages_by_id.values()),
+                session_id=session_id,
+                store=store,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to analyze long memory batch window for session %s",
+                session_id,
+            )
+            return 0, True
+        return len(batches)
 
     @override
     async def on_close(self) -> None:
         self._store = None
         self._user_maps.clear()
         self._recent_memory_cache.clear()
+
+    async def clear_session(self, session_id: str) -> None:
+        """Delete all session-scoped memory; never touch another QQ chat scope."""
+        self._user_maps.pop(session_id, None)
+        if self._store is None:
+            return
+        namespace_prefixes = [
+            (self.namespace_root, "chats", session_id),
+            (self.namespace_root, "users"),
+        ]
+        for prefix in namespace_prefixes:
+            namespaces = await self._store.alist_namespaces(prefix=prefix, limit=1000)
+            for namespace in namespaces:
+                if namespace[:3] != (self.namespace_root, "chats", session_id) and not (
+                    len(namespace) >= 4
+                    and namespace[:2] == (self.namespace_root, "users")
+                    and namespace[-1] == session_id
+                ):
+                    continue
+                for item in await self._store.asearch(namespace, limit=1000):
+                    await self._store.adelete(namespace, item.key)
+                self._recent_memory_cache.pop(namespace, None)
 
     @staticmethod
     def _validate_positive_int(value: int, name: str) -> int:
@@ -620,7 +672,15 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
                 else ""
             )
             kind_part = f"[{hit['kind']}]" if hit.get("kind") else ""
-            summary_lines.append(f"{index}. {kind_part}{user_part}{content}")
+            owner_part = (
+                f"[说法主体:{hit['epistemic_owner']}]"
+                if hit.get("epistemic_owner")
+                else ""
+            )
+            confidence_part = f"[置信度:{hit.get('confidence', 0.5):.2f}]"
+            summary_lines.append(
+                f"{index}. {kind_part}{user_part}{owner_part}{confidence_part}{content}"
+            )
 
         return LongMemoryQueryResult(
             success=True,
@@ -661,10 +721,25 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
             time_end: str = "",
             source_message_ids: list[str] | None = None,
             tags: list[str] | None = None,
+            epistemic_owner: str = "",
+            confidence: float = 0.8,
+            sensitivity: Literal["normal", "personal", "sensitive"] = "normal",
+            valid_from: str = "",
+            valid_to: str = "",
+            supersedes: list[str] | None = None,
         ) -> str:
             if len(events) >= self.memory_extraction_max_writes:
                 return "写入失败：本次 add_memory 已达到写入上限。"
 
+            valid_source_ids = list(
+                dict.fromkeys(
+                    item
+                    for item in (source_message_ids or [])
+                    if item in {message.message_id for message in messages}
+                )
+            )
+            if not valid_source_ids:
+                return "写入失败：长期记忆必须引用本批真实QQ message_id。"
             candidate = MemoryCandidate(
                 content=content,
                 kind=kind,
@@ -672,8 +747,14 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
                 user_id="",
                 time_start=time_start,
                 time_end=time_end,
-                source_message_ids=source_message_ids or [],
+                source_message_ids=valid_source_ids,
                 tags=tags or [],
+                epistemic_owner=epistemic_owner or user_name,
+                confidence=confidence,
+                sensitivity=sensitivity,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                supersedes=supersedes or [],
             )
             resolved = self._resolve_candidate_user(candidate, session_id)
             event = await self._store_memory_candidate(
@@ -846,9 +927,32 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
             "tags": candidate.tags,
             "event_time_start": normalize_time_string(candidate.time_start),
             "event_time_end": normalize_time_string(candidate.time_end),
+            "epistemic_owner": candidate.epistemic_owner or candidate.user_name or None,
+            "confidence": candidate.confidence,
+            "sensitivity": candidate.sensitivity,
+            "valid_from": normalize_time_string(candidate.valid_from),
+            "valid_to": normalize_time_string(candidate.valid_to),
+            "supersedes": candidate.supersedes,
             "created_at": now,
             "updated_at": now,
         }
+        for superseded_id in candidate.supersedes:
+            superseded = await store.aget(namespace, superseded_id)
+            if superseded is None or not isinstance(superseded.value, Mapping):
+                continue
+            superseded_value = dict(superseded.value)
+            superseded_value["valid_to"] = now
+            superseded_value["updated_at"] = now
+            await store.aput(
+                namespace,
+                superseded_id,
+                superseded_value,
+                index=["content", "kind", "tags[*]"],
+            )
+            for cached_hit in self._recent_memory_cache.get(namespace, []):
+                if cached_hit["key"] == superseded_id:
+                    cached_hit["valid_to"] = now
+                    cached_hit["updated_at"] = now
         await store.aput(
             namespace,
             memory_id,
@@ -869,6 +973,12 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
                 updated_at=now,
                 event_time_start=value["event_time_start"],
                 event_time_end=value["event_time_end"],
+                epistemic_owner=value["epistemic_owner"],
+                confidence=value["confidence"],
+                sensitivity=value["sensitivity"],
+                valid_from=value["valid_from"],
+                valid_to=value["valid_to"],
+                supersedes=value["supersedes"],
             )
         )
         return LongMemoryEvent(
@@ -995,7 +1105,6 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
 
         return [
             (self.namespace_root, "users", user_id, sess_id),
-            (self.namespace_root, "users", user_id),
             chat_namespace,
         ]
 
@@ -1120,6 +1229,12 @@ def _item_to_hit(item: Any) -> LongMemoryHit:
         updated_at=updated_at,
         event_time_start=event_time_start,
         event_time_end=event_time_end,
+        epistemic_owner=_clean_text(value.get("epistemic_owner")) or None,
+        confidence=float(value.get("confidence", 0.5) or 0.5),
+        sensitivity=_clean_text(value.get("sensitivity")) or "normal",
+        valid_from=_clean_text(value.get("valid_from")) or None,
+        valid_to=_clean_text(value.get("valid_to")) or None,
+        supersedes=[str(x) for x in value.get("supersedes", []) or []],
     )
 
 
@@ -1131,6 +1246,14 @@ def _hit_matches(
     end_dt: datetime | None,
 ) -> bool:
     if kind and hit["kind"] != kind:
+        return False
+
+    valid_from = _parse_time(hit.get("valid_from"))
+    valid_to = _parse_time(hit.get("valid_to"))
+    reference_time = datetime.now(UTC)
+    if valid_from and valid_from > reference_time:
+        return False
+    if valid_to and valid_to < reference_time:
         return False
 
     if start_dt is None and end_dt is None:

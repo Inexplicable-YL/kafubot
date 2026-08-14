@@ -1108,6 +1108,15 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
     async def on_close(self) -> None:
         self._store = None
 
+    async def clear_session(self, session_id: str) -> None:
+        self._pending_batches.pop(session_id, None)
+        self._retry_attempts.pop(session_id, None)
+        if self._store is None:
+            return
+        namespace = (self.namespace_root, "sessions", session_id)
+        for item in await self._store.asearch(namespace, limit=1000):
+            await self._store.adelete(namespace, item.key)
+
 
 def _normalize_record(value: Any) -> JargonRecord | None:
     """把 store 中的原始值规范化为 `JargonRecord`。

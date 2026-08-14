@@ -344,7 +344,7 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
     async def get_message(self, session_id: str) -> UserMessage | None:
         text = self.event.get_plain_text()
 
-        if text and any(keyword in text for keyword in self.config.clear_keywords):
+        if text and text.strip() in self.config.clear_keywords:
             await self.delete_chat(session_id)
             return None
 
@@ -360,7 +360,14 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
                 .astimezone(ZoneInfo("Asia/Shanghai"))
                 .strftime("%Y-%m-%d %H:%M:%S")
             )
-            message = QQMessageSegment.reply(time_text) + message
+            message = (
+                QQMessageSegment.reply(
+                    time_text,
+                    str(self.event.reply.message_id),
+                    include={"message_id"},
+                )
+                + message
+            )
         if not message:
             return None
 
@@ -371,6 +378,7 @@ class PrivateAgent(Node[PrivateMessageEvent, PrivateAgentState, PrivateAgentConf
             "message_id": str(self.event.message_id),
             "message": message,
             "is_tome": True,
+            "chat_type": "private",
         }
         images: list[tuple[ImageReadResult, bool]] = []
         msg_with_image = QQMessage()

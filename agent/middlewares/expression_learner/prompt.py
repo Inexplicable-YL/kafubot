@@ -59,7 +59,7 @@ def build_expression_selector_prompt(
     candidate_lines: list[str],
 ) -> str:
     return (
-        "你是 Maisaka 的表达方式选择子代理。\n"
+        "你是聊天机器人的表达方式选择子代理。\n"
         "你只负责根据最近聊天上下文，为这一次可见回复挑选最合适的表达方式。\n"
         "请只从下面候选中选择 0 到 3 条最适合当前语境的表达方式。\n"
         "优先考虑自然、贴合上下文、不生硬、不模板化。\n"

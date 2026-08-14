@@ -4,9 +4,10 @@ from __future__ import annotations
 import difflib
 import json
 import re
+from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 from typing_extensions import override
 
@@ -39,9 +40,11 @@ from .constants import (
 )
 from .manager import (
     ExpressionDatabase,
+    ExpressionEffectRecord,
     ExpressionEntry,
     ExpressionMessageRecord,
     ExpressionRecord,
+    ExpressionSelectionResult,
     ExpressionSelector,
     ModifiedBy,
     append_ai_review_log,
@@ -57,7 +60,9 @@ from .utils import (
     parse_expression_response,
 )
 
-_USER_TAG_PATTERN = re.compile(r"(?is)^<user-message\b[^>]*>(.*?)</user-message>$")
+_USER_TAG_PATTERN = re.compile(
+    r"(?is)^<(?:qq-)?user-message\b[^>]*>(.*?)</(?:qq-)?user-message>$"
+)
 _BOT_TAG_PATTERN = re.compile(r"(?is)^<bot-message\b[^>]*>(.*?)</bot-message>$")
 
 
@@ -65,6 +70,13 @@ _BOT_TAG_PATTERN = re.compile(r"(?is)^<bot-message\b[^>]*>(.*?)</bot-message>$")
 class PendingExpressionAnalysisBatch:
     session_id: str
     messages: list[BaseMessage]
+    selected_expression_ids: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PreparedExpressionSelection:
+    selection: ExpressionSelectionResult
+    prepared_at: datetime
 
 
 @dataclass(frozen=True)
@@ -196,11 +208,15 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         ) = None,
         expression_config_resolver: Callable[[str], tuple[bool, bool]] | None = None,
         similarity_threshold: float = SIMILARITY_THRESHOLD,
+        selection_refresh_seconds: float = 10.0,
+        selection_max_stale_seconds: float = 45.0,
     ) -> None:
         super().__init__(
             max_sessions=max_sessions,
             max_retries=max_retries,
             max_batch_window_size=max_batches,
+            coalesce_seconds=0.8,
+            max_concurrent_sessions=max_concurrent_learners,
             logger_config={
                 "worker_name": "ExpressionLearner",
                 "job_name": "expression learning",
@@ -216,6 +232,10 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         self._expression_group_resolver = expression_group_resolver
         self._expression_config_resolver = expression_config_resolver
         self._similarity_threshold = similarity_threshold
+        self.selection_refresh_seconds = max(1.0, selection_refresh_seconds)
+        self.selection_max_stale_seconds = max(
+            self.selection_refresh_seconds, selection_max_stale_seconds
+        )
         self._db = ExpressionDatabase(engine=engine, db_url=db_url)
         self._selector = ExpressionSelector(
             self._db,
@@ -226,6 +246,10 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
             config_resolver=expression_config_resolver,
         )
         self._learning_gate = ExpressionLearningBatchGate(max_concurrent_learners)
+        self._prepared_selection_cache: dict[
+            str, PreparedExpressionSelection
+        ] = {}
+        self._learning_backlog: dict[str, deque[ExpressionMessageRecord]] = {}
 
     def _get_expression_config(self, session_id: str) -> tuple[bool, bool]:
         if self._expression_config_resolver is None:
@@ -262,16 +286,14 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         if not use_expression:
             return None
 
-        records = self._extract_visible_expression_messages(
-            cast("Sequence[BaseMessage]", state.get("messages") or [])
-        )
-        if not records:
+        selection_item = self._prepared_selection_cache.get(session_id)
+        if selection_item is None:
             return None
-
-        selection = await self._selector.select_for_reply(
-            session_id=session_id,
-            chat_history=records,
-        )
+        if (
+            datetime.now(UTC) - selection_item.prepared_at
+        ).total_seconds() > self.selection_max_stale_seconds:
+            return None
+        selection = selection_item.selection
         if not selection.expression_habits:
             return None
         return {
@@ -280,7 +302,8 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
                     content=selection.expression_habits,
                     additional_kwargs={"lc_source": EXPRESSION_REPLY_SOURCE},
                 )
-            ]
+            ],
+            "selected_expression_ids": selection.selected_expression_ids,
         }
 
     @override
@@ -290,19 +313,26 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         runtime: Runtime[ManagerContext],
     ) -> dict[str, Any] | None:
         session_id = runtime.context["session_id"]
+        replied = any(output["type"] == "reply" for output in state["outputs"])
         _, enable_learning = self._get_expression_config(session_id)
-        if not enable_learning:
-            return None
 
-        if messages := cast(
-            "list[BaseMessage] | None",
-            state.get("summary_pruned_messages"),
-        ):
+        messages = (
+            list(state.get("currents") or [])
+            if replied
+            else cast(
+                "list[BaseMessage] | None",
+                state.get("summary_pruned_messages"),
+            )
+        )
+        if messages and (enable_learning or replied):
             await self._enqueue_batch(
                 session_id,
                 PendingExpressionAnalysisBatch(
                     session_id=session_id,
                     messages=list(messages),
+                    selected_expression_ids=list(
+                        state.get("selected_expression_ids") or []
+                    ),
                 ),
             )
         return None
@@ -316,20 +346,109 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         records = self._extract_pruned_messages(batches)
         if not records:
             return len(batches)
-        if len(records) < self.min_messages_for_extraction:
+        learning_backlog = self._learning_backlog.setdefault(
+            session_id,
+            deque(maxlen=max(40, self.min_messages_for_extraction * 4)),
+        )
+        learning_backlog.extend(records)
+        learning_records = list(learning_backlog)
+        selected_ids = list(
+            dict.fromkeys(
+                expression_id
+                for batch in batches
+                for expression_id in batch.selected_expression_ids
+            )
+        )
+        task_errors: list[Exception] = []
+
+        async def prepare_next_selection() -> None:
+            try:
+                prepared = self._prepared_selection_cache.get(session_id)
+                if (
+                    prepared is not None
+                    and (datetime.now(UTC) - prepared.prepared_at).total_seconds()
+                    < self.selection_refresh_seconds
+                ):
+                    return
+                selection = await self._selector.select_for_reply(
+                    session_id=session_id,
+                    chat_history=records,
+                )
+                self._prepared_selection_cache[session_id] = (
+                    PreparedExpressionSelection(
+                        selection=selection,
+                        prepared_at=datetime.now(UTC),
+                    )
+                )
+            except Exception as exc:
+                task_errors.append(exc)
+
+        async def mark_selected() -> None:
+            try:
+                await self._selector._update_last_active_time(selected_ids)
+            except Exception as exc:
+                task_errors.append(exc)
+
+        async def learn() -> None:
+            try:
+                await self._learn_from_session_messages(
+                    learning_records, learning_session_id=session_id
+                )
+            except Exception as exc:
+                task_errors.append(exc)
+
+        run_learning = len(learning_records) >= self.min_messages_for_extraction
+        if not run_learning:
             logger.debug(
                 "%s 表达学习消息不足: 可学习=%s 阈值=%s",
                 session_id,
-                len(records),
+                len(learning_records),
                 self.min_messages_for_extraction,
             )
-            return len(batches)
-        await self._learn_from_session_messages(records, learning_session_id=session_id)
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(prepare_next_selection)
+            if selected_ids:
+                task_group.start_soon(mark_selected)
+            if run_learning:
+                task_group.start_soon(learn)
+        for task_error in task_errors:
+            logger.exception("expression post-analysis failed", exc_info=task_error)
+        if run_learning:
+            learning_backlog.clear()
         return len(batches)
 
     @override
     async def on_close(self) -> None:
+        self._prepared_selection_cache.clear()
+        self._learning_backlog.clear()
         await self._db.dispose()
+
+    async def clear_session(self, session_id: str) -> None:
+        self._pending_batches.pop(session_id, None)
+        self._retry_attempts.pop(session_id, None)
+        self._prepared_selection_cache.pop(session_id, None)
+        self._learning_backlog.pop(session_id, None)
+
+    async def apply_observable_effect(
+        self,
+        *,
+        expression_ids: Sequence[int],
+        metrics: dict[str, Any],
+        confidence: float,
+    ) -> None:
+        if not expression_ids or confidence < 0.3:
+            return
+        reward = max(-2.0, min(2.0, float(metrics.get("observable_reward", 0.0))))
+        async with self._db.session() as session:
+            for expression_id in expression_ids:
+                record = await session.get(ExpressionEffectRecord, expression_id)
+                if record is None:
+                    record = ExpressionEffectRecord(expression_id=expression_id)
+                record.observations += 1
+                record.reward_sum += reward * confidence
+                record.last_confidence = confidence
+                record.updated_at = datetime.now()
+                session.add(record)
 
     def _extract_visible_expression_messages(
         self,
