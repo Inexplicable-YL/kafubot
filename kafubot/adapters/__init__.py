@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, cast, overloa
 import anyio
 from pydantic import BaseModel
 
+from kafubot.event import Event
 from kafubot.exceptions import GetEventTimeout, MockApiException
 from kafubot.log import logger
 from kafubot.message import BuildMessageType, MessageSegment
-from kafubot.protocol import Event
 
 if TYPE_CHECKING:
     from anyio.streams.memory import MemoryObjectSendStream

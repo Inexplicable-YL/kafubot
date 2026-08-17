@@ -11,7 +11,7 @@ import anyio
 if TYPE_CHECKING:
     from anyio.abc import ObjectReceiveStream
 
-    from kafubot.protocol import Event
+    from kafubot.event import Event
 
 from kafubot.adapters import get_adapter_class
 from kafubot.adapters.cqhttp.event import GroupMessageEvent, PrivateMessageEvent

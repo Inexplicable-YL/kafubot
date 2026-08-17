@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
     from pydantic.fields import FieldInfo
 
-from kafubot.protocol import Event
+from kafubot.event import Event
 
 from .message import CQHTTPMessage
 
@@ -50,21 +50,27 @@ class CQHTTPEvent(Event):
     def get_type(self) -> str:
         return self.post_type
 
+    @override
     def get_event_name(self) -> str:
         return self.post_type
 
+    @override
     def get_event_description(self) -> str:
         return str(self.model_dump())
 
+    @override
     def get_message(self) -> CQHTTPMessage:
         raise ValueError("event has no message")
 
+    @override
     def get_user_id(self) -> str:
         raise ValueError("event has no user context")
 
+    @override
     def get_session_id(self) -> str:
         raise ValueError("event has no session context")
 
+    @override
     def is_tome(self) -> bool:
         return False
 
@@ -180,6 +186,7 @@ class MessageEvent(CQHTTPEvent):
         group_id = getattr(self, "group_id", None)
         return f"group_{group_id}" if group_id else f"private_{self.user_id}"
 
+    @override
     def get_plain_text(self) -> str:
         return self.message.get_plain_text()
 
