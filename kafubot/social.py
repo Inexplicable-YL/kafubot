@@ -57,6 +57,8 @@ class SocialAgentContext:
     provider_peek: list[str]
     budget: int
     opened: dict[str, list[int]] = field(default_factory=dict)
+    open_session_id: str | None = None
+    open_context_summaries: dict[str, str] = field(default_factory=dict)
     focus_stack: list[str] = field(default_factory=list)
     claimed: set[str] = field(default_factory=set)
     handled: set[str] = field(default_factory=set)

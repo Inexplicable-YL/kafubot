@@ -25,7 +25,7 @@ Social Environment ──► Global Gate（只决定是否唤醒）
                          one Main Executive
                        open_chat / read_more
                   inspect_person / inspect_media
-                    search_memory / skip / reply
+                    search_memory / quit / reply
                                   │
                          Action Contract
                                   ▼
