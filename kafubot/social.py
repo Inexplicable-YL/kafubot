@@ -1,45 +1,81 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
 import anyio
+from langchain.agents import AgentState
+from langchain_core.messages import AIMessage
+from langgraph.errors import GraphRecursionError
 
 from agent.base import UserMessage
+from agent.builder import create_agent
 from agent.message import QQMessage, QQMessageSegment
+from agent.models import get_thinking_model
 from agent.multimodal.image import ImageReadResult, get_analyzer, read_image
 from kafubot.actions import QQActions
 from kafubot.agency import (
     AttentionScheduler,
     ContextCompiler,
+    ExecutiveMiddleware,
     GlobalGate,
-    MainExecutive,
     Replyer,
     SelfStateStore,
     SocialEnvironment,
     WorldModelHub,
 )
+from kafubot.agency.models import RoundResult, SelfState, SocialHome
 from kafubot.agency.providers import ConversationWorldProvider, ProviderCommit
 from kafubot.log import logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
+
+    from langchain.agents.middleware import AgentMiddleware
+    from langchain_core.language_models.chat_models import BaseChatModel
 
     from kafubot.adapters.cqhttp.event import (
         GroupMessageEvent,
         PrivateMessageEvent,
     )
     from kafubot.agency.environment import ConversationState
-    from kafubot.agency.models import RoundResult
     from kafubot.config import AgentConfig
 
 DEFAULT_USERNAME = "陌生用户"
 
 
-class Executive(Protocol):
-    async def run_round(self) -> RoundResult: ...
+@dataclass(slots=True)
+class SocialAgentContext:
+    """One create_agent invocation, owned and managed by the social runtime."""
+
+    home: SocialHome
+    state: SelfState
+    provider_peek: list[str]
+    budget: int
+    opened: dict[str, list[int]] = field(default_factory=dict)
+    focus_stack: list[str] = field(default_factory=list)
+    claimed: set[str] = field(default_factory=set)
+    handled: set[str] = field(default_factory=set)
+    reply_slots_used: int = 0
+    replies: int = 0
+    skipped: int = 0
+    finished: bool = False
+    exhausted_budget: bool = False
+
+    def spend(self, cost: int) -> bool:
+        if cost > self.budget:
+            self.exhausted_budget = True
+            return False
+        self.budget -= cost
+        return True
+
+
+class SocialAgentState(AgentState[None]):
+    """State carried by the replaceable social-agent middleware graph."""
 
 
 class ImageAnalyzer(Protocol):
@@ -56,7 +92,7 @@ def _has_model_visible_content(message: UserMessage) -> bool:
 
 
 class SocialAgentRuntime:
-    """Global Gate plus one Main Executive over a shared Social Environment."""
+    """Owns the global create_agent graph and its replaceable plugin stack."""
 
     def __init__(
         self,
@@ -64,7 +100,11 @@ class SocialAgentRuntime:
         *,
         environment: SocialEnvironment | None = None,
         state_store: SelfStateStore | None = None,
-        executive: Executive | None = None,
+        middleware: Sequence[
+            AgentMiddleware[SocialAgentState, SocialAgentContext, None]
+        ]
+        | None = None,
+        model_factory: Callable[[], BaseChatModel] | None = None,
         image_analyzer_factory: Callable[[], ImageAnalyzer] | None = None,
     ) -> None:
         self.config = config
@@ -82,36 +122,106 @@ class SocialAgentRuntime:
             keywords=set(config.reply_keywords),
         )
         self.attention = AttentionScheduler(config.attention)
-        self.providers = WorldModelHub(
-            [ConversationWorldProvider(self.environment)]
-        )
+        self.providers = WorldModelHub([ConversationWorldProvider(self.environment)])
         self.compiler = ContextCompiler(
             self.environment,
             self.providers,
             config.executive,
         )
         self.replyer = Replyer()
-        self.executive = executive or MainExecutive(
-            self.environment,
-            self.attention,
-            self.compiler,
-            self.replyer,
-            self.providers,
-            self.state_store,
-            config.executive,
+        self.middleware = (
+            tuple(middleware)
+            if middleware is not None
+            else (
+                ExecutiveMiddleware(
+                    self.environment,
+                    self.compiler,
+                    self.replyer,
+                    self.providers,
+                    self.state_store,
+                    config.executive,
+                ),
+            )
         )
+        self.model_factory = model_factory or (
+            lambda: get_thinking_model(reasoning_effort="max")
+        )
+        self._model: BaseChatModel | None = None
+        self._agent: Any | None = None
         self.image_limiter = anyio.CapacityLimiter(config.image_analyzer_workers)
         factory = image_analyzer_factory or (lambda: get_analyzer(True))
         self.image_analyzer = factory()
         self._ingest_locks: defaultdict[str, anyio.Lock] = defaultdict(anyio.Lock)
         self._closed = False
 
+    @property
+    def model(self) -> BaseChatModel:
+        if self._model is None:
+            self._model = self.model_factory()
+        return self._model
+
+    @property
+    def agent(self) -> Any:
+        if self._agent is None:
+            self._agent = create_agent(
+                model=self.model,
+                tools=[],
+                middleware=self.middleware,
+                state_schema=SocialAgentState,
+                context_schema=SocialAgentContext,
+                name="social_agent",
+            )
+        return self._agent
+
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
         await self.gate.force_wake()
+        await self._close_middleware()
         await self.providers.aclose()
+
+    async def run_round(self) -> RoundResult:
+        state = await self.state_store.cool_fatigue()
+        home = self.attention.rank(
+            await self.environment.candidates(),
+            state,
+            limit=self.config.executive.home_session_limit,
+        )
+        result = RoundResult(home_size=len(home.items))
+        if not home.items:
+            return result
+
+        context = SocialAgentContext(
+            home=home,
+            state=state,
+            provider_peek=await self.providers.peek(home, state),
+            budget=self.config.executive.focus_budget,
+        )
+        try:
+            output: dict[str, Any] = await self.agent.ainvoke(
+                {"messages": []},
+                config={"recursion_limit": self.config.executive.max_steps * 2},
+                context=context,
+            )
+        except GraphRecursionError:
+            logger.info(
+                "Social agent reached its create_agent step limit",
+                max_steps=self.config.executive.max_steps,
+            )
+            result.steps = self.config.executive.max_steps
+        else:
+            messages = output.get("messages", [])
+            if isinstance(messages, list):
+                result.steps = min(
+                    self.config.executive.max_steps,
+                    sum(isinstance(message, AIMessage) for message in messages),
+                )
+
+        result.replies = context.replies
+        result.skipped = context.skipped
+        result.exhausted_budget = context.exhausted_budget
+        return result
 
     async def run(self) -> None:
         """Run the only cognitive loop. Protocol workers only update the world."""
@@ -124,9 +234,9 @@ class SocialAgentRuntime:
             if not woke and not await self._has_idle_work():
                 continue
             try:
-                result = await self.executive.run_round()
+                result = await self.run_round()
                 logger.info(
-                    "Executive round completed",
+                    "Social agent round completed",
                     home_size=result.home_size,
                     steps=result.steps,
                     replies=result.replies,
@@ -136,7 +246,7 @@ class SocialAgentRuntime:
             except anyio.get_cancelled_exc_class():
                 raise
             except Exception:
-                logger.exception("Main Executive round failed")
+                logger.exception("Social agent round failed")
 
     async def session(self, session_id: str) -> ConversationState:
         return await self.environment.session(session_id)
@@ -252,9 +362,12 @@ class SocialAgentRuntime:
         event: GroupMessageEvent | PrivateMessageEvent,
     ) -> None:
         """Commit one accepted chat event; never invoke the executive directly."""
-        if event.user_id == event.self_id or event.user_id in self.config.ignore_user_ids:
+        if (
+            event.user_id == event.self_id
+            or event.user_id in self.config.ignore_user_ids
+        ):
             return
-        session_id = event.conversation_id
+        session_id = event.get_conversation_id()
         actions = QQActions(event)
         if event.get_plain_text().strip() in self.config.clear_keywords:
             await self.clear_session(session_id, actions)
@@ -284,6 +397,26 @@ class SocialAgentRuntime:
             score=decision.score,
             reasons=decision.reasons,
         )
+
+    async def _close_middleware(self) -> None:
+        closed: set[int] = set()
+        for plugin in reversed(self.middleware):
+            identity = id(plugin)
+            if identity in closed:
+                continue
+            closed.add(identity)
+            close = getattr(plugin, "aclose", None)
+            if not callable(close):
+                continue
+            try:
+                result = close()
+                if isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception(
+                    "Agent middleware shutdown failed",
+                    middleware=type(plugin).__name__,
+                )
 
     async def _has_idle_work(self) -> bool:
         state = await self.state_store.load()

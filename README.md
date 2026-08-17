@@ -43,6 +43,10 @@ Social Environment ──► Global Gate（只决定是否唤醒）
 - Executive 初始只看压缩后的 Social Home，必须通过工具渐进展开局部会话。
 - 同一轮可以处理多个会话，但受 Focus Budget、最大步骤数和回复数限制。
 - `reply` 先产生 Action Contract；Replyer 只负责措辞，无权重新选择目标或行动。
+- `SocialAgentRuntime` 持有并运行 `agent.builder.create_agent` 图，同时管理每轮的
+  `SocialAgentContext`；默认的 `ExecutiveMiddleware` 只提供核心提示和基础工具，
+  可以被其他 Middleware 替换。`middleware=None` 使用默认插件，显式传入的
+  `middleware` 序列则作为完整插件栈。当前没有接入旧 Middleware。
 - 持久化内容仅包括 Self State、Active Threads、Recent Actions 和 State Delta，
   不保存模型思维链或 ReAct scratchpad。
 - 当前只接入会话世界模型，不加载旧 Middleware；`WorldModelProvider` 仅保留为后续
@@ -53,7 +57,8 @@ Social Environment ──► Global Gate（只决定是否唤醒）
 - `environment.py`：统一会话时间线、未处理游标和历史仓库。
 - `gate.py`：低成本全局唤醒判断。
 - `attention.py`：跨会话注意力评分和 Social Home 排序。
-- `executive.py`：唯一 ReAct 主循环和渐进披露工具。
+- `social.py`：`create_agent` 图宿主、运行上下文、round 与插件生命周期。
+- `executive.py`：可替换的默认 Executive Middleware 和渐进披露基础工具。
 - `compiler.py`：校验 Action Contract 并编译最小局部上下文。
 - `replyer.py`：把语义行动实现为 QQ 消息。
 - `providers.py`：世界模型能力的统一读写协议；当前仅有会话上下文 Provider。

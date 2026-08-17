@@ -1,7 +1,7 @@
 from .attention import AttentionScheduler
 from .compiler import ContextCompiler
 from .environment import SocialEnvironment
-from .executive import MainExecutive
+from .executive import ExecutiveMiddleware
 from .gate import GlobalGate
 from .models import ActionContract, SelfState, SocialHome
 from .providers import WorldModelHub, WorldModelProvider
@@ -12,8 +12,8 @@ __all__ = [
     "ActionContract",
     "AttentionScheduler",
     "ContextCompiler",
+    "ExecutiveMiddleware",
     "GlobalGate",
-    "MainExecutive",
     "Replyer",
     "SelfState",
     "SelfStateStore",

@@ -71,6 +71,10 @@ class CQHTTPEvent(Event):
         raise ValueError("event has no session context")
 
     @override
+    def get_conversation_id(self) -> str:
+        raise ValueError("event has no conversation context")
+
+    @override
     def is_tome(self) -> bool:
         return False
 
@@ -180,8 +184,8 @@ class MessageEvent(CQHTTPEvent):
             else self.get_user_id()
         )
 
-    @property
-    def conversation_id(self) -> str:
+    @override
+    def get_conversation_id(self) -> str:
         """Cognitive context partition; unlike legacy session ids, groups are shared."""
         group_id = getattr(self, "group_id", None)
         return f"group_{group_id}" if group_id else f"private_{self.user_id}"

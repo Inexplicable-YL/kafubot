@@ -1,34 +1,26 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, get_type_hints
+from typing_extensions import override
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
+from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
+from langchain.tools import ToolRuntime  # noqa: TC002 - inspected at runtime by tools
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
-from agent.models import get_thinking_model
-
 from .compiler import ContextCompilationError
-from .models import ActionContract, RecentAction, RoundResult, SelfState, SocialHome
+from .models import ActionContract, RecentAction
 from .providers import ProviderCommit, ProviderQuery, WorldModelHub
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from langchain_core.language_models.chat_models import BaseChatModel
+    from collections.abc import Awaitable, Callable
 
     from kafubot.config import ExecutiveConfig
+    from kafubot.social import SocialAgentContext, SocialAgentState  # noqa: F401
 
-    from .attention import AttentionScheduler
     from .compiler import ContextCompiler
     from .environment import SocialEnvironment
     from .replyer import Replyer
@@ -109,138 +101,61 @@ class FinishInput(BaseModel):
     reason: str = "round complete"
 
 
-@dataclass(slots=True)
-class _RoundContext:
-    home: SocialHome
-    state: SelfState
-    budget: int
-    opened: dict[str, list[int]] = field(default_factory=dict)
-    focus_stack: list[str] = field(default_factory=list)
-    handled: set[str] = field(default_factory=set)
-    replies: int = 0
-    skipped: int = 0
-    finished: bool = False
-    exhausted_budget: bool = False
-
-    def spend(self, cost: int) -> bool:
-        if cost > self.budget:
-            self.exhausted_budget = True
-            return False
-        self.budget -= cost
-        return True
-
-
-class MainExecutive:
-    """The only ReAct controller, operating over many conversation contexts."""
+class ExecutiveMiddleware(
+    AgentMiddleware["SocialAgentState", "SocialAgentContext", None]
+):
+    """Default executive plugin: social context prompt and foundational tools."""
 
     def __init__(
         self,
         environment: SocialEnvironment,
-        attention: AttentionScheduler,
         compiler: ContextCompiler,
         replyer: Replyer,
         providers: WorldModelHub,
         state_store: SelfStateStore,
         config: ExecutiveConfig,
-        *,
-        model_factory: Callable[[], BaseChatModel] | None = None,
     ) -> None:
         self.environment = environment
-        self.attention = attention
         self.compiler = compiler
         self.replyer = replyer
         self.providers = providers
         self.state_store = state_store
         self.config = config
-        self.model_factory = model_factory or (
-            lambda: get_thinking_model(reasoning_effort="max")
+        self.tools = self._build_tools()
+
+    @override
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[SocialAgentContext],
+        handler: Callable[
+            [ModelRequest[SocialAgentContext]],
+            Awaitable[ModelResponse[None]],
+        ],
+    ) -> ModelResponse[None]:
+        context = cast("SocialAgentContext", request.runtime.context)
+        return await handler(
+            request.override(
+                system_message=SystemMessage(content=EXECUTIVE_PROMPT),
+                messages=[
+                    HumanMessage(content=self._round_prompt(context)),
+                    *request.messages,
+                ],
+            )
         )
-        self._model: BaseChatModel | None = None
 
-    @property
-    def model(self) -> BaseChatModel:
-        if self._model is None:
-            self._model = self.model_factory()
-        return self._model
+    def _build_tools(self) -> list[BaseTool]:  # noqa: PLR0915
+        def home_sequences(context: SocialAgentContext) -> dict[str, int]:
+            return {
+                item.session_id: item.latest_sequence for item in context.home.items
+            }
 
-    async def run_round(self) -> RoundResult:
-        state = await self.state_store.cool_fatigue()
-        home = self.attention.rank(
-            await self.environment.candidates(),
-            state,
-            limit=self.config.home_session_limit,
-        )
-        result = RoundResult(home_size=len(home.items))
-        if not home.items:
-            return result
-
-        round_context = _RoundContext(
-            home=home,
-            state=state,
-            budget=self.config.focus_budget,
-        )
-        tools = self._build_tools(round_context)
-        tool_by_name = {tool.name: tool for tool in tools}
-        provider_peek = await self.providers.peek(home, state)
-        messages: list[BaseMessage] = [
-            SystemMessage(content=EXECUTIVE_PROMPT),
-            HumanMessage(
-                content=self._round_prompt(
-                    home,
-                    state,
-                    provider_peek,
-                    round_context.budget,
-                )
-            ),
-        ]
-        model = self.model.bind_tools(tools)
-
-        for step in range(self.config.max_steps):
-            response = await model.ainvoke(messages)
-            ai_message = cast("AIMessage", response)
-            messages.append(ai_message)
-            result.steps = step + 1
-            if not ai_message.tool_calls:
-                messages.append(
-                    HumanMessage(
-                        content=(
-                            "Text is not a visible action. Use a tool, or call finish "
-                            "if the round is complete."
-                        )
-                    )
-                )
-                continue
-            for tool_call in ai_message.tool_calls:
-                tool_name = str(tool_call.get("name", ""))
-                tool_call_id = str(tool_call.get("id", ""))
-                tool = tool_by_name.get(tool_name)
-                if tool is None:
-                    output = f"unknown tool: {tool_name}"
-                else:
-                    try:
-                        output = await tool.ainvoke(tool_call.get("args", {}))
-                    except Exception as exc:
-                        output = f"tool error: {type(exc).__name__}: {exc}"
-                messages.append(
-                    ToolMessage(content=str(output), tool_call_id=tool_call_id)
-                )
-            if round_context.finished:
-                break
-            if round_context.exhausted_budget and round_context.budget <= 0:
-                break
-
-        result.replies = round_context.replies
-        result.skipped = round_context.skipped
-        result.exhausted_budget = round_context.exhausted_budget
-        return result
-
-    def _build_tools(self, context: _RoundContext) -> list[BaseTool]:  # noqa: PLR0915
-        home_sequences = {
-            item.session_id: item.latest_sequence for item in context.home.items
-        }
-        home_ids = set(home_sequences)
-
-        async def open_chat(session_id: str, limit: int = 12) -> str:
+        async def open_chat(
+            session_id: str,
+            runtime: ToolRuntime,
+            limit: int = 12,
+        ) -> str:
+            context = cast("SocialAgentContext", runtime.context)
+            home_ids = set(home_sequences(context))
             if session_id not in home_ids:
                 return "session_id is not present on the current Social Home"
             if not context.spend(1):
@@ -259,8 +174,10 @@ class MainExecutive:
         async def read_more(
             session_id: str,
             before_sequence: int,
+            runtime: ToolRuntime,
             limit: int = 20,
         ) -> str:
+            context = cast("SocialAgentContext", runtime.context)
             if session_id not in context.opened:
                 return "open_chat is required before read_more"
             if not context.spend(1):
@@ -273,7 +190,12 @@ class MainExecutive:
             context.opened[session_id].extend(item.sequence for item in entries)
             return self._with_budget(self._format_entries(entries), context)
 
-        async def inspect_person(session_id: str, user_id: str) -> str:
+        async def inspect_person(
+            session_id: str,
+            user_id: str,
+            runtime: ToolRuntime,
+        ) -> str:
+            context = cast("SocialAgentContext", runtime.context)
             if session_id not in context.opened:
                 return "open_chat is required before inspect_person"
             if not context.spend(1):
@@ -290,7 +212,12 @@ class MainExecutive:
                 context,
             )
 
-        async def inspect_media(session_id: str, message_id: str) -> str:
+        async def inspect_media(
+            session_id: str,
+            message_id: str,
+            runtime: ToolRuntime,
+        ) -> str:
+            context = cast("SocialAgentContext", runtime.context)
             if session_id not in context.opened:
                 return "open_chat is required before inspect_media"
             if not context.spend(1):
@@ -310,8 +237,10 @@ class MainExecutive:
         async def search_memory(
             session_id: str,
             query: str,
+            runtime: ToolRuntime,
             limit: int = 12,
         ) -> str:
+            context = cast("SocialAgentContext", runtime.context)
             if session_id not in context.opened:
                 return "open_chat is required before search_memory"
             if not context.spend(2):
@@ -329,32 +258,60 @@ class MainExecutive:
                 context,
             )
 
-        async def skip(session_id: str, reason: str) -> str:
+        async def skip(
+            session_id: str,
+            reason: str,
+            runtime: ToolRuntime,
+        ) -> str:
+            context = cast("SocialAgentContext", runtime.context)
+            sequences = home_sequences(context)
+            home_ids = set(sequences)
             if session_id not in home_ids:
                 return "session_id is not present on the current Social Home"
-            await self.environment.mark_handled(
-                session_id,
-                through_sequence=home_sequences[session_id],
-            )
-            context.state = await self.state_store.record_skip(session_id, reason)
-            await self.providers.commit(
-                ProviderCommit(
-                    operation="skip",
-                    session_id=session_id,
-                    payload={"reason": reason},
+            if session_id in context.claimed:
+                return "an action is already running or committed for this session"
+            context.claimed.add(session_id)
+            try:
+                await self.environment.mark_handled(
+                    session_id,
+                    through_sequence=sequences[session_id],
                 )
-            )
+                context.state = await self.state_store.record_skip(session_id, reason)
+                await self.providers.commit(
+                    ProviderCommit(
+                        operation="skip",
+                        session_id=session_id,
+                        payload={"reason": reason},
+                    )
+                )
+            except Exception:
+                context.claimed.discard(session_id)
+                raise
             context.handled.add(session_id)
             context.skipped += 1
             return f"silence committed for {session_id}"
 
-        async def reply(contract: ActionContract) -> str:
+        async def reply(
+            contract: ActionContract,
+            runtime: ToolRuntime,
+        ) -> str:
+            context = cast("SocialAgentContext", runtime.context)
             session_id = contract.target_session_id
             if session_id not in context.opened:
                 return "open_chat is required before reply"
-            if context.replies >= self.config.max_replies_per_round:
+            if session_id in context.claimed:
+                return "an action is already running or committed for this session"
+            if context.reply_slots_used >= self.config.max_replies_per_round:
                 return "maximum replies for this executive round reached"
+            context.claimed.add(session_id)
+            context.reply_slots_used += 1
+
+            def release_claim() -> None:
+                context.claimed.discard(session_id)
+                context.reply_slots_used -= 1
+
             if not context.spend(2):
+                release_claim()
                 return "focus budget exhausted"
             visible_entries = await self.environment.entries_by_sequence(
                 session_id,
@@ -369,27 +326,36 @@ class MainExecutive:
                 if item not in visible_message_ids
             ]
             if undisclosed_evidence:
+                release_claim()
                 return (
                     "Action Contract cites messages not disclosed by open_chat/read_more: "
                     f"{undisclosed_evidence}"
                 )
-            visible_user_ids = {item.user_id for item in visible_entries if item.user_id}
+            visible_user_ids = {
+                item.user_id for item in visible_entries if item.user_id
+            }
             undisclosed_users = [
-                item for item in contract.target_user_ids if item not in visible_user_ids
+                item
+                for item in contract.target_user_ids
+                if item not in visible_user_ids
             ]
             if undisclosed_users:
+                release_claim()
                 return f"Action Contract targets undisclosed users: {undisclosed_users}"
             if (
                 contract.quote_message_id
                 and contract.quote_message_id not in visible_message_ids
             ):
+                release_claim()
                 return "Action Contract quotes a message that was not disclosed"
             try:
                 compiled = await self.compiler.compile(contract)
             except ContextCompilationError as exc:
+                release_claim()
                 return f"invalid Action Contract: {exc}"
             actions = await self.environment.actions_for(session_id)
             if actions is None:
+                release_claim()
                 return "the conversation has no live protocol action context"
             reply_result = await self.replyer.execute(compiled, contract, actions)
             await self.environment.commit_reply(
@@ -426,9 +392,30 @@ class MainExecutive:
                 f"{reply_result.full_text}\n[focus budget remaining={context.budget}]"
             )
 
-        async def finish(reason: str = "round complete") -> str:
+        async def finish(
+            runtime: ToolRuntime,
+            reason: str = "round complete",
+        ) -> str:
+            context = cast("SocialAgentContext", runtime.context)
             context.finished = True
             return f"executive round finished: {reason}"
+
+        # BaseTool inspects raw call signatures while executing. Resolve postponed
+        # annotations so ToolRuntime remains an injected argument, not model input.
+        for tool_function in (
+            open_chat,
+            read_more,
+            inspect_person,
+            inspect_media,
+            search_memory,
+            skip,
+            reply,
+            finish,
+        ):
+            tool_function.__annotations__ = get_type_hints(
+                tool_function,
+                include_extras=True,
+            )
 
         return [
             StructuredTool.from_function(
@@ -502,16 +489,15 @@ class MainExecutive:
         )
 
     @staticmethod
-    def _with_budget(output: str, context: _RoundContext) -> str:
+    def _with_budget(output: str, context: SocialAgentContext) -> str:
         return f"{output}\n[focus budget remaining={context.budget}]"
 
     @staticmethod
     def _round_prompt(
-        home: SocialHome,
-        state: SelfState,
-        provider_peek: list[str],
-        budget: int,
+        context: SocialAgentContext,
     ) -> str:
+        home = context.home
+        state = context.state
         visible_state = {
             "current_focus": state.current_focus,
             "active_threads": {
@@ -526,10 +512,10 @@ class MainExecutive:
                 state.last_delta.model_dump(mode="json") if state.last_delta else None
             ),
         }
-        provider_text = "\n".join(provider_peek) or "(none)"
+        provider_text = "\n".join(context.provider_peek) or "(none)"
         return (
             f"Time: {datetime.now(UTC).isoformat()}\n"
-            f"Focus budget: {budget}\n\n"
+            f"Focus budget: {context.budget}\n\n"
             f"<social_home>\n{home.as_prompt()}\n</social_home>\n\n"
             f"<self_state>\n{visible_state}\n</self_state>\n\n"
             "<world_model_peek>\n"

@@ -72,7 +72,10 @@ class Bot:
         self._should_exit.set()
 
     async def submit_event(self, event: Event) -> None:
-        if isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
+        if (
+            isinstance(event, (GroupMessageEvent, PrivateMessageEvent))
+            and "2682064633" in event.get_conversation_id()
+        ):
             await self._event_send.send(event)
 
     async def _run_adapter(self) -> None:

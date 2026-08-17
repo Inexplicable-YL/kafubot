@@ -61,6 +61,10 @@ class Event(ABC, BaseModel, Generic[AdapterT]):
         return self.get_message().get_plain_text()
 
     @abstractmethod
+    def get_conversation_id(self) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
     def is_tome(self) -> bool:
         raise NotImplementedError
 
