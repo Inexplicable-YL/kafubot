@@ -19,8 +19,6 @@ classifiers = [
 ]
 requires-python = ">=3.11,<4"
 dependencies = [
-    "sekaibot>=0.1.6",
-    "sekaibot-adapter-cqhttp>=0.1.5",
     "aiohttp>=3.11.13",
     "aiosqlite>=0.21.0",
     "anyio>=4.11.0",

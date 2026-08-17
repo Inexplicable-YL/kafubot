@@ -1,8 +1,7 @@
 import os
 from collections.abc import Callable
 from datetime import datetime
-from functools import cache
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import aiosqlite
 import anyio
@@ -16,7 +15,6 @@ from langchain.agents.middleware import (
 )
 from langchain.agents.middleware.types import _CallableReturningSystemMessage
 from langchain_core.messages import HumanMessage
-from langchain_deepseek.chat_models import DEFAULT_API_BASE, ChatDeepSeek
 from langchain_openai import OpenAIEmbeddings
 from langgraph.store.sqlite import AsyncSqliteStore
 
@@ -46,6 +44,7 @@ from agent.middlewares import (
     LongMemoryMiddleware,
     SummarizationMiddleware,
 )
+from agent.models import get_nonthinking_model, get_thinking_model
 from agent.prompts.manager import (
     BOT_NAME,
     IDENTITY,
@@ -66,7 +65,6 @@ load_dotenv()
 
 
 MAX_TRUNS = 10
-MODEL_NAME = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-flash")
 HISTORY_WINDOW = 20
 wrap_model_call_async = cast("Any", wrap_model_call)
 
@@ -115,47 +113,6 @@ async def add_time(
                 )
             ]
         )
-    )
-
-
-@cache
-def get_thinking_model(
-    reasoning_effort: Literal["high", "max"] = "high",
-) -> ChatDeepSeek:
-    if reasoning_effort == "max":
-        return ChatDeepSeek(
-            model=MODEL_NAME,
-            api_base=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE),
-            max_retries=2,
-            reasoning_effort="max",
-            extra_body={
-                "thinking": {
-                    "type": "enabled",
-                }
-            },
-        )
-    return ChatDeepSeek(
-        model=MODEL_NAME,
-        api_base=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE),
-        max_retries=2,
-        reasoning_effort="high",
-        extra_body={
-            "thinking": {
-                "type": "enabled",
-            }
-        },
-    )
-
-
-@cache
-def get_nonthinking_model(temperature: float = 0.8) -> ChatDeepSeek:
-    """Use sampling controls only where DeepSeek actually applies them."""
-    return ChatDeepSeek(
-        model=MODEL_NAME,
-        api_base=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_API_BASE),
-        temperature=temperature,
-        max_retries=2,
-        extra_body={"thinking": {"type": "disabled"}},
     )
 
 

@@ -237,7 +237,7 @@ class ActivateLimitMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         )
         if not reply:
             if text and self.notice_when_limit and runtime.context["is_tome"]:
-                await runtime.context["node"].reply(text, reply_message=True)
+                await runtime.context["actions"].reply(text, reply_message=True)
             return {
                 "jump_to": "end",
                 "outputs": [

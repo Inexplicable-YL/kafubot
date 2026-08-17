@@ -29,9 +29,7 @@ async def view_forward_message(
 ) -> str:
     try:
         messages: list[dict[str, Any]] = (
-            await runtime.context["node"].event.adapter.call_api(
-                "get_forward_msg", id=id
-            )
+            await runtime.context["actions"].call_api("get_forward_msg", id=id)
         )["messages"]
     except Exception:
         return "无法获取转发消息，请检查消息ID是否正确。"

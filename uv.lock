@@ -1398,8 +1398,6 @@ dependencies = [
     { name = "python-multipart" },
     { name = "pyyaml" },
     { name = "rich" },
-    { name = "sekaibot" },
-    { name = "sekaibot-adapter-cqhttp" },
     { name = "sqlite-vec" },
     { name = "sqlmodel" },
     { name = "structlog" },
@@ -1464,8 +1462,6 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "rich", specifier = ">=15.0.0" },
-    { name = "sekaibot", specifier = ">=0.1.6" },
-    { name = "sekaibot-adapter-cqhttp", specifier = ">=0.1.5" },
     { name = "sqlite-vec", specifier = ">=0.1.9" },
     { name = "sqlmodel", specifier = ">=0.0.38" },
     { name = "structlog", specifier = ">=25.3.0" },
@@ -3919,39 +3915,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/52/52/e57eceff0e342a1f50e274264ed47497b59e6a4e3118808ee58ddda7b74a/scipy-1.17.1-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:a77cbd07b940d326d39a1d1b37817e2ee4d79cb30e7338f3d0cddffae70fcaa2", size = 37682317, upload-time = "2026-02-23T00:22:18.513Z" },
     { url = "https://files.pythonhosted.org/packages/11/2f/b29eafe4a3fbc3d6de9662b36e028d5f039e72d345e05c250e121a230dd4/scipy-1.17.1-cp314-cp314t-win_amd64.whl", hash = "sha256:eb092099205ef62cd1782b006658db09e2fed75bffcae7cc0d44052d8aa0f484", size = 37345327, upload-time = "2026-02-23T00:22:24.442Z" },
     { url = "https://files.pythonhosted.org/packages/07/39/338d9219c4e87f3e708f18857ecd24d22a0c3094752393319553096b98af/scipy-1.17.1-cp314-cp314t-win_arm64.whl", hash = "sha256:200e1050faffacc162be6a486a984a0497866ec54149a01270adc8a59b7c7d21", size = 25489165, upload-time = "2026-02-23T00:22:29.563Z" },
-]
-
-[[package]]
-name = "sekaibot"
-version = "0.1.6"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "aiohttp" },
-    { name = "anyio" },
-    { name = "exceptiongroup" },
-    { name = "pyahocorasick" },
-    { name = "pydantic" },
-    { name = "pygtrie" },
-    { name = "pypinyin" },
-    { name = "pyyaml" },
-    { name = "structlog" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/05/87/20238435e349adbc9daa13c0ea0dff4fe3af862cb61b0c8cac5b1bcb2d40/sekaibot-0.1.6.tar.gz", hash = "sha256:1029d174d164da7149de44e22ee82c7c6f4bf7a80e2c912df0321ad65ea4066d", size = 56721, upload-time = "2026-05-20T03:50:48.571Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/4d/2b/ceeb0d83f214f242b998a001602c1583707439207366bc189f43fd2ef845/sekaibot-0.1.6-py3-none-any.whl", hash = "sha256:39a783265a21d1305d23692191542d1eba31392d523c90be5ae9050cf47713f6", size = 68015, upload-time = "2026-05-20T03:50:46.703Z" },
-]
-
-[[package]]
-name = "sekaibot-adapter-cqhttp"
-version = "0.1.5"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "sekaibot" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/07/86/ef3d2ced227e05890675d0549418f79e00ae5124354a98a0c9b258015562/sekaibot_adapter_cqhttp-0.1.5.tar.gz", hash = "sha256:a4b2b025902156672cb34487858ade5bcd26ec344dab6d4a927c68c3d781fed3", size = 11311, upload-time = "2026-05-20T03:36:15.598Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/3d/7febe646b4a673c9426b1ca812050bd722af2389e7eed04f082f822bf1a1/sekaibot_adapter_cqhttp-0.1.5-py3-none-any.whl", hash = "sha256:80867f4938299e0e65831a1bcc96c7a85ca91056c0ce2a555650118ea2ff1c58", size = 12134, upload-time = "2026-05-20T03:36:07.683Z" },
 ]
 
 [[package]]

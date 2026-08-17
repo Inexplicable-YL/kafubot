@@ -104,7 +104,7 @@ class ManagerState(AgentState):
 
 
 class ManagerContext(TypedDict):
-    node: Any
+    actions: Any
     session_id: str
     is_tome: bool
     unrestricted: bool

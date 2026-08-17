@@ -8,7 +8,6 @@ from langchain.tools import ToolRuntime, tool
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field
-from sekaibot.adapter.cqhttp.message import CQHTTPMessageSegment
 
 from agent.base import (
     ManagerContext,
@@ -16,6 +15,7 @@ from agent.base import (
     OutputMessage,
 )
 from agent.multimodal.meme import MemeResult, search_memes
+from kafubot.adapters.cqhttp.message import CQHTTPMessageSegment
 
 KEEP_SEND_HISTORY = 3
 
@@ -130,7 +130,7 @@ class MemeSendingMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             return "无法通过索引找到对应的表情包，请检查索引是否正确。"
         self.send_count[runtime.context["session_id"]] += 1
         self.send_history[runtime.context["session_id"]].append(result.analysis)
-        await runtime.context["node"].reply(
+        await runtime.context["actions"].reply(
             CQHTTPMessageSegment.image(result.base64, sub_type=1)
         )
         return Command(

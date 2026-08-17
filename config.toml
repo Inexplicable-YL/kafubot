@@ -1,72 +1,88 @@
 [bot]
-# 这里是 KafuBot 自身的配置
-event_queue_size=100
-nodes = []
-node_dirs = ["./nodes"]
-adapters = ["sekaibot.adapter.cqhttp"]
+# KafuBot 主循环：CQHTTP 事件先进入有界队列，再由统一社交运行时感知。
+event_queue_size = 100
+event_workers = 100
+adapter = "cqhttp"
 adapter_max_retries = 30
 
-
 [bot.log]
-# 这里是 KafuBot 自身日志相关的配置
 level = "INFO"
 verbose_exception = true
 
 [adapter.cqhttp]
-# 这里是 CQHTTP 适配器的配置
 adapter_type = "reverse-ws"
 host = "127.0.0.1"
 port = 8888
 url = "/cqhttp/ws"
-api_timeout=10
+api_timeout = 10
 
-[node.private_agent]
-merge_window_seconds=5
-clear_keywords=["/clear", "/清除"]
-average_reply_count=1.3
-rate_limit=[0.05, 1.8]
-activity_limits=[
-    [18000, 70],
-    [604800, 450],
+[agent]
+# 群聊、私聊都经过同一个运行时；这里的 session 只是上下文分区。
+environment_message_limit = 100
+image_analyzer_workers = 10
+clear_keywords = ["/clear", "/清除"]
+ignore_user_ids = [2830758180]
+
+# 这些会话即使没有直接 @ 也允许 Global Gate 判断是否介入。
+proactive_sessions = [
+    "group_596488203",
+    "group_1011357049",
+    "group_1058218429",
+    "group_1087911123",
+    "group_834922207",
+    "group_895484096",
+    "group_648749016",
+    "group_752699901",
+    "group_913873554",
+    "group_954012874",
+    "group_897593721",
+    "group_1048490205",
+    "group_172844144",
+    "group_565525468",
+    "group_154243984",
+    "group_924342546",
+    "group_1074180418",
+    "group_983497050",
+    "group_646553634",
+    "group_779261674",
 ]
 
-[node.group_agent]
-unrestricted_groups=[
-    596488203,
-    1011357049,
-    1058218429,
-    1087911123,
-    834922207,
-    895484096,
-]
-auto_reply_groups=[
-    648749016,
-    752699901,
-    913873554,
-    954012874,
-    897593721,
-    1048490205,
-    172844144,
-    565525468,
-    154243984,
-    924342546,
-    1074180418,
-    983497050,
-    646553634,
-    779261674,
-]
-reply_keywords=[
+talk_value = 0.18
+reply_keywords = [
     ["可不", 0.7],
     ["星界", 0.6],
     ["花谱", 0.5],
     ["里命", 0.2],
     ["情绪", 0.1],
 ]
-clear_keywords=["/clear", "/清除"]
-talk_value=0.18
-average_reply_count=1.3
-rate_limit=[0.08, 1.8]
-activity_limits=[
-    [18000, 60],
-    [604800, 450],
-]
+[agent.gate]
+# Gate 只决定是否唤醒唯一主循环，不决定是否回复。
+threshold = 0.75
+debounce_seconds = 1.5
+idle_wake_seconds = 30
+novelty_per_message = 0.2
+max_novelty = 0.8
+residue_half_life_seconds = 180
+
+[agent.attention]
+directedness = 1.4
+social_obligation = 0.8
+relationship = 0.35
+urgency = 0.45
+continuity = 0.9
+novelty = 0.55
+fatigue = 0.55
+interruption = 0.35
+random_jitter = 0.03
+residue_half_life_seconds = 180
+
+[agent.executive]
+home_session_limit = 12
+initial_chat_messages = 12
+read_page_size = 20
+focus_budget = 12
+max_steps = 10
+max_replies_per_round = 3
+context_message_limit = 36
+recent_action_limit = 30
+state_file = ".database/agent_loop_state.json"

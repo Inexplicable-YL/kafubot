@@ -32,7 +32,6 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command
 from numpy import random
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
-from sekaibot.adapter.cqhttp.message import CQHTTPMessageSegment
 
 from agent.base import (
     MODEL_VISIBLE_TZ,
@@ -55,6 +54,7 @@ from agent.prompts.replyer import (
 from agent.session import register_session_clearer
 from agent.telemetry import log_social_event
 from agent.utils import content_to_text, to_reply
+from kafubot.adapters.cqhttp.message import CQHTTPMessageSegment
 
 logger = logging.getLogger(__name__)
 
@@ -435,17 +435,17 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
                 full_text += msg.get_msgcode() + "\n"
                 for seg in raw_cq_msg:
                     if seg.type == "image":
-                        await runtime.context["node"].reply(seg)
+                        await runtime.context["actions"].reply(seg)
                         break
                 else:
                     if quote_message_id:
-                        await runtime.context["node"].reply(
+                        await runtime.context["actions"].reply(
                             CQHTTPMessageSegment.reply(int(quote_message_id))
                             + raw_cq_msg
                         )
                         quote_message_id = ""
                     else:
-                        await runtime.context["node"].reply(raw_cq_msg)
+                        await runtime.context["actions"].reply(raw_cq_msg)
         full_text = full_text.strip()
         if not full_text:
             return "回复失败：无法生成回复。"
@@ -676,8 +676,7 @@ class InteractionMiddleware(AgentMiddleware[ManagerState, ManagerContext, Any]):
             }
             if (
                 not needs_complete_answer
-                and
-                self.real_average_count[config["configurable"]["session_id"]]
+                and self.real_average_count[config["configurable"]["session_id"]]
                 >= self.average_reply_count
             ):
                 payload["reply_style"] = LESS_REPLY

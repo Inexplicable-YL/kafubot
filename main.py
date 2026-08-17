@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
-from sekaibot import Bot
+
+from kafubot import Bot
 
 load_dotenv()
 
