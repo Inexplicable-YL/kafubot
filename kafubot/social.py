@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Protocol, cast
-from zoneinfo import ZoneInfo
 
 import anyio
 from langchain.agents import AgentState
@@ -285,16 +284,10 @@ class SocialAgentRuntime:
             list(session.entries),
             lambda file: self.get_image(actions, file),
         )
-        if event.reply and event.reply.time:
-            time_text = (
-                datetime.fromtimestamp(event.reply.time, tz=UTC)
-                .astimezone(ZoneInfo("Asia/Shanghai"))
-                .strftime("%Y-%m-%d %H:%M:%S")
-            )
+        if event.reply:
             message = (
                 QQMessageSegment.reply(
-                    time_text,
-                    str(event.reply.message_id),
+                    message_id=str(event.reply.message_id),
                     include={"message_id"},
                 )
                 + message

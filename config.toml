@@ -57,6 +57,8 @@ random_jitter = 0.03
 residue_half_life_seconds = 180
 
 [agent.executive]
+# Internal timestamps remain UTC; this IANA timezone is only used in LLM context.
+display_timezone = "Auto"
 home_session_limit = 12
 initial_chat_messages = 12
 read_page_size = 20

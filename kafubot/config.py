@@ -3,8 +3,9 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 from typing import Any, ClassVar, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ConfigModel(BaseModel):
@@ -73,6 +74,19 @@ class ExecutiveConfig(ConfigModel):
     context_message_limit: int = Field(default=36, ge=1)
     recent_action_limit: int = Field(default=30, ge=1)
     state_file: str = ".database/agent_loop_state.json"
+    display_timezone: str = "Auto"
+
+    @field_validator("display_timezone")
+    @classmethod
+    def validate_display_timezone(cls, value: str) -> str:
+        timezone_name = value.strip()
+        if timezone_name.casefold() == "auto":
+            return "Auto"
+        try:
+            ZoneInfo(timezone_name)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError(f"unknown IANA timezone: {value!r}") from exc
+        return timezone_name
 
 
 class AgentConfig(ConfigModel):

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING, Any, cast, get_type_hints
 from typing_extensions import override
+from zoneinfo import ZoneInfo
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.tools import ToolRuntime  # noqa: TC002 - inspected at runtime by tools
@@ -33,6 +34,31 @@ if TYPE_CHECKING:
     from .state import SelfStateStore
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_local_timezone() -> tuple[tzinfo, str]:
+    local_now = datetime.now().astimezone()
+    local_timezone = local_now.tzinfo
+    if local_timezone is None:
+        raise RuntimeError("the operating system returned no local timezone")
+    timezone_name = (
+        getattr(local_timezone, "key", None)
+        or local_now.tzname()
+        or str(local_timezone)
+    )
+    if not timezone_name:
+        raise RuntimeError("the operating system returned an unnamed local timezone")
+    return local_timezone, timezone_name
+
+
+def _resolve_display_timezone(value: str) -> tuple[tzinfo, str]:
+    if value != "Auto":
+        return ZoneInfo(value), value
+    try:
+        return _detect_local_timezone()
+    except Exception:
+        logger.warning("Failed to detect local timezone; falling back to UTC")
+        return UTC, "UTC"
 
 EXECUTIVE_PROMPT = """
 You are the single Main Executive of a social agent. There is one identity and one
@@ -130,6 +156,9 @@ class ExecutiveMiddleware(
         self.providers = providers
         self.state_store = state_store
         self.config = config
+        self._display_timezone, self._display_timezone_name = (
+            _resolve_display_timezone(config.display_timezone)
+        )
         self.tools = self._build_tools()
         tools_by_name = {tool.name: tool for tool in self.tools}
         self._home_tools = [tools_by_name[name] for name in ("open_chat", "finish")]
@@ -642,30 +671,44 @@ class ExecutiveMiddleware(
         compacted.extend(messages[cursor:])
         return compacted
 
-    @staticmethod
-    def _format_entries(entries: list[Any]) -> str:
+    def _format_entries(self, entries: list[Any]) -> str:
         if not entries:
             return "(no messages in this range)"
         return "\n".join(
             (
-                f"[{item.sequence}] {item.timestamp.isoformat()} | "
+                f"[{item.sequence}] {self._display_datetime(item.timestamp)} | "
                 f"{item.user} (QQ {item.user_id}, message_id={item.message_id}, "
                 f"directed={item.directed_to_bot}): {item.content}"
                 if item.role == "user"
                 else (
-                    f"[{item.sequence}] {item.timestamp.isoformat()} | "
+                    f"[{item.sequence}] {self._display_datetime(item.timestamp)} | "
                     f"agent: {item.content}"
                 )
             )
             for item in entries
         )
 
+    def _display_datetime(self, value: datetime) -> str:
+        aware_value = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return aware_value.astimezone(self._display_timezone).isoformat()
+
+    def _for_display(self, value: Any) -> Any:
+        if isinstance(value, datetime):
+            return self._display_datetime(value)
+        if isinstance(value, BaseModel):
+            return self._for_display(value.model_dump(mode="python"))
+        if isinstance(value, dict):
+            return {key: self._for_display(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._for_display(item) for item in value]
+        return value
+
     @staticmethod
     def _with_budget(output: str, context: SocialAgentContext) -> str:
         return f"{output}\n[focus budget remaining={context.budget}]"
 
-    @staticmethod
     def _round_prompt(
+        self,
         context: SocialAgentContext,
     ) -> str:
         home = context.home
@@ -673,16 +716,14 @@ class ExecutiveMiddleware(
         visible_state = {
             "current_focus": state.current_focus,
             "active_threads": {
-                key: value.model_dump(mode="json")
+                key: self._for_display(value)
                 for key, value in state.active_threads.items()
             },
             "recent_actions": [
-                item.model_dump(mode="json") for item in state.recent_actions[-8:]
+                self._for_display(item) for item in state.recent_actions[-8:]
             ],
             "fatigue_by_session": state.fatigue_by_session,
-            "last_delta": (
-                state.last_delta.model_dump(mode="json") if state.last_delta else None
-            ),
+            "last_delta": self._for_display(state.last_delta),
         }
         provider_text = "\n".join(context.provider_peek) or "(none)"
         if context.open_session_id is None:
@@ -702,7 +743,8 @@ class ExecutiveMiddleware(
                 "quit return to HOME."
             )
         return (
-            f"Time: {datetime.now(UTC).isoformat()}\n"
+            f"Time ({self._display_timezone_name}): "
+            f"{self._display_datetime(datetime.now(UTC))}\n"
             f"Focus budget: {context.budget}\n\n"
             f"<social_home>\n{home.as_prompt()}\n</social_home>\n\n"
             f"<self_state>\n{visible_state}\n</self_state>\n\n"
