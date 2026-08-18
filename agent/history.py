@@ -24,9 +24,7 @@ TABLE_NAME = "agent_history"
 
 MODEL_VISIBLE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 CHAT_HISTORY_MAX_MESSAGES = 100
-_QQ_METADATA_RE = re.compile(
-    r"<qq-user-message\s+metadata=(['\"])(.*?)\1>", re.DOTALL
-)
+_QQ_METADATA_RE = re.compile(r"<qq-user-message\s+metadata=(['\"])(.*?)\1>", re.DOTALL)
 
 
 def _extract_qq_metadata(content: str) -> dict[str, Any]:

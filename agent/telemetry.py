@@ -57,7 +57,9 @@ class _TelemetryWriter:
         try:
             self._send_stream.send_nowait(record)
         except anyio.WouldBlock:
-            logger.warning("social telemetry queue full; dropping event=%s", record.get("event"))
+            logger.warning(
+                "social telemetry queue full; dropping event=%s", record.get("event")
+            )
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             return
 

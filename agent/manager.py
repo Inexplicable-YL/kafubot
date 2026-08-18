@@ -219,6 +219,7 @@ async def create_agent_service():  # noqa: PLR0915
                 for item in metrics.get("attributed_followups", [])
                 if item.get("message_id")
             ]
+
             async def apply_behavior_effect() -> None:
                 await behavior_middleware.apply_observable_effect(
                     behavior_ids=pending.selected_behavior_ids,

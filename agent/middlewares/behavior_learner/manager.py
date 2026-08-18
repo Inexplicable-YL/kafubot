@@ -2534,7 +2534,8 @@ class BehaviorPatternSelector:
                     continue
                 ranked = dict(candidate)
                 ranked["behavior_retrieval_score"] = round(
-                    shared_count / max(1, len(context_tokens))
+                    shared_count
+                    / max(1, len(context_tokens))
                     * self._candidate_weight(candidate),
                     4,
                 )

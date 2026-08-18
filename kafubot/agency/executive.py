@@ -341,9 +341,8 @@ class ExecutiveMiddleware(
             context.skipped += 1
             context.open_session_id = None
             context.finished = to_finish
-            result = (
-                f"closed {session_id} without replying and returned to HOME"
-                + ("; executive round finished" if to_finish else "")
+            result = f"closed {session_id} without replying and returned to HOME" + (
+                "; executive round finished" if to_finish else ""
             )
             self._record_open_summary(
                 context,

@@ -474,9 +474,7 @@ class ExpressionSelector:
                 )
             expressions = list((await session.scalars(statement)).all())
             expression_ids = [
-                expression.id
-                for expression in expressions
-                if expression.id is not None
+                expression.id for expression in expressions if expression.id is not None
             ]
             effect_rows = {
                 row.expression_id: row

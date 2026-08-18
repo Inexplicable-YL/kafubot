@@ -91,9 +91,7 @@ class BaseDaemonMiddleware(
         self._max_batches_per_session = max(16, max_sessions * 2)
         self._max_batch_window_size = max(1, max_batch_window_size)
         self._coalesce_seconds = max(0.0, coalesce_seconds)
-        self._session_limiter = anyio.CapacityLimiter(
-            max(1, max_concurrent_sessions)
-        )
+        self._session_limiter = anyio.CapacityLimiter(max(1, max_concurrent_sessions))
 
         self._pending_batches: LRUCache[str, deque[BatchT]] = LRUCache(
             maxsize=max_sessions
@@ -200,7 +198,9 @@ class BaseDaemonMiddleware(
                 maxlen=self._max_batches_per_session
             )
         self._pending_batches[session_id].append(batch)
-        self._enqueue_versions[session_id] = self._enqueue_versions.get(session_id, 0) + 1
+        self._enqueue_versions[session_id] = (
+            self._enqueue_versions.get(session_id, 0) + 1
+        )
         await self._queue_job(session_id)
 
     async def _save_worker(

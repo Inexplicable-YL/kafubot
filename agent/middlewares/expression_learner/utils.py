@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import random
@@ -107,7 +107,9 @@ def _normalize_repair_json_result(repaired_result: Any) -> str:
         if isinstance(first_item, str):
             return first_item
         return json.dumps(first_item, ensure_ascii=False)
-    raise TypeError(f"repair_json 杩斿洖浜嗘棤娉曞鐞嗙殑缁撴灉绫诲瀷: {type(repaired_result)}")
+    raise TypeError(
+        f"repair_json 杩斿洖浜嗘棤娉曞鐞嗙殑缁撴灉绫诲瀷: {type(repaired_result)}"
+    )
 
 
 def _strip_markdown_code_fence(text: str) -> str:
@@ -128,7 +130,9 @@ def _extract_json_object_candidate(text: str) -> str:
 
 
 def _extract_reason_from_text(text: str) -> str | None:
-    reason_key_match = re.search(r'["鈥溾€漖?reason["鈥溾€漖?\s*:\s*', text, re.IGNORECASE)
+    reason_key_match = re.search(
+        r'["鈥溾€漖?reason["鈥溾€漖?\s*:\s*', text, re.IGNORECASE
+    )
     if reason_key_match is None:
         return None
 
@@ -401,4 +405,3 @@ __all__ = [
     "strip_json_code_fence",
     "weighted_sample",
 ]
-

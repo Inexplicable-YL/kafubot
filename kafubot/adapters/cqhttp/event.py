@@ -179,9 +179,7 @@ class MessageEvent(CQHTTPEvent):
     def get_session_id(self) -> str:
         group_id = getattr(self, "group_id", None)
         return (
-            f"group_{group_id}_{self.get_user_id()}"
-            if group_id
-            else self.get_user_id()
+            f"group_{group_id}_{self.get_user_id()}" if group_id else self.get_user_id()
         )
 
     @override
@@ -235,9 +233,7 @@ class NoticeEvent(CQHTTPEvent):
     def get_session_id(self) -> str:
         group_id = getattr(self, "group_id", None)
         return (
-            f"group_{group_id}_{self.get_user_id()}"
-            if group_id
-            else self.get_user_id()
+            f"group_{group_id}_{self.get_user_id()}" if group_id else self.get_user_id()
         )
 
 
@@ -423,9 +419,7 @@ class RequestEvent(CQHTTPEvent):
     def get_session_id(self) -> str:
         group_id = getattr(self, "group_id", None)
         return (
-            f"group_{group_id}_{self.get_user_id()}"
-            if group_id
-            else self.get_user_id()
+            f"group_{group_id}_{self.get_user_id()}" if group_id else self.get_user_id()
         )
 
     async def approve(self) -> dict[str, Any]:

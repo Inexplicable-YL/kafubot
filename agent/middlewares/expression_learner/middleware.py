@@ -246,9 +246,7 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
             config_resolver=expression_config_resolver,
         )
         self._learning_gate = ExpressionLearningBatchGate(max_concurrent_learners)
-        self._prepared_selection_cache: dict[
-            str, PreparedExpressionSelection
-        ] = {}
+        self._prepared_selection_cache: dict[str, PreparedExpressionSelection] = {}
         self._learning_backlog: dict[str, deque[ExpressionMessageRecord]] = {}
 
     def _get_expression_config(self, session_id: str) -> tuple[bool, bool]:
@@ -271,7 +269,9 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         try:
             resolved = self._expression_group_resolver(session_id)
         except Exception:
-            logger.exception("Failed to resolve expression group scope for %s", session_id)
+            logger.exception(
+                "Failed to resolve expression group scope for %s", session_id
+            )
             return normalize_expression_scope(session_id, None)
         return normalize_expression_scope(session_id, resolved)
 
@@ -888,8 +888,8 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         session_id: str,
     ) -> tuple[ExpressionEntry, float] | None:
         try:
-            related_session_ids, has_global_share = self._resolve_expression_group_scope(
-                session_id
+            related_session_ids, has_global_share = (
+                self._resolve_expression_group_scope(session_id)
             )
             async with self._db.session(auto_commit=False) as session:
                 statement = select(ExpressionRecord)

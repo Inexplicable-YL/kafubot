@@ -67,9 +67,7 @@ class Adapter(ABC, Generic[EventT, ConfigT]):
         config_class = self.Config
         if config_class is None:
             return cast("ConfigT", None)
-        config_name = str(
-            getattr(config_class, "__config_name__", None) or self.name
-        )
+        config_name = str(getattr(config_class, "__config_name__", None) or self.name)
         adapter_config = self.bot.config.adapter
         raw_config = (
             adapter_config.get(config_name, {})

@@ -39,7 +39,9 @@ class ContextCompiler:
         by_id = {item.message_id: item for item in user_messages if item.message_id}
         evidence_ids = list(dict.fromkeys(contract.evidence_message_ids))
         if not evidence_ids:
-            raise ContextCompilationError("at least one evidence_message_id is required")
+            raise ContextCompilationError(
+                "at least one evidence_message_id is required"
+            )
         for message_id in evidence_ids:
             if message_id in by_id:
                 continue
@@ -70,7 +72,9 @@ class ContextCompiler:
             if contract.quote_message_id not in by_id:
                 raise ContextCompilationError("quote_message_id is not visible")
             if not contract.quote_message_id.isdigit():
-                raise ContextCompilationError("quote_message_id must be a QQ numeric id")
+                raise ContextCompilationError(
+                    "quote_message_id must be a QQ numeric id"
+                )
 
         provider_context: list[str] = []
 

@@ -167,9 +167,7 @@ class BehaviorFeedbackContext:
 class PendingBehaviorAnalysisBatch:
     session_id: str
     messages: list[BaseMessage]
-    selected_references: list[BehaviorReferenceCandidate] = field(
-        default_factory=list
-    )
+    selected_references: list[BehaviorReferenceCandidate] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -910,7 +908,9 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         ):
             prepared = None
         self._turn_selection_cache[session_id] = (
-            prepared.selection if prepared is not None else BehaviorPatternRetrievalResult()
+            prepared.selection
+            if prepared is not None
+            else BehaviorPatternRetrievalResult()
         )
         return None
 
@@ -935,9 +935,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         messages = (
             list(state.get("currents") or [])
             if replied
-            else cast(
-                "list[BaseMessage] | None", state.get("summary_pruned_messages")
-            )
+            else cast("list[BaseMessage] | None", state.get("summary_pruned_messages"))
         )
         if messages:
             await self._enqueue_batch(
@@ -1063,9 +1061,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             except Exception as exc:
                 task_errors.append(exc)
 
-        run_learning_task = (
-            len(learning_records) >= self.min_messages_for_extraction
-        )
+        run_learning_task = len(learning_records) >= self.min_messages_for_extraction
         if not run_learning_task:
             logger.debug(
                 "%s 行为学习消息不足: 可学习=%s 阈值=%s",

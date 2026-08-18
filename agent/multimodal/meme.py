@@ -270,9 +270,7 @@ def _exact_similarity_search_with_relevance_scores(
         embeddings_by_id = _read_embeddings_by_id(collection, ids)
         missing_embedding_count += len(ids) - len(embeddings_by_id)
 
-        for id_, page_content, metadata in zip(
-            ids, documents, metadatas, strict=False
-        ):
+        for id_, page_content, metadata in zip(ids, documents, metadatas, strict=False):
             embedding = embeddings_by_id.get(id_)
             if embedding is None or page_content is None:
                 continue
@@ -299,8 +297,7 @@ def _exact_similarity_search_with_relevance_scores(
         )
     ranked.sort(key=lambda item: item[0])
     return [
-        (document, relevance_score_fn(distance))
-        for distance, document in ranked[:k]
+        (document, relevance_score_fn(distance)) for distance, document in ranked[:k]
     ]
 
 
@@ -342,10 +339,7 @@ async def _similarity_search_with_relevance_scores(
             )
         )
 
-    return [
-        (document, relevance_score_fn(distance))
-        for document, distance in results
-    ]
+    return [(document, relevance_score_fn(distance)) for document, distance in results]
 
 
 async def search_meme(

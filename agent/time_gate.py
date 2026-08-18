@@ -251,7 +251,9 @@ class _TimeGate(BaseModel):
         self.state = _State.IDLE
         self.pressure = 0.0
         self.ignore_count = 0
-        self.last_ai_timestamp = timestamp if timestamp is not None else self.last_timestamp
+        self.last_ai_timestamp = (
+            timestamp if timestamp is not None else self.last_timestamp
+        )
         self.last_allowed = False
 
     def _observe_ignore(self) -> None:
