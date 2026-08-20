@@ -13,7 +13,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from agent.conversation import MessageEvent, _SessionGraph  # noqa: E402
+from kafubot.cognition.plugins.conversation import (  # noqa: E402
+    MessageEvent,
+    _SessionGraph,
+)
 
 
 async def load_events(db_path: Path, session_id: str) -> list[MessageEvent]:

@@ -17,11 +17,11 @@ from aiohttp import web
 from aiohttp.multipart import BodyPartReader
 from anyio.to_thread import run_sync
 
-from agent.multimodal.image import (
+from kafubot.cognition.media.image import (
     get_analyzer,
     read_image,
 )
-from agent.multimodal.meme import (
+from kafubot.cognition.plugins.meme.backend import (
     MEME_CHROMA_PATH,
     MEME_PHASH_DISTANCE,
     add_memes,

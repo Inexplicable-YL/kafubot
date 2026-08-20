@@ -17,7 +17,7 @@ from kafubot.adapters import get_adapter_class
 from kafubot.adapters.cqhttp.event import GroupMessageEvent, PrivateMessageEvent
 from kafubot.config import AppConfig, load_config
 from kafubot.log import configure_logging, logger
-from kafubot.social import SocialAgentRuntime
+from kafubot.runtimes import AgentRuntime, create_agent_runtime
 
 ShutdownCallback = Callable[[], Awaitable[None]]
 ChatMessageEvent: TypeAlias = GroupMessageEvent | PrivateMessageEvent
@@ -33,8 +33,8 @@ class Bot:
             self.config.bot.log.level,
             self.config.bot.log.verbose_exception,
         )
-        self.social_runtime = SocialAgentRuntime(self.config.agent)
-        self._shutdown_callbacks: list[ShutdownCallback] = [self.social_runtime.aclose]
+        self.agent_runtime: AgentRuntime = create_agent_runtime(self.config.agent)
+        self._shutdown_callbacks: list[ShutdownCallback] = [self.agent_runtime.aclose]
         self._should_exit = anyio.Event()
         self._event_send, self._event_receive = anyio.create_memory_object_stream[
             ChatMessageEvent
@@ -52,7 +52,7 @@ class Bot:
             async with anyio.create_task_group() as task_group:
                 task_group.start_soon(self._run_adapter)
                 task_group.start_soon(self._watch_signals)
-                task_group.start_soon(self.social_runtime.run)
+                task_group.start_soon(self.agent_runtime.run)
                 for _ in range(self.config.bot.event_workers):
                     task_group.start_soon(
                         self._event_worker,
@@ -72,10 +72,7 @@ class Bot:
         self._should_exit.set()
 
     async def submit_event(self, event: Event) -> None:
-        if (
-            isinstance(event, (GroupMessageEvent, PrivateMessageEvent))
-            and "2682064633" in event.get_conversation_id()
-        ):
+        if isinstance(event, (GroupMessageEvent, PrivateMessageEvent)):
             await self._event_send.send(event)
 
     async def _run_adapter(self) -> None:
@@ -92,7 +89,7 @@ class Bot:
             async for event in receive:
                 try:
                     logger.debug("Handling chat event", event_name=event.event_name)
-                    await self.social_runtime.handle(event)
+                    await self.agent_runtime.handle(event)
                 except anyio.get_cancelled_exc_class():
                     raise
                 except Exception:

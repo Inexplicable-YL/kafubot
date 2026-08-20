@@ -68,3 +68,69 @@ max_replies_per_round = 3
 context_message_limit = 36
 recent_action_limit = 30
 state_file = ".database/agent_loop_state.json"
+
+[agent.plugins.environment]
+enabled = true
+
+[agent.plugins.self_state]
+enabled = true
+
+[agent.plugins.model]
+enabled = true
+
+[agent.plugins.ingress]
+enabled = true
+
+[agent.plugins.attention]
+enabled = true
+
+[agent.plugins.world_model]
+enabled = true
+
+[agent.plugins.replyer]
+enabled = true
+
+[agent.plugins.interaction]
+enabled = true
+
+[agent.plugins.social_signals]
+enabled = true
+
+[agent.plugins.conversation]
+enabled = true
+
+[agent.plugins.reply_effects]
+enabled = true
+
+[agent.plugins.limiter]
+enabled = true
+
+[agent.plugins.meme]
+enabled = true
+
+[agent.plugins.jargon]
+enabled = true
+
+[agent.plugins.memory]
+enabled = true
+
+[agent.plugins.summarization]
+enabled = true
+
+[agent.plugins.behavior]
+enabled = true
+
+[agent.plugins.expression]
+enabled = true
+
+[agent.plugins.prompt]
+enabled = true
+
+[agent.plugins.clock]
+enabled = true
+
+[agent.plugins.search_song]
+enabled = true
+
+[agent.plugins.view_message]
+enabled = true

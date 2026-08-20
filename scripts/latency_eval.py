@@ -11,13 +11,13 @@ from typing_extensions import override
 import anyio
 from langchain_core.messages import AIMessage
 
-from agent.base import UserMessage
-from agent.message import QQMessage
-from agent.social_signals import (
+from kafubot.cognition.message import QQMessage
+from kafubot.cognition.plugins.social_signals import (
     SocialSignalAnalysis,
     SocialSignalAnalyzer,
     SocialSignalService,
 )
+from kafubot.cognition.types import UserMessage
 
 
 @dataclass(slots=True)

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from kafubot.cognition.types import UserMessage
 
 
 class ToneVector(BaseModel):
@@ -31,6 +34,11 @@ class ActionContract(BaseModel):
     behavior: str = Field(description="Speech act and visible behavior to realize.")
     expected_effect: str = Field(description="Expected observable social effect.")
     facts_to_preserve: list[str] = Field(default_factory=list, max_length=8)
+    meme_intent: str = Field(
+        default="",
+        description="Optional visual reaction intent; empty means no meme should be sent.",
+        max_length=160,
+    )
     tone: ToneVector = Field(default_factory=ToneVector)
 
 
@@ -46,6 +54,7 @@ class TimelineEntry(BaseModel):
     message_id: str = ""
     directed_to_bot: bool = False
     has_media: bool = False
+    raw: UserMessage | None = Field(default=None, exclude=True)
 
 
 class ConversationCandidate(BaseModel):

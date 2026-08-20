@@ -89,6 +89,13 @@ class ExecutiveConfig(ConfigModel):
         return timezone_name
 
 
+class PluginSettings(ConfigModel):
+    """Enable one cognitive component and pass its component-owned options."""
+
+    enabled: bool = True
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentConfig(ConfigModel):
     """Configuration for the single social/cognitive runtime."""
 
@@ -102,6 +109,10 @@ class AgentConfig(ConfigModel):
     gate: GateConfig = GateConfig()
     attention: AttentionConfig = AttentionConfig()
     executive: ExecutiveConfig = ExecutiveConfig()
+    plugins: dict[str, PluginSettings] = Field(default_factory=dict)
+
+    def plugin(self, name: str, *, default_enabled: bool = True) -> PluginSettings:
+        return self.plugins.get(name, PluginSettings(enabled=default_enabled))
 
 
 class AppConfig(ConfigModel):
