@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import anyio
 from pydantic import BaseModel, Field
 
-from kafubot.cognition.plugins.base import (
-    PluginContext,
-    PluginDefinition,
-    PluginHost,
-)
-
 if TYPE_CHECKING:
     from kafubot.agency.models import SelfState, SocialHome
-
-    from .environment import SocialEnvironment
+    from kafubot.cognition.plugins.environment import SocialEnvironment
 
 
 class ProviderQuery(BaseModel):
@@ -33,7 +26,7 @@ class ProviderCommit(BaseModel):
 
 
 class WorldModelProvider(Protocol):
-    """Read/read-more/write boundary for middleware-like world knowledge."""
+    """Read/read-more/write boundary for plugin-provided world knowledge."""
 
     name: str
 
@@ -145,21 +138,3 @@ class ConversationWorldProvider:
 
     async def aclose(self) -> None:
         return
-
-
-def apply(context: PluginContext, _config: Any) -> None:
-    environment = cast("SocialEnvironment", context.service("environment"))
-    context.provider(ConversationWorldProvider(environment))
-
-    def assemble() -> None:
-        host = cast("PluginHost", context.service("plugin_host"))
-        context.provide("world_model", WorldModelHub([*context.providers(), host]))
-
-    context.ready(assemble)
-
-
-plugin = PluginDefinition(
-    name="world_model",
-    apply=apply,
-    requires=("environment",),
-)

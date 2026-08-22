@@ -5,13 +5,11 @@ import json
 from collections import Counter, defaultdict, deque
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
-from typing_extensions import override
 
 import aiosqlite
 import anyio
 import jieba
-from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import BaseModel, Field
 
 from kafubot.cognition.message import QQMessage
@@ -23,13 +21,12 @@ from kafubot.cognition.plugins.social_signals import (
     is_reliable_signal,
 )
 from kafubot.cognition.telemetry import log_social_event
-from kafubot.cognition.types import ManagerContext, ManagerState, UserMessage
+from kafubot.cognition.types import UserMessage
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from anyio.abc import TaskGroup
-    from langgraph.runtime import Runtime
 
     from kafubot.cognition.plugins.lifecycle import (
         ObservationEvent,
@@ -218,8 +215,8 @@ class _SessionGraph:
         self.bot_recently_spoke = False
         self.social_signals: dict[str, SocialSignalAnalysis] = {}
 
-    @staticmethod
-    def _tokens(event: MessageEvent) -> set[str]:
+    @classmethod
+    def _tokens(cls, event: MessageEvent) -> set[str]:
         return {
             normalized
             for token in jieba.lcut(event.text)
@@ -512,9 +509,7 @@ class _SessionGraph:
         )
 
 
-class ConversationFrameMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
-    state_schema = ManagerState
-
+class ConversationTracker:
     def __init__(
         self,
         db_path: str = ".database/qq_event_ledger.db",
@@ -753,18 +748,6 @@ class ConversationFrameMiddleware(AgentMiddleware[ManagerState, ManagerContext])
             )
             await db.commit()
 
-    @override
-    async def abefore_agent(
-        self, state: ManagerState, runtime: Runtime[ManagerContext]
-    ) -> dict[str, Any] | None:
-        session_id = runtime.context["session_id"]
-        frame = await self.observe_messages(
-            session_id,
-            state.get("inputs", []),
-            state.get("histories", []),
-        )
-        return {"conversation_frame": frame}
-
     async def observe_messages(
         self,
         session_id: str,
@@ -813,31 +796,6 @@ class ConversationFrameMiddleware(AgentMiddleware[ManagerState, ManagerContext])
         )
         return frame
 
-    @override
-    async def awrap_model_call(
-        self, request: ModelRequest[ManagerContext], handler: Any
-    ) -> ModelResponse:
-        frame = request.state.get("conversation_frame")
-        if isinstance(frame, ConversationFrame):
-            request = request.override(
-                messages=[
-                    HumanMessage(
-                        content=frame.to_prompt_text(),
-                        additional_kwargs={"lc_source": "conversation_frame"},
-                    ),
-                    *request.messages,
-                ]
-            )
-        return await handler(request)
-
-    @override
-    async def aafter_agent(
-        self, state: ManagerState, runtime: Runtime[ManagerContext]
-    ) -> dict[str, Any] | None:
-        if any(output["type"] in {"reply", "meme"} for output in state["outputs"]):
-            self.record_reply(runtime.context["session_id"])
-        return None
-
     def record_reply(self, session_id: str) -> None:
         graph = self._graphs.get(session_id)
         if graph is not None:
@@ -855,7 +813,7 @@ class ConversationFrameMiddleware(AgentMiddleware[ManagerState, ManagerContext])
 
 
 def apply(context: PluginContext, config: dict[str, Any]) -> None:
-    analyzer = ConversationFrameMiddleware(
+    analyzer = ConversationTracker(
         signal_service=cast("SocialSignalService", context.service("social_signals")),
         **config,
     )
@@ -895,7 +853,7 @@ plugin = PluginDefinition(
 
 __all__ = [
     "ConversationFrame",
-    "ConversationFrameMiddleware",
+    "ConversationTracker",
     "AddresseeHypothesis",
     "EvidenceLink",
     "GroupState",

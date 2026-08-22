@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
@@ -8,6 +9,7 @@ import pytest
 from langchain.tools import tool
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from kafubot.agency.models import TimelineEntry
 from kafubot.cognition.plugins.base import (
     PluginCatalog,
     PluginContext,
@@ -15,6 +17,7 @@ from kafubot.cognition.plugins.base import (
     PluginHost,
     ToolScope,
 )
+from kafubot.cognition.plugins.lifecycle import ContextWindowEvicted
 from kafubot.cognition.plugins.loader import discover_plugins
 from kafubot.config import PluginSettings
 
@@ -149,6 +152,42 @@ def test_host_is_instance_scoped_and_honors_toggles() -> None:
         await second.aclose()
 
     anyio.run(scenario)
+
+
+def test_plugin_api_dispatches_native_context_eviction_hooks() -> None:
+    received: list[tuple[str, tuple[int, ...]]] = []
+
+    def apply(context: PluginContext, _config: Any) -> None:
+        def evicted(event: ContextWindowEvicted) -> None:
+            received.append(
+                (event.session_id, tuple(entry.sequence for entry in event.entries))
+            )
+
+        context.on_context_evicted(evicted)
+
+    async def scenario() -> None:
+        host = await PluginHost.build(
+            PluginCatalog([PluginDefinition("learner", apply)]),
+            {},
+        )
+        event = ContextWindowEvicted(
+            session_id="session",
+            entries=(
+                TimelineEntry(
+                    sequence=4,
+                    role="assistant",
+                    timestamp=datetime.now(UTC),
+                    content="outside",
+                ),
+            ),
+        )
+        await host.context_evicted(event)
+        await host.aclose()
+
+    anyio.run(scenario)
+    assert received == [("session", (4,))]
+    assert not hasattr(PluginContext, "middleware")
+    assert not hasattr(PluginHost, "middleware")
 
 
 def test_plugin_consumes_dependency_service_through_its_context() -> None:

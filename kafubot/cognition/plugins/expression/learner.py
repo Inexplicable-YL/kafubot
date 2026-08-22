@@ -1,4 +1,6 @@
 # ruff: noqa: TC002, TC003, DTZ005, TRY400, TRY401
+"""Expression learning service and background analysis pipeline."""
+
 from __future__ import annotations
 
 import difflib
@@ -6,23 +8,22 @@ import json
 import re
 from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 from typing_extensions import override
 
 import anyio
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langgraph.runtime import Runtime
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
 )
 
-from kafubot.cognition.plugins.daemon import BaseDaemonMiddleware, SessionProcessOutput
+from kafubot.cognition.plugins.background import BatchProcessOutput, SessionBatchWorker
 from kafubot.cognition.prompts.manager import BOT_NAME
-from kafubot.cognition.types import ManagerContext, ManagerState, UserMessage
+from kafubot.cognition.types import UserMessage
 from kafubot.cognition.utils import content_to_text
 
 from .constants import (
@@ -33,7 +34,6 @@ from .constants import (
     DEFAULT_MAX_CONCURRENT_LEARNERS,
     EXPRESSION_EVALUATION_SOURCE,
     EXPRESSION_LEARN_SOURCE,
-    EXPRESSION_REPLY_SOURCE,
     EXPRESSION_SUMMARY_SOURCE,
     MAX_LEARNED_EXPRESSIONS_PER_BATCH,
     SIMILARITY_THRESHOLD,
@@ -66,21 +66,23 @@ _USER_TAG_PATTERN = re.compile(
 _BOT_TAG_PATTERN = re.compile(r"(?is)^<bot-message\b[^>]*>(.*?)</bot-message>$")
 
 
-@dataclass(frozen=True)
-class PendingExpressionAnalysisBatch:
+class PendingExpressionAnalysisBatch(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     session_id: str
     messages: list[BaseMessage]
-    selected_expression_ids: list[int] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class PreparedExpressionSelection:
+class PreparedExpressionSelection(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     selection: ExpressionSelectionResult
     prepared_at: datetime
 
 
-@dataclass(frozen=True)
-class ExpressionLearningAcquireResult:
+class ExpressionLearningAcquireResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     acquired: bool
     reason: str = ""
     active_count: int = 0
@@ -96,31 +98,31 @@ class ExpressionLearningBatchGate:
     async def acquire(self, session_id: str) -> ExpressionLearningAcquireResult:
         if self.max_count <= 0:
             return ExpressionLearningAcquireResult(
-                False,
-                "max_expression_learner <= 0",
-                0,
-                self.max_count,
+                acquired=False,
+                reason="max_expression_learner <= 0",
+                active_count=0,
+                max_count=self.max_count,
             )
 
         async with self._lock:
             active_count = len(self._active_session_ids)
             if session_id in self._active_session_ids:
                 return ExpressionLearningAcquireResult(
-                    False,
-                    "session_busy",
-                    active_count,
-                    self.max_count,
+                    acquired=False,
+                    reason="session_busy",
+                    active_count=active_count,
+                    max_count=self.max_count,
                 )
             if active_count >= self.max_count:
                 return ExpressionLearningAcquireResult(
-                    False,
-                    "global_limit",
-                    active_count,
-                    self.max_count,
+                    acquired=False,
+                    reason="global_limit",
+                    active_count=active_count,
+                    max_count=self.max_count,
                 )
             self._active_session_ids.add(session_id)
             return ExpressionLearningAcquireResult(
-                True,
+                acquired=True,
                 active_count=active_count + 1,
                 max_count=self.max_count,
             )
@@ -130,62 +132,7 @@ class ExpressionLearningBatchGate:
             self._active_session_ids.discard(session_id)
 
 
-def _normalize_record_message(message: BaseMessage) -> ExpressionMessageRecord | None:
-    if isinstance(message, HumanMessage) and isinstance(
-        raw := message.additional_kwargs.get("raw"),
-        UserMessage,
-    ):
-        content = clean_text(raw.message.get_msgcode())
-        if not content:
-            return None
-        return ExpressionMessageRecord(
-            speaker="USER",
-            content=content,
-            name=clean_text(raw.user),
-            timestamp=raw.timestamp.strftime("%H:%M:%S"),
-        )
-
-    raw_content = content_to_text(message.content)
-    if not raw_content.strip():
-        return None
-
-    if isinstance(message, HumanMessage):
-        stripped = raw_content.strip()
-        if match := _USER_TAG_PATTERN.match(stripped):
-            content = clean_text(match.group(1))
-            if content:
-                return ExpressionMessageRecord(
-                    speaker="USER",
-                    content=content,
-                    name="未知用户",
-                    timestamp="unknown",
-                )
-        if match := _BOT_TAG_PATTERN.match(stripped):
-            content = clean_text(match.group(1))
-            if content:
-                return ExpressionMessageRecord(
-                    speaker="SELF",
-                    content=content,
-                    name=BOT_NAME,
-                    timestamp="unknown",
-                )
-        return None
-
-    if isinstance(message, AIMessage):
-        content = clean_text(raw_content)
-        if content:
-            return ExpressionMessageRecord(
-                speaker="SELF",
-                content=content,
-                name=BOT_NAME,
-                timestamp="unknown",
-            )
-    return None
-
-
-class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysisBatch]):
-    state_schema = ManagerState
-
+class ExpressionLearner(SessionBatchWorker[PendingExpressionAnalysisBatch]):
     def __init__(
         self,
         analyze_model: BaseChatModel,
@@ -249,6 +196,61 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         self._prepared_selection_cache: dict[str, PreparedExpressionSelection] = {}
         self._learning_backlog: dict[str, deque[ExpressionMessageRecord]] = {}
 
+    @classmethod
+    def _normalize_record_message(
+        cls, message: BaseMessage
+    ) -> ExpressionMessageRecord | None:
+        if isinstance(message, HumanMessage) and isinstance(
+            raw := message.additional_kwargs.get("raw"),
+            UserMessage,
+        ):
+            content = clean_text(raw.message.get_msgcode())
+            if not content:
+                return None
+            return ExpressionMessageRecord(
+                speaker="USER",
+                content=content,
+                name=clean_text(raw.user),
+                timestamp=raw.timestamp.strftime("%H:%M:%S"),
+            )
+
+        raw_content = content_to_text(message.content)
+        if not raw_content.strip():
+            return None
+
+        if isinstance(message, HumanMessage):
+            stripped = raw_content.strip()
+            if match := _USER_TAG_PATTERN.match(stripped):
+                content = clean_text(match.group(1))
+                if content:
+                    return ExpressionMessageRecord(
+                        speaker="USER",
+                        content=content,
+                        name="未知用户",
+                        timestamp="unknown",
+                    )
+            if match := _BOT_TAG_PATTERN.match(stripped):
+                content = clean_text(match.group(1))
+                if content:
+                    return ExpressionMessageRecord(
+                        speaker="SELF",
+                        content=content,
+                        name=BOT_NAME,
+                        timestamp="unknown",
+                    )
+            return None
+
+        if isinstance(message, AIMessage):
+            content = clean_text(raw_content)
+            if content:
+                return ExpressionMessageRecord(
+                    speaker="SELF",
+                    content=content,
+                    name=BOT_NAME,
+                    timestamp="unknown",
+                )
+        return None
+
     def _get_expression_config(self, session_id: str) -> tuple[bool, bool]:
         if self._expression_config_resolver is None:
             return True, True
@@ -275,30 +277,8 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
             return normalize_expression_scope(session_id, None)
         return normalize_expression_scope(session_id, resolved)
 
-    @override
-    async def abefore_agent(
-        self,
-        state: ManagerState,
-        runtime: Runtime[ManagerContext],
-    ) -> dict[str, Any] | None:
-        _ = state
-        content, selected_ids = self.prepare_reply_context(
-            runtime.context["session_id"]
-        )
-        if not content:
-            return None
-        return {
-            "reply_bottom_messages": [
-                HumanMessage(
-                    content=content,
-                    additional_kwargs={"lc_source": EXPRESSION_REPLY_SOURCE},
-                )
-            ],
-            "selected_expression_ids": selected_ids,
-        }
-
     def prepare_reply_context(self, session_id: str) -> tuple[str, list[int]]:
-        """Return prepared expression habits without requiring ManagerState."""
+        """Return expression habits prepared by the previous background batch."""
         use_expression, _ = self._get_expression_config(session_id)
         if not use_expression:
             return "", []
@@ -315,62 +295,34 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
             return "", []
         return selection.expression_habits, list(selection.selected_expression_ids)
 
-    @override
-    async def aafter_agent(
-        self,
-        state: ManagerState,
-        runtime: Runtime[ManagerContext],
-    ) -> dict[str, Any] | None:
-        session_id = runtime.context["session_id"]
-        replied = any(output["type"] == "reply" for output in state["outputs"])
-        _, enable_learning = self._get_expression_config(session_id)
-
-        messages = (
-            list(state.get("currents") or [])
-            if replied
-            else cast(
-                "list[BaseMessage] | None",
-                state.get("summary_pruned_messages"),
-            )
-        )
-        await self.learn_from_messages(
-            session_id,
-            messages or (),
-            replied=replied,
-            enable_learning=enable_learning,
-            selected_expression_ids=list(state.get("selected_expression_ids") or []),
-        )
-        return None
-
-    async def learn_from_messages(
+    async def consume_evicted(
         self,
         session_id: str,
         messages: Sequence[BaseMessage],
-        *,
-        replied: bool = False,
-        enable_learning: bool | None = None,
-        selected_expression_ids: Sequence[int] = (),
     ) -> None:
-        """Consume native plugin-event messages without a LangGraph runtime shim."""
-        if enable_learning is None:
-            _, enable_learning = self._get_expression_config(session_id)
-        if messages and (enable_learning or replied):
+        """Queue messages that the plugin host evicted from live context."""
+        _, enable_learning = self._get_expression_config(session_id)
+        if messages and enable_learning:
             await self._enqueue_batch(
                 session_id,
                 PendingExpressionAnalysisBatch(
                     session_id=session_id,
                     messages=list(messages),
-                    selected_expression_ids=list(selected_expression_ids),
                 ),
             )
+
+    async def record_reply(self, selected_expression_ids: Sequence[int]) -> None:
+        """Update selection activity without sending live messages to learning."""
+        if selected_expression_ids:
+            await self._selector._update_last_active_time(list(selected_expression_ids))
 
     @override
     async def process_batches(
         self,
         session_id: str,
         batches: tuple[PendingExpressionAnalysisBatch, ...],
-    ) -> SessionProcessOutput:
-        records = self._extract_pruned_messages(batches)
+    ) -> BatchProcessOutput:
+        records = self._extract_evicted_messages(batches)
         if not records:
             return len(batches)
         learning_backlog = self._learning_backlog.setdefault(
@@ -379,13 +331,6 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         )
         learning_backlog.extend(records)
         learning_records = list(learning_backlog)
-        selected_ids = list(
-            dict.fromkeys(
-                expression_id
-                for batch in batches
-                for expression_id in batch.selected_expression_ids
-            )
-        )
         task_errors: list[Exception] = []
 
         async def prepare_next_selection() -> None:
@@ -410,12 +355,6 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
             except Exception as exc:
                 task_errors.append(exc)
 
-        async def mark_selected() -> None:
-            try:
-                await self._selector._update_last_active_time(selected_ids)
-            except Exception as exc:
-                task_errors.append(exc)
-
         async def learn() -> None:
             try:
                 await self._learn_from_session_messages(
@@ -434,8 +373,6 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
             )
         async with anyio.create_task_group() as task_group:
             task_group.start_soon(prepare_next_selection)
-            if selected_ids:
-                task_group.start_soon(mark_selected)
             if run_learning:
                 task_group.start_soon(learn)
         for task_error in task_errors:
@@ -451,8 +388,7 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         await self._db.dispose()
 
     async def clear_session(self, session_id: str) -> None:
-        self._pending_batches.pop(session_id, None)
-        self._retry_attempts.pop(session_id, None)
+        self.discard(session_id)
         self._prepared_selection_cache.pop(session_id, None)
         self._learning_backlog.pop(session_id, None)
 
@@ -484,10 +420,10 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         return [
             record
             for message in messages
-            if (record := _normalize_record_message(message)) is not None
+            if (record := self._normalize_record_message(message)) is not None
         ]
 
-    def _extract_pruned_messages(
+    def _extract_evicted_messages(
         self,
         batches: Sequence[PendingExpressionAnalysisBatch],
     ) -> list[ExpressionMessageRecord]:
@@ -497,7 +433,7 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
                 [
                     record
                     for message in batch.messages
-                    if (record := _normalize_record_message(message))
+                    if (record := self._normalize_record_message(message))
                 ]
             )
 
@@ -604,8 +540,9 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
             wrote_expression = wrote_expression or expression is not None
         return wrote_expression
 
-    @staticmethod
+    @classmethod
     def _build_learning_messages(
+        cls,
         records: list[ExpressionMessageRecord],
         system_prompt: str,
     ) -> list[BaseMessage]:
@@ -959,4 +896,4 @@ class ExpressionLearnerMiddleware(BaseDaemonMiddleware[PendingExpressionAnalysis
         return None
 
 
-__all__ = ["ExpressionLearnerMiddleware"]
+__all__ = ["ExpressionLearner"]

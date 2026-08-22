@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -10,7 +10,6 @@ from kafubot.adapters.cqhttp.message import CQHTTPMessageSegment
 from kafubot.agency.models import ActionContract, CompiledContext, ReplyResult
 from kafubot.cognition.message import QQMessage
 from kafubot.cognition.models import get_nonthinking_model
-from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
 from kafubot.cognition.prompts.manager import BOT_NAME, IDENTITY
 from kafubot.cognition.telemetry import log_social_event
 from kafubot.cognition.utils import content_to_text
@@ -250,8 +249,9 @@ class Replyer:
             logger.exception("Failed to record visible reply telemetry")
         return ReplyResult(full_text=full_text, message_count=len(sent))
 
-    @staticmethod
+    @classmethod
     def _user_prompt(
+        cls,
         context: CompiledContext,
         contract: ActionContract,
     ) -> str:
@@ -277,10 +277,3 @@ class Replyer:
             "</action_contract>\n\n"
             "Realize the action now. Output only the messages to send."
         )
-
-
-def apply(context: PluginContext, _config: Any) -> None:
-    context.provide("replyer", Replyer())
-
-
-plugin = PluginDefinition(name="replyer", apply=apply)

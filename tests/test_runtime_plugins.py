@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
 import anyio
-from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ToolCallRequest
 from langchain.tools import tool
 from langchain_core.messages import ToolMessage
 
-from kafubot.agency.models import SelfState, SocialHome
+from kafubot.agency.models import SelfState, SocialHome, TimelineEntry
 from kafubot.cognition.plugins.base import (
     PluginCatalog,
     PluginContext,
@@ -21,12 +21,9 @@ from kafubot.cognition.plugins.environment import (
     SocialEnvironment,
 )
 from kafubot.cognition.plugins.environment import plugin as environment_plugin
-from kafubot.cognition.plugins.interaction import ExecutiveMiddleware
+from kafubot.cognition.plugins.interaction import ExecutiveAgent
 from kafubot.cognition.plugins.interaction import plugin as interaction_plugin
-from kafubot.cognition.plugins.model import plugin as model_plugin
-from kafubot.cognition.plugins.replyer import plugin as replyer_plugin
-from kafubot.cognition.plugins.self_state import SelfStateStore
-from kafubot.cognition.plugins.self_state import plugin as self_state_plugin
+from kafubot.cognition.plugins.world_model import SelfStateStore
 from kafubot.cognition.plugins.world_model import plugin as world_model_plugin
 from kafubot.config import AgentConfig, PluginSettings
 from kafubot.social import SocialAgentContext, SocialAgentRuntime
@@ -61,17 +58,8 @@ def shared_plugin_tool() -> str:
     return "both"
 
 
-class OwnedMiddleware(AgentMiddleware[Any, Any, Any]):
-    def __init__(self, closed: list[str]) -> None:
-        self.closed = closed
-
-    async def aclose(self) -> None:
-        self.closed.append("owned")
-
-
-def test_runtime_mounts_native_plugins_into_main_executive(monkeypatch: Any) -> None:
+def test_runtime_composes_core_plugins_into_main_executive(monkeypatch: Any) -> None:
     closed: list[str] = []
-    owned_middleware = OwnedMiddleware(closed)
 
     async def close_recording() -> None:
         closed.append("recording")
@@ -83,11 +71,10 @@ def test_runtime_mounts_native_plugins_into_main_executive(monkeypatch: Any) -> 
         context.on_prepare_reply(lambda _preparation: "recorded")
         context.effect(close_recording)
 
-    def owned(
+    def tools(
         context: PluginContext,
         _options: dict[str, Any],
     ) -> None:
-        context.middleware(owned_middleware)
         context.tool(home_plugin_tool, ToolScope.HOME)
         context.tool(open_plugin_tool, ToolScope.OPEN)
         context.tool(shared_plugin_tool, ToolScope.BOTH)
@@ -95,13 +82,10 @@ def test_runtime_mounts_native_plugins_into_main_executive(monkeypatch: Any) -> 
     catalog = PluginCatalog(
         [
             environment_plugin,
-            model_plugin,
-            self_state_plugin,
             world_model_plugin,
-            replyer_plugin,
             interaction_plugin,
             PluginDefinition("recording", recording),
-            PluginDefinition("owned", owned),
+            PluginDefinition("tools", tools),
         ]
     )
     monkeypatch.setattr(
@@ -111,18 +95,30 @@ def test_runtime_mounts_native_plugins_into_main_executive(monkeypatch: Any) -> 
 
     async def scenario() -> None:
         runtime = SocialAgentRuntime(
-            AgentConfig(plugins={"interaction": PluginSettings()}),
+            AgentConfig(
+                plugins={
+                    "interaction": PluginSettings(
+                        options={
+                            "prompt_enabled": False,
+                            "clock_enabled": False,
+                        }
+                    )
+                }
+            ),
             environment=SocialEnvironment(history=InMemoryHistoryRepository()),
             state_store=SelfStateStore(None),
             image_analyzer_factory=FakeImageAnalyzer,
         )
         await runtime._ensure_plugins()
 
-        assert len(runtime.middleware) == 2
-        executive = runtime.middleware[0]
-        assert isinstance(executive, ExecutiveMiddleware)
+        assert len(runtime._agent_stack) == 1
+        executive = runtime._agent_stack[0]
+        assert isinstance(executive, ExecutiveAgent)
         assert executive.plugins is runtime._plugin_host
-        assert runtime.middleware[1] is owned_middleware
+        assert executive.prompt_enabled is False
+        assert executive.clock_enabled is False
+        assert runtime.model_factory is not None
+        assert runtime.replyer is not None
         assert runtime.providers is not None
         assert len(runtime.providers.providers) == 2
         assert {tool.name for tool in executive._home_tools} == {
@@ -187,4 +183,44 @@ def test_runtime_mounts_native_plugins_into_main_executive(monkeypatch: Any) -> 
         await runtime.aclose()
 
     anyio.run(scenario)
-    assert closed == ["owned", "recording"]
+    assert closed == ["recording"]
+
+
+def test_environment_emits_only_newly_evicted_context_entries() -> None:
+    repository = InMemoryHistoryRepository()
+    repository.entries["session"] = [
+        TimelineEntry(
+            role="assistant",
+            timestamp=datetime.now(UTC),
+            content=f"history-{index}",
+        )
+        for index in range(3)
+    ]
+
+    async def scenario() -> None:
+        environment = SocialEnvironment(
+            history=repository,
+            max_entries=2,
+            context_window_size=2,
+        )
+        await environment.session("session")
+        assert await environment.take_context_evictions("session") == []
+
+        await environment.commit_reply(
+            "session",
+            "reply-1",
+            handled_through_sequence=0,
+        )
+        first = await environment.take_context_evictions("session")
+        assert [entry.content for entry in first] == ["history-1"]
+        assert await environment.take_context_evictions("session") == []
+
+        await environment.commit_reply(
+            "session",
+            "reply-2",
+            handled_through_sequence=0,
+        )
+        second = await environment.take_context_evictions("session")
+        assert [entry.content for entry in second] == ["history-2"]
+
+    anyio.run(scenario)

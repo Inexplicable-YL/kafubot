@@ -4,28 +4,20 @@ import logging
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 import anyio
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from kafubot.agency.models import ConversationCandidate, TimelineEntry
 from kafubot.cognition.history import clear_session_history, get_session_history
-from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
 from kafubot.cognition.types import UserMessage
 from kafubot.cognition.utils import content_to_text
 
 if TYPE_CHECKING:
     from kafubot.actions import QQActions
-    from kafubot.config import AgentConfig
 
 logger = logging.getLogger(__name__)
-
-
-def _aware_utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
 
 
 class HistoryRepository(Protocol):
@@ -64,14 +56,20 @@ class AgentHistoryRepository:
     async def clear(self, session_id: str) -> None:
         await clear_session_history(session_id)
 
-    @staticmethod
-    def _to_entry(message: BaseMessage) -> TimelineEntry | None:
+    @classmethod
+    def _aware_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @classmethod
+    def _to_entry(cls, message: BaseMessage) -> TimelineEntry | None:
         if isinstance(message, HumanMessage):
             raw = message.additional_kwargs.get("raw")
             if isinstance(raw, UserMessage):
                 return TimelineEntry(
                     role="user",
-                    timestamp=_aware_utc(raw.timestamp),
+                    timestamp=cls._aware_utc(raw.timestamp),
                     content=raw.message.get_msgcode(),
                     user=raw.user,
                     user_id=raw.user_id,
@@ -91,7 +89,7 @@ class AgentHistoryRepository:
                 timestamp = datetime.now(UTC)
             return TimelineEntry(
                 role="assistant",
-                timestamp=_aware_utc(timestamp),
+                timestamp=cls._aware_utc(timestamp),
                 content=content_to_text(message.content),
             )
         return None
@@ -143,6 +141,7 @@ class ConversationState:
         self.last_handled_sequence = 0
         self.last_read_sequence = 0
         self.hydrated = False
+        self.pending_context_evictions: deque[TimelineEntry] = deque()
 
     @property
     def latest_sequence(self) -> int:
@@ -165,9 +164,11 @@ class SocialEnvironment:
         *,
         history: HistoryRepository | None = None,
         max_entries: int = 100,
+        context_window_size: int = 36,
     ) -> None:
         self.history = history or AgentHistoryRepository()
         self.max_entries = max_entries
+        self.context_window_size = max(1, context_window_size)
         self.sessions: dict[str, ConversationState] = {}
         self._sequence = 0
         self._lock = anyio.Lock()
@@ -198,7 +199,8 @@ class SocialEnvironment:
         state = await self.session(session_id)
         async with self._lock:
             self._sequence += 1
-            state.entries.append(
+            self._append_entry(
+                state,
                 TimelineEntry(
                     sequence=self._sequence,
                     role="user",
@@ -210,7 +212,7 @@ class SocialEnvironment:
                     directed_to_bot=message.is_tome,
                     has_media=bool(message.images),
                     raw=message,
-                )
+                ),
             )
             state.latest_actions = actions
             candidate = self._candidate(session_id, state)
@@ -306,13 +308,14 @@ class SocialEnvironment:
         now = datetime.now(UTC)
         async with self._lock:
             self._sequence += 1
-            state.entries.append(
+            self._append_entry(
+                state,
                 TimelineEntry(
                     sequence=self._sequence,
                     role="assistant",
                     timestamp=now,
                     content=content,
-                )
+                ),
             )
             state.last_handled_sequence = max(
                 state.last_handled_sequence,
@@ -328,12 +331,24 @@ class SocialEnvironment:
         async with self._lock:
             self.sessions.pop(session_id, None)
 
+    async def take_context_evictions(
+        self,
+        session_id: str,
+    ) -> list[TimelineEntry]:
+        """Return each entry exactly once after it leaves the live model window."""
+        state = await self.session(session_id)
+        async with self._lock:
+            evicted = list(state.pending_context_evictions)
+            state.pending_context_evictions.clear()
+            return evicted
+
     async def has_unhandled(self) -> bool:
         async with self._lock:
             return any(state.unread for state in self.sessions.values())
 
-    @staticmethod
+    @classmethod
     def _candidate(
+        cls,
         session_id: str,
         state: ConversationState,
     ) -> ConversationCandidate:
@@ -363,15 +378,18 @@ class SocialEnvironment:
             latest_sequence=state.latest_sequence,
         )
 
-
-def apply(context: PluginContext, _config: Any) -> None:
-    if context.optional_service("environment") is not None:
-        return
-    config = cast("AgentConfig", context.service("config"))
-    context.provide(
-        "environment",
-        SocialEnvironment(max_entries=config.environment_message_limit),
-    )
-
-
-plugin = PluginDefinition(name="environment", apply=apply)
+    def _append_entry(
+        self,
+        state: ConversationState,
+        entry: TimelineEntry,
+    ) -> None:
+        live_before = list(state.entries)[-self.context_window_size :]
+        state.entries.append(entry)
+        live_after = {
+            item.sequence for item in list(state.entries)[-self.context_window_size :]
+        }
+        state.pending_context_evictions.extend(
+            item.model_copy(deep=True)
+            for item in live_before
+            if item.sequence not in live_after
+        )

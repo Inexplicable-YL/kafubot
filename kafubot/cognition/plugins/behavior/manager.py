@@ -1,7 +1,7 @@
 # ruff: noqa: TC002, TC003, DTZ005, TRY400, TRY401, SIM103, PERF401
-"""Behavior learning middleware.
+"""Behavior learning domain model and persistence services.
 
-This middleware ports MaiBot's behavior system into KafuBot's middleware
+This module ports MaiBot's behavior system into KafuBot's native plugin
 architecture:
 
 1. Learn reusable scene-action-outcome paths from pruned chat history.
@@ -10,8 +10,8 @@ architecture:
 4. Evaluate later feedback for selected behaviors from subsequent pruned chat.
 
 Unlike the upstream project, KafuBot does not have Maisaka's context message
-types. The middleware therefore reuses the same message source as
-`jargon_learner.py`: `summary_pruned_messages`.
+types. The learner consumes the same explicit context-eviction events as the
+other background learning plugins.
 """
 
 import hashlib
@@ -22,7 +22,6 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import datetime
 from math import exp, log
 from typing import Any, Literal, cast
@@ -30,6 +29,7 @@ from typing import Any, Literal, cast
 import anyio
 import jieba
 from json_repair import repair_json
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -104,8 +104,9 @@ _ALLOWED_TAG_KINDS = {"attitude", "domain", "need"}
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class BehaviorReferenceCandidate:
+class BehaviorReferenceCandidate(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     behavior_id: int
     action: str
     outcome: str
@@ -114,14 +115,13 @@ class BehaviorReferenceCandidate:
     session_id: str = ""
 
 
-@dataclass
-class BehaviorPatternRetrievalResult:
+class BehaviorPatternRetrievalResult(BaseModel):
     reference_text: str = ""
-    behaviors: list[dict[str, Any]] = field(default_factory=list)
-    scenario_profile: "BehaviorScenarioProfile" = field(
+    behaviors: list[dict[str, Any]] = Field(default_factory=list)
+    scenario_profile: "BehaviorScenarioProfile" = Field(
         default_factory=lambda: BehaviorScenarioProfile()
     )
-    references: list[BehaviorReferenceCandidate] = field(default_factory=list)
+    references: list[BehaviorReferenceCandidate] = Field(default_factory=list)
 
 
 class _BehaviorBase(DeclarativeBase):
@@ -354,8 +354,8 @@ class BehaviorDatabase:
         self._schema_ready = False
         self._schema_lock = anyio.Lock()
 
-    @staticmethod
-    def _normalize_async_db_url(db_url: str) -> str:
+    @classmethod
+    def _normalize_async_db_url(cls, db_url: str) -> str:
         if db_url.startswith("sqlite+"):
             return db_url
         if db_url.startswith("sqlite:///"):
@@ -415,10 +415,11 @@ def _text_hash(value: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-@dataclass(frozen=True)
-class BehaviorScenarioTagCluster:
+class BehaviorScenarioTagCluster(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     kind: str
-    tags: list[str] = field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
 
     def to_prompt_payload(self) -> dict[str, Any]:
         values = self.all_values()
@@ -436,10 +437,11 @@ class BehaviorScenarioTagCluster:
         return values
 
 
-@dataclass(frozen=True)
-class BehaviorScenarioProfile:
+class BehaviorScenarioProfile(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     summary: str = ""
-    tag_clusters: list[BehaviorScenarioTagCluster] = field(default_factory=list)
+    tag_clusters: list[BehaviorScenarioTagCluster] = Field(default_factory=list)
     confidence: float = 0.0
 
     @property
@@ -478,12 +480,13 @@ class BehaviorScenarioProfile:
         ]
 
 
-@dataclass(frozen=True)
-class BehaviorScenarioSegment:
+class BehaviorScenarioSegment(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     segment_id: str
     title: str
-    source_ids: list[str] = field(default_factory=list)
-    profile: BehaviorScenarioProfile = field(default_factory=BehaviorScenarioProfile)
+    source_ids: list[str] = Field(default_factory=list)
+    profile: BehaviorScenarioProfile = Field(default_factory=BehaviorScenarioProfile)
 
     def to_prompt_payload(self) -> dict[str, Any]:
         return {
@@ -1219,8 +1222,9 @@ def _session_scope_condition(model: Any, session_ids: set[str]):
     return model.session_id.is_(None)  # type: ignore[attr-defined]
 
 
-@dataclass(frozen=True)
-class BehaviorGraphRefs:
+class BehaviorGraphRefs(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
     scene_cluster: BehaviorSceneCluster
     scene_cluster_id: int
     action_id: int
@@ -1947,15 +1951,16 @@ async def retrieve_behavior_scores_from_scene_clusters(
     )
 
 
-@dataclass(frozen=True)
-class BehaviorPatternMaintenanceResult:
+class BehaviorPatternMaintenanceResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     session_id: str
     scanned_count: int = 0
     decayed_count: int = 0
     disabled_count: int = 0
     merged_count: int = 0
     skipped_reason: str = ""
-    touched_pattern_ids: list[int] = field(default_factory=list)
+    touched_pattern_ids: list[int] = Field(default_factory=list)
 
     @property
     def changed(self) -> bool:
@@ -2069,8 +2074,11 @@ class BehaviorPatternMaintenanceService:
                 skipped_reason="error",
             )
 
-    @staticmethod
-    def _normalize_session_ids(session_ids: set[str] | None) -> set[str]:
+    @classmethod
+    def _normalize_session_ids(
+        cls,
+        session_ids: set[str] | None,
+    ) -> set[str]:
         if not session_ids:
             return set()
         return {
@@ -2079,22 +2087,29 @@ class BehaviorPatternMaintenanceService:
             if str(session_id or "").strip()
         }
 
-    @staticmethod
-    def _dedupe_ids(pattern_ids: Sequence[int]) -> list[int]:
+    @classmethod
+    def _dedupe_ids(cls, pattern_ids: Sequence[int]) -> list[int]:
         deduped_ids: list[int] = []
         for pattern_id in pattern_ids:
             if pattern_id not in deduped_ids:
                 deduped_ids.append(pattern_id)
         return deduped_ids
 
-    @staticmethod
-    def _days_since(now: datetime, timestamp: datetime | None) -> int:
+    @classmethod
+    def _days_since(
+        cls,
+        now: datetime,
+        timestamp: datetime | None,
+    ) -> int:
         if timestamp is None:
             return 0
         return max(0, (now - timestamp).days)
 
-    @staticmethod
-    def _latest_activity_time(pattern: BehaviorExperiencePath) -> datetime:
+    @classmethod
+    def _latest_activity_time(
+        cls,
+        pattern: BehaviorExperiencePath,
+    ) -> datetime:
         timestamps = [
             timestamp
             for timestamp in [
@@ -2151,8 +2166,9 @@ class BehaviorPatternMaintenanceService:
         feedback_items.append(event)
         pattern.feedback_list = dump_json_list(feedback_items[-FEEDBACK_HISTORY_LIMIT:])
 
-    @dataclass(frozen=True)
-    class _DecayResult:
+    class _DecayResult(BaseModel):
+        model_config = ConfigDict(frozen=True)
+
         decayed: bool = False
         disabled: bool = False
 
@@ -2198,8 +2214,9 @@ class BehaviorPatternMaintenanceService:
             pattern.update_time = now
         return self._DecayResult(decayed=decayed, disabled=disabled)
 
-    @staticmethod
+    @classmethod
     def _calculate_decay(
+        cls,
         pattern: BehaviorExperiencePath,
         *,
         inactive_days: int,
@@ -2234,8 +2251,9 @@ class BehaviorPatternMaintenanceService:
             return -0.15, "曾经有效但长期未再出现，轻微衰减以给新行为让路。"
         return 0.0, ""
 
-    @staticmethod
+    @classmethod
     def _should_disable(
+        cls,
         pattern: BehaviorExperiencePath,
         *,
         inactive_days: int,
@@ -2272,8 +2290,11 @@ class BehaviorPatternSelector:
         self._maintenance = maintenance
         self._group_resolver = group_resolver
 
-    @staticmethod
-    def _build_compact_scenario_text(scenario_profile: BehaviorScenarioProfile) -> str:
+    @classmethod
+    def _build_compact_scenario_text(
+        cls,
+        scenario_profile: BehaviorScenarioProfile,
+    ) -> str:
         if not scenario_profile.has_signal:
             return "无可用场景画像。"
         lines = []
@@ -2283,8 +2304,8 @@ class BehaviorPatternSelector:
             lines.append(f"场景标签：{scenario_profile.tag_cluster_text()}")
         return "\n".join(lines) if lines else "无可用场景画像。"
 
-    @staticmethod
-    def _format_priority_label(index: int, total_count: int) -> str:
+    @classmethod
+    def _format_priority_label(cls, index: int, total_count: int) -> str:
         if index <= 1:
             return "高"
         if total_count <= 2 or index <= 2:
@@ -2323,8 +2344,8 @@ class BehaviorPatternSelector:
         )
         return bool(patterns)
 
-    @staticmethod
-    def _candidate_weight(candidate: dict[str, Any]) -> float:
+    @classmethod
+    def _candidate_weight(cls, candidate: dict[str, Any]) -> float:
         count = max(float(candidate.get("count") or 0.0), 0.0)
         score = float(candidate.get("score") or 0.0)
         success_count = max(float(candidate.get("success_count") or 0.0), 0.0)
@@ -2353,8 +2374,11 @@ class BehaviorPatternSelector:
             weight *= COLD_SINGLETON_BEHAVIOR_FACTOR
         return max(0.2, weight)
 
-    @staticmethod
-    def _profile_tag_mapping_from_distribution(distribution: Any) -> dict[str, float]:
+    @classmethod
+    def _profile_tag_mapping_from_distribution(
+        cls,
+        distribution: Any,
+    ) -> dict[str, float]:
         if not isinstance(distribution, list):
             return {}
         tag_probs: dict[str, float] = {}
@@ -2551,8 +2575,9 @@ class BehaviorPatternSelector:
             return matched_candidates[:max_count]
         return []
 
-    @staticmethod
+    @classmethod
     def _build_group_reference_text(
+        cls,
         *,
         behaviors: list[dict[str, Any]],
         scenario_profile: BehaviorScenarioProfile,

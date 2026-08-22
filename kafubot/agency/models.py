@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-if TYPE_CHECKING:
-    from kafubot.cognition.types import UserMessage
+from kafubot.cognition.types import UserMessage  # noqa: TC001 - Pydantic resolves it
 
 
 class ToneVector(BaseModel):

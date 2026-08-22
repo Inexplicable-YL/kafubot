@@ -3,14 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
-from typing_extensions import override
 
 import aiosqlite
 import anyio
-from langchain.agents.middleware import AgentMiddleware
+from pydantic import BaseModel, Field
 
 from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
 from kafubot.cognition.plugins.social_signals import (
@@ -20,40 +18,36 @@ from kafubot.cognition.plugins.social_signals import (
     is_reliable_signal,
 )
 from kafubot.cognition.telemetry import log_social_event
-from kafubot.cognition.types import ManagerContext, ManagerState, UserMessage
+from kafubot.cognition.types import UserMessage  # noqa: TC001 - Pydantic runtime type
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
     from anyio.abc import TaskGroup
-    from langgraph.runtime import Runtime
 
-    from kafubot.cognition.plugins.behavior import BehaviorLearnerMiddleware
-    from kafubot.cognition.plugins.expression import ExpressionLearnerMiddleware
+    from kafubot.cognition.plugins.behavior import BehaviorLearner
+    from kafubot.cognition.plugins.expression import ExpressionLearner
     from kafubot.cognition.plugins.lifecycle import ObservationEvent, ReplyCommitted
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(slots=True)
-class PendingReply:
+class PendingReply(BaseModel):
     effect_id: str
     session_id: str
     sent_at: datetime
     text: str
     action: dict[str, Any]
-    selected_behavior_ids: list[int] = field(default_factory=list)
-    selected_expression_ids: list[int] = field(default_factory=list)
-    observed_messages: list[UserMessage] = field(default_factory=list)
+    selected_behavior_ids: list[int] = Field(default_factory=list)
+    selected_expression_ids: list[int] = Field(default_factory=list)
+    observed_messages: list[UserMessage] = Field(default_factory=list)
     competing_reply_count: int = 1
-    signal_analyses: list[SocialSignalAnalysis] = field(default_factory=list)
+    signal_analyses: list[SocialSignalAnalysis] = Field(default_factory=list)
     session_generation: int = 0
 
 
-class ReplyEffectMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
+class ReplyEffectTracker:
     """Track only effects observable through the installed QQ adapter."""
-
-    state_schema = ManagerState
 
     def __init__(
         self,
@@ -128,8 +122,8 @@ class ReplyEffectMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             await self._db.commit()
         return self._db
 
-    @staticmethod
-    def _as_utc(value: datetime) -> datetime:
+    @classmethod
+    def _as_utc(cls, value: datetime) -> datetime:
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
@@ -286,14 +280,6 @@ class ReplyEffectMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
             selected_expression_ids=pending.selected_expression_ids,
         )
 
-    @override
-    async def abefore_agent(
-        self, state: ManagerState, runtime: Runtime[ManagerContext]
-    ) -> dict[str, Any] | None:
-        session_id = runtime.context["session_id"]
-        await self.observe_messages(session_id, state.get("inputs", []))
-        return None
-
     async def observe_messages(
         self,
         session_id: str,
@@ -352,29 +338,6 @@ class ReplyEffectMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
         else:
             self._pending.pop(session_id, None)
 
-    @override
-    async def aafter_agent(
-        self, state: ManagerState, runtime: Runtime[ManagerContext]
-    ) -> dict[str, Any] | None:
-        session_id = runtime.context["session_id"]
-        for output in state["outputs"]:
-            if output["type"] != "reply":
-                continue
-            data = output["data"]
-            await self.record_reply(
-                session_id,
-                text=str(data.get("full_text") or ""),
-                action=dict(data.get("social_action") or {}),
-                selected_behavior_ids=list(data.get("selected_behavior_ids") or []),
-                selected_expression_ids=list(data.get("selected_expression_ids") or []),
-                sent_at=(
-                    datetime.fromisoformat(str(data["sent_at"]))
-                    if data.get("sent_at")
-                    else None
-                ),
-            )
-        return None
-
     async def record_reply(
         self,
         session_id: str,
@@ -429,16 +392,16 @@ class ReplyEffectMiddleware(AgentMiddleware[ManagerState, ManagerContext]):
 
 
 def apply(context: PluginContext, config: dict[str, Any]) -> None:
-    tracker = ReplyEffectMiddleware(
+    tracker = ReplyEffectTracker(
         signal_service=cast("SocialSignalService", context.service("social_signals")),
         **config,
     )
     behavior = cast(
-        "BehaviorLearnerMiddleware | None",
+        "BehaviorLearner | None",
         context.optional_service("behavior"),
     )
     expression = cast(
-        "ExpressionLearnerMiddleware | None",
+        "ExpressionLearner | None",
         context.optional_service("expression"),
     )
 
@@ -510,4 +473,4 @@ plugin = PluginDefinition(
 )
 
 
-__all__ = ["PendingReply", "ReplyEffectMiddleware", "plugin"]
+__all__ = ["PendingReply", "ReplyEffectTracker", "plugin"]

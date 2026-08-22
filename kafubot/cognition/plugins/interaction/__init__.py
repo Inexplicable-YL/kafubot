@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Literal, cast
 
+from pydantic import BaseModel, ConfigDict
+
+from kafubot.cognition.models import get_thinking_model
 from kafubot.cognition.plugins.base import (
     PluginContext,
     PluginDefinition,
@@ -10,50 +13,62 @@ from kafubot.cognition.plugins.base import (
 )
 
 from .compiler import ContextCompiler
-from .executive import ExecutiveMiddleware
+from .executive import ExecutiveAgent
+from .replyer import Replyer
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable
 
-    from langchain.agents.middleware import AgentMiddleware
+    from langchain_core.language_models.chat_models import BaseChatModel
 
     from kafubot.cognition.plugins.environment import SocialEnvironment
-    from kafubot.cognition.plugins.replyer import Replyer
-    from kafubot.cognition.plugins.self_state import SelfStateStore
-    from kafubot.cognition.plugins.world_model import WorldModelHub
+    from kafubot.cognition.plugins.world_model import SelfStateStore, WorldModelHub
     from kafubot.config import AgentConfig
 
 
-def apply(context: PluginContext, _config: Any) -> None:
+class InteractionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reasoning_effort: Literal["high", "max"] = "max"
+    prompt_enabled: bool = True
+    clock_enabled: bool = True
+
+
+def apply(context: PluginContext, config: InteractionConfig) -> None:
+    factory = cast(
+        "Callable[[], BaseChatModel] | None",
+        context.optional_service("model_factory_override"),
+    )
+    context.provide(
+        "model_factory",
+        factory or (lambda: get_thinking_model(config.reasoning_effort)),
+    )
+    context.provide("replyer", Replyer())
+
     def assemble() -> None:
-        custom = cast(
-            "Sequence[AgentMiddleware[Any, Any]] | None",
-            context.optional_service("custom_middleware"),
-        )
-        if custom is not None:
-            return
-        config = cast("AgentConfig", context.service("config"))
+        agent_config = cast("AgentConfig", context.service("config"))
         environment = cast("SocialEnvironment", context.service("environment"))
         providers = cast("WorldModelHub", context.service("world_model"))
         replyer = cast("Replyer", context.service("replyer"))
         state_store = cast("SelfStateStore", context.service("state_store"))
         host = cast("PluginHost", context.service("plugin_host"))
-        compiler = ContextCompiler(environment, providers, config.executive)
+        compiler = ContextCompiler(environment, providers, agent_config.executive)
         context.provide("context_compiler", compiler)
-        context.middleware(
-            ExecutiveMiddleware(
+        context.provide(
+            "executive_agent",
+            ExecutiveAgent(
                 environment,
                 compiler,
                 replyer,
                 providers,
                 state_store,
-                config.executive,
+                agent_config.executive,
                 host,
                 home_tools=context.tools_for(ToolScope.HOME),
                 open_tools=context.tools_for(ToolScope.OPEN),
-                prompt_enabled=context.enabled("prompt"),
-                clock_enabled=context.enabled("clock"),
-            )
+                prompt_enabled=config.prompt_enabled,
+                clock_enabled=config.clock_enabled,
+            ),
         )
 
     context.ready(assemble)
@@ -62,8 +77,15 @@ def apply(context: PluginContext, _config: Any) -> None:
 plugin = PluginDefinition(
     name="interaction",
     apply=apply,
-    requires=("environment", "model", "replyer", "self_state", "world_model"),
+    requires=("environment", "world_model"),
+    config_model=InteractionConfig,
 )
 
 
-__all__ = ["ContextCompiler", "ExecutiveMiddleware", "plugin"]
+__all__ = [
+    "ContextCompiler",
+    "ExecutiveAgent",
+    "InteractionConfig",
+    "plugin",
+    "Replyer",
+]

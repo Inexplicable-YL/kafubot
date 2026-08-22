@@ -4,7 +4,6 @@ import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -16,9 +15,7 @@ from typing import (
 
 import anyio
 from cachetools import LRUCache
-from langchain.agents.middleware import AgentMiddleware
-
-from kafubot.cognition.types import ManagerContext, ManagerState
+from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -39,9 +36,10 @@ class LoggerConfig(TypedDict):
     retry_exhausted_label: NotRequired[str | None]
 
 
-@dataclass(slots=True, frozen=True)
-class ProcessResult:
+class ProcessResult(BaseModel):
     """Business result returned by subclasses for one batch window."""
+
+    model_config = ConfigDict(frozen=True)
 
     consumed_batches: int = 0
     failed: bool = False
@@ -50,17 +48,11 @@ class ProcessResult:
 # `None` -> consumed_batches=0, failed=False
 # `int` -> consumed_batches=<int>, failed=False
 # `tuple[int, bool]` -> consumed_batches, failed
-SessionProcessOutput = int | tuple[int, bool] | ProcessResult | None
+BatchProcessOutput = int | tuple[int, bool] | ProcessResult | None
 
 
-class BaseDaemonMiddleware(
-    AgentMiddleware[ManagerState, ManagerContext],
-    ABC,
-    Generic[BatchT],
-):
-    """Shared session-scoped queue/worker/retry system for background middlewares."""
-
-    state_schema = ManagerState
+class SessionBatchWorker(ABC, Generic[BatchT]):
+    """Session-scoped queue, coalescing and retries for plugin background work."""
 
     def __init__(
         self,
@@ -72,7 +64,6 @@ class BaseDaemonMiddleware(
         max_concurrent_sessions: int = 4,
         logger_config: LoggerConfig | None = None,
     ) -> None:
-        super().__init__()
         if logger_config is None:
             logger_config = {}
         self.max_retries = max_retries
@@ -375,12 +366,20 @@ class BaseDaemonMiddleware(
         if not pending_batches:
             self._pending_batches.pop(session_id, None)
 
+    def discard(self, session_id: str) -> None:
+        """Forget queued work and retry state for one cleared session."""
+        self._pending_batches.pop(session_id, None)
+        self._retry_attempts.pop(session_id, None)
+        self._scheduled_sessions.discard(session_id)
+        self._delayed_retry_sessions.discard(session_id)
+        self._enqueue_versions.pop(session_id, None)
+
     @abstractmethod
     async def process_batches(
         self,
         session_id: str,
         batches: tuple[BatchT, ...],
-    ) -> SessionProcessOutput:
+    ) -> BatchProcessOutput:
         """Process one session batch window using business logic only."""
         raise NotImplementedError
 
@@ -389,7 +388,8 @@ class BaseDaemonMiddleware(
 
 
 __all__ = [
-    "BaseDaemonMiddleware",
+    "BatchProcessOutput",
     "LoggerConfig",
     "ProcessResult",
+    "SessionBatchWorker",
 ]

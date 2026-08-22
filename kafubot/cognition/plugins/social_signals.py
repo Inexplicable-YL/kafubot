@@ -4,24 +4,22 @@ import json
 import logging
 import unicodedata
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 from hashlib import blake2s
 from itertools import product
 from typing import TYPE_CHECKING, Any, Literal
 
 import anyio
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from kafubot.cognition.models import get_nonthinking_model
 from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
+from kafubot.cognition.types import UserMessage  # noqa: TC001 - Pydantic runtime type
 
 if TYPE_CHECKING:
     from anyio.abc import TaskGroup
     from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
     from langchain_core.language_models.chat_models import BaseChatModel
-
-    from kafubot.cognition.types import UserMessage
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +40,20 @@ class SocialSignalBatch(BaseModel):
     analyses: list[SocialSignalAnalysis] = Field(default_factory=list)
 
 
-@dataclass(frozen=True, slots=True)
-class SignalTerm:
+class SignalTerm(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     phrase: str
     weight: float
 
+    def __init__(self, phrase: str, weight: float) -> None:
+        super().__init__(phrase=phrase, weight=weight)
 
-@dataclass(frozen=True, slots=True)
-class SignalRule:
+
+class SignalRule(BaseModel):
     """A local composition rule made from short, independently useful fragments."""
+
+    model_config = ConfigDict(frozen=True)
 
     rule_id: str
     kind: SignalKind
@@ -59,9 +62,29 @@ class SignalRule:
     max_span: int = 12
     blockers: tuple[str, ...] = ()
 
+    def __init__(
+        self,
+        rule_id: str,
+        kind: SignalKind,
+        groups: tuple[tuple[str, ...], ...],
+        weight: float,
+        *,
+        max_span: int = 12,
+        blockers: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(
+            rule_id=rule_id,
+            kind=kind,
+            groups=groups,
+            weight=weight,
+            max_span=max_span,
+            blockers=blockers,
+        )
 
-@dataclass(frozen=True, slots=True)
-class LexicalSignalResult:
+
+class LexicalSignalResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     scores: dict[SignalKind, float]
     matches: dict[SignalKind, tuple[str, ...]]
 
@@ -375,8 +398,11 @@ class SocialSignalAnalyzer:
     def __init__(self, model: BaseChatModel | None) -> None:
         self._model = model
 
-    @staticmethod
-    def fallback(target_messages: list[UserMessage]) -> list[SocialSignalAnalysis]:
+    @classmethod
+    def fallback(
+        cls,
+        target_messages: list[UserMessage],
+    ) -> list[SocialSignalAnalysis]:
         """Return the bounded local estimate used while semantic analysis runs."""
 
         return [_fallback_analysis(message) for message in target_messages]
@@ -453,14 +479,13 @@ class SocialSignalAnalyzer:
 SignalObserver = Callable[[str, list[SocialSignalAnalysis]], Awaitable[None]]
 
 
-@dataclass(slots=True)
-class _PendingSignalBatch:
+class _PendingSignalBatch(BaseModel):
     session_id: str
     bot_key: str
     bot_message: str | None
     generation: int
-    target_messages: dict[str, UserMessage] = field(default_factory=dict)
-    context_messages: dict[str, UserMessage] = field(default_factory=dict)
+    target_messages: dict[str, UserMessage] = Field(default_factory=dict)
+    context_messages: dict[str, UserMessage] = Field(default_factory=dict)
 
 
 class SocialSignalService:
@@ -469,7 +494,7 @@ class SocialSignalService:
     Callers get a conservative local result immediately.  When semantic analysis
     is useful, one bounded background task upgrades the shared cache and notifies
     observers.  A QQ message is therefore never analyzed twice by the
-    conversation and effect middlewares.
+    conversation and reply-effect plugins.
     """
 
     def __init__(
@@ -567,14 +592,15 @@ class SocialSignalService:
                     task_group.start_soon(self._batch_worker, receive_stream.clone())
             return self._task_group
 
-    @staticmethod
-    def _bot_key(bot_message: str | None) -> str:
+    @classmethod
+    def _bot_key(cls, bot_message: str | None) -> str:
         if not bot_message:
             return "none"
         return blake2s(bot_message.encode(), digest_size=6).hexdigest()
 
-    @staticmethod
+    @classmethod
     def _worth_semantic_analysis(
+        cls,
         message: UserMessage,
         fallback: SocialSignalAnalysis,
         *,
@@ -766,8 +792,9 @@ class SocialSignalService:
                 if event := self._ready_events.pop(key, None):
                     event.set()
 
-    @staticmethod
+    @classmethod
     async def _notify_observer(
+        cls,
         observer: SignalObserver,
         session_id: str,
         analyses: list[SocialSignalAnalysis],

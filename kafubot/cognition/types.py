@@ -2,14 +2,11 @@ import json
 import os
 from datetime import datetime  # noqa: TC003
 from html import escape
-from operator import add
-from typing import Annotated, Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal
 from typing_extensions import override
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from langchain.agents import AgentState
-from langchain_core.messages import AnyMessage, BaseMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from kafubot.cognition.media.image import ImageReadResult  # noqa: TC001
@@ -79,32 +76,3 @@ class UserMessage(BaseModel):
     def as_plain_content(self) -> str:
         msg = QQMessage(filter(lambda x: x.type != "reply", self.message))
         return f"{escape(self.user, quote=True)}: {msg.get_msgcode()}"
-
-
-class OutputMessage(TypedDict):
-    type: Literal["reply", "finish", "stop", "meme", "limit"]
-    data: dict[str, Any]
-
-
-class ManagerState(AgentState):
-    inputs: list[UserMessage]
-    outputs: Annotated[list[OutputMessage], add]
-    currents: list[AnyMessage]
-    histories: list[AnyMessage]
-
-    summary_pruned_messages: NotRequired[list[BaseMessage] | None]
-
-    reply_top_messages: NotRequired[Annotated[list[BaseMessage], add]]
-    reply_bottom_messages: NotRequired[Annotated[list[BaseMessage], add]]
-    reply_bottom_message_factories: NotRequired[Annotated[list[Any], add]]
-    conversation_frame: NotRequired[Any]
-    intervention_decision: NotRequired[dict[str, Any]]
-    selected_behavior_ids: NotRequired[list[int]]
-    selected_expression_ids: NotRequired[list[int]]
-
-
-class ManagerContext(TypedDict):
-    actions: Any
-    session_id: str
-    is_tome: bool
-    unrestricted: bool

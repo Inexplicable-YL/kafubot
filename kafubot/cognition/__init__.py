@@ -1,4 +1,4 @@
-"""Cognitive models, services, tools, and optional middleware plugins."""
+"""Cognitive models, services, tools, and native lifecycle plugins."""
 
 from .types import UserMessage
 

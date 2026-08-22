@@ -6,27 +6,18 @@ from kafubot.cognition.plugins.loader import discover_plugins
 from kafubot.config import PluginSettings, load_config
 
 EXPECTED_PLUGINS = {
-    "attention",
     "behavior",
-    "clock",
     "conversation",
     "environment",
     "expression",
     "interaction",
-    "ingress",
     "jargon",
-    "limiter",
     "memory",
     "meme",
-    "model",
-    "prompt",
     "reply_effects",
-    "replyer",
     "search_song",
-    "self_state",
     "social_signals",
     "summarization",
-    "time_gate",
     "view_message",
     "world_model",
 }
@@ -40,6 +31,26 @@ def test_project_config_enables_current_executive_pipeline() -> None:
     assert {
         definition.name for definition in catalog.resolve(config.agent.plugins)
     } == (EXPECTED_PLUGINS)
+
+
+def test_core_loop_is_composed_from_three_cohesive_plugins() -> None:
+    definitions = {
+        definition.name: definition
+        for definition in discover_plugins(include_entry_points=False).definitions
+    }
+
+    assert definitions["environment"].requires == ()
+    assert definitions["world_model"].requires == ("environment",)
+    assert definitions["interaction"].requires == ("environment", "world_model")
+    assert {
+        "attention",
+        "clock",
+        "ingress",
+        "model",
+        "prompt",
+        "replyer",
+        "self_state",
+    }.isdisjoint(definitions)
 
 
 def test_every_plugin_definition_lives_in_its_discovered_module_or_package() -> None:

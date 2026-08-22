@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 from kafubot.agency.models import (
     AttentionFeatures,
@@ -12,12 +12,11 @@ from kafubot.agency.models import (
     SelfState,
     SocialHome,
 )
-from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from kafubot.config import AgentConfig, AttentionConfig
+    from kafubot.config import AttentionConfig
 
 
 class AttentionScheduler:
@@ -104,11 +103,3 @@ class AttentionScheduler:
                 else 0.0
             ),
         )
-
-
-def apply(context: PluginContext, _config: Any) -> None:
-    config = cast("AgentConfig", context.service("config"))
-    context.provide("attention", AttentionScheduler(config.attention))
-
-
-plugin = PluginDefinition(name="attention", apply=apply)

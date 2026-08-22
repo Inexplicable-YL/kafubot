@@ -5,11 +5,11 @@ from typing import TYPE_CHECKING, Any, cast
 from kafubot.cognition.models import get_nonthinking_model
 from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
 
-from .middleware import ExpressionLearnerMiddleware
+from .learner import ExpressionLearner
 
 if TYPE_CHECKING:
     from kafubot.cognition.plugins.lifecycle import (
-        ObservationEvent,
+        ContextWindowEvicted,
         ReplyCommitted,
         ReplyPreparation,
     )
@@ -20,7 +20,7 @@ def apply(context: PluginContext, config: dict[str, Any]) -> None:
         "enable_precise_expression_selection": True,
         **config,
     }
-    learner = cast("Any", ExpressionLearnerMiddleware)(
+    learner = cast("Any", ExpressionLearner)(
         analyze_model=get_nonthinking_model(
             float(values.pop("analyze_temperature", 0.2))
         ),
@@ -30,8 +30,8 @@ def apply(context: PluginContext, config: dict[str, Any]) -> None:
         **values,
     )
 
-    async def observe(event: ObservationEvent) -> None:
-        await learner.learn_from_messages(event.session_id, event.model_messages)
+    async def evicted(event: ContextWindowEvicted) -> None:
+        await learner.consume_evicted(event.session_id, event.model_messages)
 
     async def prepare(preparation: ReplyPreparation) -> str | None:
         content, selected_ids = learner.prepare_reply_context(
@@ -41,17 +41,12 @@ def apply(context: PluginContext, config: dict[str, Any]) -> None:
         return content or None
 
     async def committed(event: ReplyCommitted) -> None:
-        await learner.learn_from_messages(
-            event.preparation.context.session_id,
-            event.model_messages,
-            replied=True,
-            selected_expression_ids=list(
-                event.preparation.metadata.get("selected_expression_ids") or []
-            ),
+        await learner.record_reply(
+            list(event.preparation.metadata.get("selected_expression_ids") or [])
         )
 
     context.resource("expression", learner)
-    context.on_observe(observe)
+    context.on_context_evicted(evicted)
     context.on_prepare_reply(prepare)
     context.on_reply_committed(committed)
     context.clear_session(learner.clear_session)
@@ -60,4 +55,4 @@ def apply(context: PluginContext, config: dict[str, Any]) -> None:
 plugin = PluginDefinition(name="expression", apply=apply)
 
 
-__all__ = ["ExpressionLearnerMiddleware", "plugin"]
+__all__ = ["ExpressionLearner", "plugin"]

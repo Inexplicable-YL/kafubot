@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar
 from typing_extensions import override
@@ -10,7 +9,7 @@ from typing_extensions import override
 import aiohttp
 import anyio
 from aiohttp import web
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from kafubot.adapters.utils import WebSocketAdapter
 from kafubot.config import CQHTTPConfig
@@ -40,8 +39,9 @@ from .message import CQHTTPMessage, CQHTTPMessageSegment
 __all__ = ["CQHTTPAdapter"]
 
 
-@dataclass
-class _PendingResponse:
+class _PendingResponse(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     ready: anyio.Event
     response: dict[str, Any] | None = None
     error: Exception | None = None
@@ -261,8 +261,8 @@ class CQHTTPAdapter(WebSocketAdapter[CQHTTPEvent, CQHTTPConfig]):
                 del event.message[index]
         self._trim_leading_text(event, index)
 
-    @staticmethod
-    def _trim_leading_text(event: MessageEvent, index: int) -> None:
+    @classmethod
+    def _trim_leading_text(cls, event: MessageEvent, index: int) -> None:
         if len(event.message) > index and event.message[index].type == "text":
             text = str(event.message[index].data.get("text", "")).lstrip()
             if text:
@@ -272,8 +272,8 @@ class CQHTTPAdapter(WebSocketAdapter[CQHTTPEvent, CQHTTPConfig]):
         if not event.message:
             event.message.append(CQHTTPMessageSegment.text(""))
 
-    @staticmethod
-    def _extract_at_me(event: MessageEvent) -> None:
+    @classmethod
+    def _extract_at_me(cls, event: MessageEvent) -> None:
         if not event.message:
             event.message.append(CQHTTPMessageSegment.text(""))
         if event.message_type == "private":

@@ -2,18 +2,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 import aiofiles
 import anyio
 
 from kafubot.agency.models import ActiveThread, RecentAction, SelfState, StateDelta
-from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    from kafubot.config import AgentConfig
 
 
 class SelfStateStore:
@@ -134,19 +131,3 @@ class SelfStateStore:
         async with aiofiles.open(temporary_path, "w", encoding="utf-8") as state_file:
             await state_file.write(state.model_dump_json(indent=2))
         temporary_path.replace(self.path)
-
-
-def apply(context: PluginContext, _config: Any) -> None:
-    if context.optional_service("state_store") is not None:
-        return
-    config = cast("AgentConfig", context.service("config"))
-    context.provide(
-        "state_store",
-        SelfStateStore(
-            config.executive.state_file,
-            recent_action_limit=config.executive.recent_action_limit,
-        ),
-    )
-
-
-plugin = PluginDefinition(name="self_state", apply=apply)

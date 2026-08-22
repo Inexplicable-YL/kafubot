@@ -6,7 +6,6 @@ import logging
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -15,6 +14,7 @@ import anyio
 import jieba
 from json_repair import repair_json
 from langchain_core.language_models.chat_models import BaseChatModel
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -66,23 +66,22 @@ class ModifiedBy(str, Enum):
     USER = "USER"
 
 
-@dataclass(frozen=True, slots=True)
-class ExpressionMessageRecord:
+class ExpressionMessageRecord(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     speaker: str
     content: str
     name: str = ""
     timestamp: str = ""
 
 
-@dataclass
-class ExpressionSelectionResult:
+class ExpressionSelectionResult(BaseModel):
     expression_habits: str = ""
-    selected_expression_ids: list[int] = field(default_factory=list)
-    selected_expressions: list[dict[str, Any]] = field(default_factory=list)
+    selected_expression_ids: list[int] = Field(default_factory=list)
+    selected_expressions: list[dict[str, Any]] = Field(default_factory=list)
 
 
-@dataclass
-class ExpressionEntry:
+class ExpressionEntry(BaseModel):
     situation: str
     style: str
     content: list[str]
@@ -184,8 +183,8 @@ class ExpressionDatabase:
         self._schema_ready = False
         self._schema_lock = anyio.Lock()
 
-    @staticmethod
-    def _normalize_async_db_url(db_url: str) -> str:
+    @classmethod
+    def _normalize_async_db_url(cls, db_url: str) -> str:
         if db_url.startswith("sqlite+"):
             return db_url
         if db_url.startswith("sqlite:///"):
@@ -534,8 +533,11 @@ class ExpressionSelector:
         )
         return all_candidates[: max(MIN_CANDIDATE_POOL_SIZE, 12)]
 
-    @staticmethod
-    def _format_candidate_preview(candidates: list[dict[str, Any]]) -> str:
+    @classmethod
+    def _format_candidate_preview(
+        cls,
+        candidates: list[dict[str, Any]],
+    ) -> str:
         preview_items = [
             "id={id_}, situation={situation!r}, style={style!r}, count={count}".format(
                 id_=candidate.get("id"),
@@ -547,8 +549,9 @@ class ExpressionSelector:
         ]
         return "; ".join(preview_items)
 
-    @staticmethod
+    @classmethod
     def build_expression_habits_block(
+        cls,
         selected_expressions: list[dict[str, Any]],
     ) -> str:
         if not selected_expressions:
@@ -559,8 +562,11 @@ class ExpressionSelector:
         ]
         return "【表达习惯参考，请视情况自然的使用】\n" + "\n".join(lines)
 
-    @staticmethod
-    def _normalize_history_line(message: ExpressionMessageRecord) -> str:
+    @classmethod
+    def _normalize_history_line(
+        cls,
+        message: ExpressionMessageRecord,
+    ) -> str:
         content = clean_text(message.content)
         if len(content) > 120:
             content = content[:120] + "..."
@@ -596,8 +602,9 @@ class ExpressionSelector:
             candidate_lines=candidate_lines,
         )
 
-    @staticmethod
+    @classmethod
     def _parse_selected_ids(
+        cls,
         raw_response: str,
         candidates: list[dict[str, Any]],
     ) -> list[int]:

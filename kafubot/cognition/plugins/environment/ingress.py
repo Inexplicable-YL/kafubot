@@ -8,7 +8,6 @@ import anyio
 
 from kafubot.cognition.media.image import ImageReadResult, read_image
 from kafubot.cognition.message import HistoryMessage, QQMessage, QQMessageSegment
-from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
 from kafubot.cognition.types import UserMessage
 
 if TYPE_CHECKING:
@@ -18,7 +17,6 @@ if TYPE_CHECKING:
 
     from kafubot.actions import QQActions
     from kafubot.adapters.cqhttp.event import GroupMessageEvent, PrivateMessageEvent
-    from kafubot.config import AgentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -151,23 +149,8 @@ class CQHTTPMessageIngestor:
         return message if has_model_visible_content(message) else None
 
 
-def apply(context: PluginContext, _config: Any) -> None:
-    config = cast("AgentConfig", context.service("config"))
-    factory = cast(
-        "Callable[[], ImageAnalyzer]", context.service("image_analyzer_factory")
-    )
-    context.provide(
-        "ingress",
-        CQHTTPMessageIngestor(factory, image_workers=config.image_analyzer_workers),
-    )
-
-
-plugin = PluginDefinition(name="ingress", apply=apply)
-
-
 __all__ = [
     "CQHTTPMessageIngestor",
     "ImageAnalyzer",
     "has_model_visible_content",
-    "plugin",
 ]

@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from kafubot.agency.models import ActionContract, RecentAction
 from kafubot.cognition.plugins.lifecycle import (
+    ContextWindowEvicted,
     ReplyCommitted,
     ReplyPreparation,
     SkipCommitted,
@@ -40,39 +41,14 @@ if TYPE_CHECKING:
 
     from kafubot.cognition.plugins.base import PluginHost
     from kafubot.cognition.plugins.environment import SocialEnvironment
-    from kafubot.cognition.plugins.replyer import Replyer
-    from kafubot.cognition.plugins.self_state import SelfStateStore
+    from kafubot.cognition.plugins.world_model import SelfStateStore
     from kafubot.config import ExecutiveConfig
     from kafubot.social import SocialAgentContext, SocialAgentState  # noqa: F401
 
     from .compiler import ContextCompiler
+    from .replyer import Replyer
 
 logger = logging.getLogger(__name__)
-
-
-def _detect_local_timezone() -> tuple[tzinfo, str]:
-    local_now = datetime.now().astimezone()
-    local_timezone = local_now.tzinfo
-    if local_timezone is None:
-        raise RuntimeError("the operating system returned no local timezone")
-    timezone_name = (
-        getattr(local_timezone, "key", None)
-        or local_now.tzname()
-        or str(local_timezone)
-    )
-    if not timezone_name:
-        raise RuntimeError("the operating system returned an unnamed local timezone")
-    return local_timezone, timezone_name
-
-
-def _resolve_display_timezone(value: str) -> tuple[tzinfo, str]:
-    if value != "Auto":
-        return ZoneInfo(value), value
-    try:
-        return _detect_local_timezone()
-    except Exception:
-        logger.warning("Failed to detect local timezone; falling back to UTC")
-        return UTC, "UTC"
 
 
 EXECUTIVE_PROMPT = """
@@ -155,10 +131,31 @@ class FinishInput(BaseModel):
     reason: str = "round complete"
 
 
-class ExecutiveMiddleware(
-    AgentMiddleware["SocialAgentState", "SocialAgentContext", None]
-):
-    """Default executive plugin: social context prompt and foundational tools."""
+class ExecutiveAgent(AgentMiddleware["SocialAgentState", "SocialAgentContext", None]):
+    """The one real LangGraph agent component owned by the interaction plugin."""
+
+    @classmethod
+    def _resolve_display_timezone(cls, value: str) -> tuple[tzinfo, str]:
+        if value != "Auto":
+            return ZoneInfo(value), value
+        try:
+            local_now = datetime.now().astimezone()
+            local_timezone = local_now.tzinfo
+            if local_timezone is None:
+                raise RuntimeError("the operating system returned no local timezone")
+            timezone_name = (
+                getattr(local_timezone, "key", None)
+                or local_now.tzname()
+                or str(local_timezone)
+            )
+            if not timezone_name:
+                raise RuntimeError(
+                    "the operating system returned an unnamed local timezone"
+                )
+        except Exception:
+            logger.warning("Failed to detect local timezone; falling back to UTC")
+            return UTC, "UTC"
+        return local_timezone, timezone_name
 
     def __init__(
         self,
@@ -183,8 +180,8 @@ class ExecutiveMiddleware(
         self.plugins = plugins
         self.prompt_enabled = prompt_enabled
         self.clock_enabled = clock_enabled
-        self._display_timezone, self._display_timezone_name = _resolve_display_timezone(
-            config.display_timezone
+        self._display_timezone, self._display_timezone_name = (
+            self._resolve_display_timezone(config.display_timezone)
         )
         native_tools = self._build_tools()
         tools_by_name = {tool.name: tool for tool in native_tools}
@@ -216,8 +213,9 @@ class ExecutiveMiddleware(
         self._open_plugin_tool_names = [tool.name for tool in open_tools]
         self.tools = self._execution_registry([*native_tools, *home_tools, *open_tools])
 
-    @staticmethod
+    @classmethod
     def _merge_state_tools(
+        cls,
         state: str,
         native_tools: Sequence[BaseTool],
         plugin_tools: Sequence[BaseTool],
@@ -231,8 +229,11 @@ class ExecutiveMiddleware(
             merged[tool.name] = tool
         return list(merged.values())
 
-    @staticmethod
-    def _execution_registry(tools: Sequence[BaseTool]) -> list[BaseTool]:
+    @classmethod
+    def _execution_registry(
+        cls,
+        tools: Sequence[BaseTool],
+    ) -> list[BaseTool]:
         registered: dict[str, BaseTool] = {}
         for tool in tools:
             existing = registered.get(tool.name)
@@ -594,6 +595,14 @@ class ExecutiveMiddleware(
                 reply_result.full_text,
                 handled_through_sequence=max(context.opened[session_id]),
             )
+            evicted = await self.environment.take_context_evictions(session_id)
+            if evicted:
+                await self.plugins.context_evicted(
+                    ContextWindowEvicted(
+                        session_id=session_id,
+                        entries=tuple(evicted),
+                    )
+                )
             action = RecentAction(
                 session_id=session_id,
                 behavior=contract.behavior,
@@ -739,8 +748,9 @@ class ExecutiveMiddleware(
             ),
         ]
 
-    @staticmethod
+    @classmethod
     def _record_open_summary(
+        cls,
         context: SocialAgentContext,
         tool_call_id: str | None,
         *,
@@ -763,8 +773,9 @@ class ExecutiveMiddleware(
             "</completed_open_context>"
         )
 
-    @staticmethod
+    @classmethod
     def _compact_completed_open_contexts(
+        cls,
         messages: list[AnyMessage],
         summaries: dict[str, str],
     ) -> list[AnyMessage]:
@@ -840,8 +851,12 @@ class ExecutiveMiddleware(
             return [self._for_display(item) for item in value]
         return value
 
-    @staticmethod
-    def _with_budget(output: str, context: SocialAgentContext) -> str:
+    @classmethod
+    def _with_budget(
+        cls,
+        output: str,
+        context: SocialAgentContext,
+    ) -> str:
         return f"{output}\n[focus budget remaining={context.budget}]"
 
     def _round_prompt(

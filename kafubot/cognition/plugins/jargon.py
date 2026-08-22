@@ -1,4 +1,4 @@
-"""黑话术语抽取与解释中间件。
+"""黑话术语抽取与解释插件。
 
 本模块负责把已经从主对话窗口中裁剪出去的历史消息，异步转化为一组可检索的
 `jargon` 记录。它的核心目标不是立即回答用户，而是持续积累“这个会话里哪些
@@ -7,7 +7,7 @@
 
 整体处理链路如下：
 
-1. `JargonMiddleware.aafter_agent` 接收上游提供的历史消息批次。
+1. 插件宿主把刚离开实时上下文窗口的历史消息交给学习器。
 2. 批次按 `session_id` 进入内存队列，由后台 worker 串行消费。
 3. 分析模型先从消息中抽取疑似黑话词条，再和原始消息上下文重新关联。
 4. 词条写入 store 后，根据出现次数阈值决定是否触发进一步语义推断。
@@ -24,29 +24,26 @@ import random
 import re
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 from typing_extensions import override
 
 import jieba
 from json_repair import repair_json
-from langchain.tools import ToolRuntime, tool
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
-from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from kafubot.cognition.models import get_nonthinking_model
-from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
-from kafubot.cognition.plugins.daemon import (
-    BaseDaemonMiddleware,
-    SessionProcessOutput,
+from kafubot.cognition.plugins.background import (
+    BatchProcessOutput,
+    SessionBatchWorker,
 )
-from kafubot.cognition.plugins.lifecycle import ObservationEvent, ReplyPreparation
+from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
+from kafubot.cognition.plugins.lifecycle import ContextWindowEvicted, ReplyPreparation
 from kafubot.cognition.prompts.manager import BOT_NAME
-from kafubot.cognition.types import ManagerContext, ManagerState, UserMessage
+from kafubot.cognition.types import UserMessage
 from kafubot.cognition.utils import content_to_text
 
 if TYPE_CHECKING:
@@ -182,17 +179,6 @@ JARGON_COMPARE_INFERENCE_PROMPT = """
 """.strip()
 
 
-class QueryJargonInput(BaseModel):
-    """`query_jargon` 工具的输入模型。
-
-    Attributes:
-        words: 需要查询含义的词条列表。调用方通常会传入用户当前提到、但模型
-            自身无法可靠解释的简称、黑话或缩写。
-    """
-
-    words: list[str] = Field(description="要查询的词条列表。")
-
-
 class JargonEntry(TypedDict):
     """抽取得到的黑话候选条目。
 
@@ -246,8 +232,7 @@ class JargonRecord(TypedDict):
     updated_at: str
 
 
-@dataclass(slots=True)
-class PendingJargonAnalysisBatch:
+class PendingJargonAnalysisBatch(BaseModel):
     """等待后台分析的单个消息批次。
 
     Attributes:
@@ -262,29 +247,26 @@ class PendingJargonAnalysisBatch:
 _DEFAULT_NAMESPACE = "jargon"
 
 
-class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
+class JargonLearner(SessionBatchWorker[PendingJargonAnalysisBatch]):
     """为代理提供异步黑话抽取、入库、推断与查询能力。
 
-    这个中间件刻意不把黑话分析放在主对话的同步路径里，而是在消息被上游裁剪后
+    这个服务刻意不把黑话分析放在主对话的同步路径里，而是在消息被上游裁剪后
     再异步处理。这样可以把较重的术语学习成本挪到后台，同时尽量不影响当前轮响
     应时延。
 
     模块内部把整条链路拆成三个层次：
 
-    1. 收集层：在 `aafter_agent` 中接收裁剪后的历史消息，并按会话写入待处理队列。
+    1. 收集层：接收上下文驱逐事件，并按会话写入待处理队列。
     2. 工作层：后台 worker 串行分析每个会话，抽取候选词条并更新持久化记录。
-    3. 查询层：通过 `query_jargon` 工具向主代理暴露已确认黑话的含义查询能力。
+    3. 查询层：通过回复准备钩子提供当前会话已确认的黑话释义。
 
     作用域命中时遵循稳定的优先级策略：人工记录优先于 AI 记录，当前会话优先于
     关联会话，关联会话优先于全局共享记录；在同优先级下，再按出现次数选择更稳
     定的结果。
 
     Attributes:
-        tools: 暴露给代理的工具列表。目前包含 `query_jargon`。
         namespace_root: 存储黑话记录时使用的根命名空间。
     """
-
-    state_schema = ManagerState
 
     def __init__(
         self,
@@ -300,7 +282,7 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         jargon_group_resolver: Callable[[str], set[str] | tuple[set[str], bool]]
         | None = None,
     ) -> None:
-        """初始化黑话中间件。
+        """初始化黑话学习服务。
 
         Args:
             analyze_model: 用于黑话抽取与含义推断的分析模型。
@@ -342,53 +324,14 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         self._max_message_chars = max(1, max_input_chars // max_batches)
         self.namespace_root = _DEFAULT_NAMESPACE
 
-        self.tools = [
-            tool(
-                "query_jargon",
-                description="查询当前聊天上下文中的黑话或词条含义。用法：当你认为某些词的含义不明确，或者用户询问某些词的含义，需要进行查询。",
-                args_schema=QueryJargonInput,
-            )(self._query_jargon_tool)
-        ]
-
-    @override
-    async def aafter_agent(
-        self,
-        state: ManagerState,
-        runtime: Runtime[ManagerContext],
-    ) -> dict[str, Any] | None:
-        """接收裁剪后的历史消息，并把它们异步送入黑话分析队列。
-
-        该钩子只处理 `summary_pruned_messages`，也就是已经从主上下文窗口移除的
-        历史消息。这样做有两个好处：
-
-        1. 不会影响当前轮主推理的 token 预算。
-        2. 黑话学习可以和摘要系统一样，作为一种后台增量知识沉淀机制。
-
-        Args:
-            state: 当前代理状态。这里会读取其中的 `summary_pruned_messages`。
-            runtime: LangGraph 运行时上下文，用于获取 `session_id` 和 store。
-
-        Returns:
-            始终返回 `None`，因为该钩子只负责排队副作用，不直接改写状态。
-        """
-        if messages := cast(
-            "list[BaseMessage] | None", state.get("summary_pruned_messages")
-        ):
-            await self.learn_from_messages(
-                runtime.context["session_id"],
-                messages,
-                store=runtime.store,
-            )
-        return None
-
-    async def learn_from_messages(
+    async def consume_evicted(
         self,
         session_id: str,
         messages: Sequence[BaseMessage],
         *,
         store: BaseStore | None = None,
     ) -> None:
-        """Queue observable messages through the native plugin lifecycle."""
+        """Queue messages delivered by the native context-eviction hook."""
         if store is not None:
             self._store = self._store or store
         if messages:
@@ -405,7 +348,7 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         self,
         session_id: str,
         batches: tuple[PendingJargonAnalysisBatch, ...],
-    ) -> SessionProcessOutput:
+    ) -> BatchProcessOutput:
         """分析单个会话当前积压的黑话批次。
 
         父类已经负责从会话队列中切出当前批次窗口，这里只处理本轮业务逻辑：
@@ -887,23 +830,6 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         else:
             logger.info("[%s]%s 不是黑话", record["session_id"], record["content"])
 
-    async def _query_jargon(
-        self,
-        runtime: ToolRuntime[ManagerContext, ManagerState],
-        keyword: str,
-        limit: int = 10,
-        case_sensitive: bool = False,
-        fuzzy: bool = True,
-    ) -> list[dict[str, str]]:
-        return await self.query_jargon(
-            runtime.context["session_id"],
-            keyword,
-            limit=limit,
-            case_sensitive=case_sensitive,
-            fuzzy=fuzzy,
-            store=runtime.store,
-        )
-
     async def query_jargon(
         self,
         session_id: str,
@@ -1026,62 +952,6 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
             for _, _, record in sorted_results[:limit]
         ]
 
-    async def _query_jargon_tool(
-        self,
-        runtime: ToolRuntime[ManagerContext, ManagerState],
-        words: list[str],
-    ) -> dict[str, list[dict[str, Any]]]:
-        """`query_jargon` 工具的实现入口。
-
-        它会先规范化并去重输入词条，再按“精确匹配优先、失败后退化到模糊匹配”的
-        顺序逐个查询。
-
-        Args:
-            runtime: 工具运行时上下文。
-            words: 调用方请求解释的一组词条。
-
-        Returns:
-            形如 `{"results": [...]}` 的结构化结果，其中每个元素包含原始查询词、
-            是否命中以及命中的候选解释列表。
-        """
-        normalized_words = []
-        seen: set[str] = set()
-        for word in words if isinstance(words, list) else []:
-            word_text = _clean_text(word)
-            if not word_text or word_text in seen:
-                continue
-            normalized_words.append(word_text)
-            seen.add(word_text)
-
-        results: list[dict[str, Any]] = []
-        for word in normalized_words:
-            exact_matches = await self._query_jargon(
-                runtime,
-                keyword=word,
-                limit=5,
-                case_sensitive=False,
-                fuzzy=False,
-            )
-            matched_entries = exact_matches
-            if not matched_entries:
-                matched_entries = await self._query_jargon(
-                    runtime,
-                    keyword=word,
-                    limit=5,
-                    case_sensitive=False,
-                    fuzzy=True,
-                )
-
-            results.append(
-                {
-                    "word": word,
-                    "found": bool(matched_entries),
-                    "matches": matched_entries,
-                }
-            )
-
-        return {"results": results}
-
     def _resolve_jargon_scope(self, session_id: str) -> tuple[set[str], bool]:
         """解析当前会话可见的黑话作用域。
 
@@ -1112,8 +982,8 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         related_session_ids.update(str(item) for item in raw_ids if str(item).strip())
         return related_session_ids, bool(has_global_share)
 
-    @staticmethod
-    def _should_infer_meaning(record: JargonRecord) -> bool:
+    @classmethod
+    def _should_infer_meaning(cls, record: JargonRecord) -> bool:
         """判断某条记录当前是否应当触发新一轮含义推断。
 
         Args:
@@ -1145,8 +1015,7 @@ class JargonLearnerMiddleware(BaseDaemonMiddleware[PendingJargonAnalysisBatch]):
         self._store = None
 
     async def clear_session(self, session_id: str) -> None:
-        self._pending_batches.pop(session_id, None)
-        self._retry_attempts.pop(session_id, None)
+        self.discard(session_id)
         if self._store is None:
             return
         namespace = (self.namespace_root, "sessions", session_id)
@@ -1325,14 +1194,14 @@ async def apply(context: PluginContext, config: dict[str, Any]) -> None:
     path = str(values.pop("store_path", "./.database/jargon_learner.db"))
     temperature = float(values.pop("temperature", 0.1))
     store = await context.sqlite_store(path)
-    learner = JargonLearnerMiddleware(
+    learner = JargonLearner(
         analyze_model=get_nonthinking_model(temperature),
         store=store,
         **values,
     )
 
-    async def observe(event: ObservationEvent) -> None:
-        await learner.learn_from_messages(event.session_id, event.model_messages)
+    async def evicted(event: ContextWindowEvicted) -> None:
+        await learner.consume_evicted(event.session_id, event.model_messages)
 
     async def prepare(preparation: ReplyPreparation) -> str | None:
         text = " ".join(
@@ -1367,7 +1236,7 @@ async def apply(context: PluginContext, config: dict[str, Any]) -> None:
         )
 
     context.resource("jargon", learner)
-    context.on_observe(observe)
+    context.on_context_evicted(evicted)
     context.on_prepare_reply(prepare)
     context.clear_session(learner.clear_session)
 
@@ -1375,4 +1244,4 @@ async def apply(context: PluginContext, config: dict[str, Any]) -> None:
 plugin = PluginDefinition(name="jargon", apply=apply)
 
 
-__all__ = ["JargonLearnerMiddleware", "plugin"]
+__all__ = ["JargonLearner", "plugin"]

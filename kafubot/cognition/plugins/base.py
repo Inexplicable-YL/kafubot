@@ -3,27 +3,26 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
 from enum import StrEnum
 from inspect import isawaitable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar, cast
+from typing_extensions import override
 
 import aiosqlite
 from langchain_core.tools import BaseTool
 from langchain_openai import OpenAIEmbeddings
 from langgraph.store.sqlite import AsyncSqliteStore
+from pydantic import BaseModel, ConfigDict, Field
 
 from kafubot.config import PluginSettings
 
 if TYPE_CHECKING:
-    from langchain.agents.middleware import AgentMiddleware
-    from pydantic import BaseModel
-
     from kafubot.agency.models import SelfState, SocialHome
     from kafubot.cognition.plugins.world_model import ProviderQuery, WorldModelProvider
 
     from .lifecycle import (
+        ContextWindowEvicted,
         ObservationEvent,
         ReplyCommitted,
         ReplyPreparation,
@@ -38,6 +37,9 @@ EffectDisposer: TypeAlias = Callable[[], MaybeAwaitable[None]]
 SessionClearer: TypeAlias = Callable[[str], MaybeAwaitable[None]]
 ReadyHook: TypeAlias = Callable[[], MaybeAwaitable[None]]
 ObserveHook: TypeAlias = Callable[["ObservationEvent"], MaybeAwaitable[None]]
+ContextEvictionHook: TypeAlias = Callable[
+    ["ContextWindowEvicted"], MaybeAwaitable[None]
+]
 PeekHook: TypeAlias = Callable[
     ["SocialHome", "SelfState"],
     MaybeAwaitable[str | None],
@@ -59,9 +61,10 @@ class ToolScope(StrEnum):
     BOTH = "both"
 
 
-@dataclass(slots=True, frozen=True)
-class PluginTool:
+class PluginTool(BaseModel):
     """One executable tool plus its Main Executive availability contract."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     tool: BaseTool
     scope: ToolScope
@@ -70,23 +73,24 @@ class PluginTool:
         return self.scope in {scope, ToolScope.BOTH}
 
 
-@dataclass(slots=True)
-class _PluginContribution:
-    middleware: list[AgentMiddleware[Any, Any]] = field(default_factory=list)
-    tools: list[PluginTool] = field(default_factory=list)
-    providers: list[WorldModelProvider] = field(default_factory=list)
-    services: dict[str, Any] = field(default_factory=dict)
-    effects: list[EffectDisposer] = field(default_factory=list)
-    session_clearers: list[SessionClearer] = field(default_factory=list)
-    ready_hooks: list[ReadyHook] = field(default_factory=list)
-    observe_hooks: list[ObserveHook] = field(default_factory=list)
-    peek_hooks: list[PeekHook] = field(default_factory=list)
-    query_hooks: list[QueryHook] = field(default_factory=list)
-    preparation_hooks: list[PreparationHook] = field(default_factory=list)
-    guard_hooks: list[PreparationHook] = field(default_factory=list)
-    reply_hooks: list[ReplyHook] = field(default_factory=list)
-    skip_hooks: list[SkipHook] = field(default_factory=list)
-    owned_resources: set[int] = field(default_factory=set)
+class _PluginContribution(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    tools: list[PluginTool] = Field(default_factory=list)
+    providers: list[Any] = Field(default_factory=list)
+    services: dict[str, Any] = Field(default_factory=dict)
+    effects: list[EffectDisposer] = Field(default_factory=list)
+    session_clearers: list[SessionClearer] = Field(default_factory=list)
+    ready_hooks: list[ReadyHook] = Field(default_factory=list)
+    observe_hooks: list[Any] = Field(default_factory=list)
+    context_eviction_hooks: list[Any] = Field(default_factory=list)
+    peek_hooks: list[Any] = Field(default_factory=list)
+    query_hooks: list[Any] = Field(default_factory=list)
+    preparation_hooks: list[Any] = Field(default_factory=list)
+    guard_hooks: list[Any] = Field(default_factory=list)
+    reply_hooks: list[Any] = Field(default_factory=list)
+    skip_hooks: list[Any] = Field(default_factory=list)
+    owned_resources: set[int] = Field(default_factory=set)
 
 
 class PluginBuildContext:
@@ -179,21 +183,8 @@ class PluginContext:
             raise TypeError(
                 f"plugin {self.plugin_name} tool registration must contain BaseTool"
             )
-        self._contribution.tools.append(PluginTool(tool, scope))
+        self._contribution.tools.append(PluginTool(tool=tool, scope=scope))
         return tool
-
-    def middleware(
-        self,
-        middleware: AgentMiddleware[Any, Any],
-        *,
-        owned: bool = True,
-    ) -> AgentMiddleware[Any, Any]:
-        self._contribution.middleware.append(middleware)
-        if owned and callable(
-            getattr(middleware, "aclose", None) or getattr(middleware, "close", None)
-        ):
-            self.own(middleware)
-        return middleware
 
     def provider(self, provider: WorldModelProvider, *, owned: bool = True) -> Any:
         self._contribution.providers.append(provider)
@@ -248,6 +239,14 @@ class PluginContext:
         self._contribution.observe_hooks.append(callback)
         return callback
 
+    def on_context_evicted(
+        self,
+        callback: ContextEvictionHook,
+    ) -> ContextEvictionHook:
+        """Consume messages only after they leave the live context window."""
+        self._contribution.context_eviction_hooks.append(callback)
+        return callback
+
     def on_peek(self, callback: PeekHook) -> PeekHook:
         self._contribution.peek_hooks.append(callback)
         return callback
@@ -276,9 +275,10 @@ class PluginContext:
 PluginApply: TypeAlias = Callable[[PluginContext, Any], MaybeAwaitable[None]]
 
 
-@dataclass(slots=True, frozen=True)
-class PluginDefinition:
+class PluginDefinition(BaseModel):
     """Self-description exported by one autonomous plugin module."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     name: str
     apply: PluginApply
@@ -287,7 +287,27 @@ class PluginDefinition:
     after: tuple[str, ...] = ()
     config_model: type[BaseModel] | None = None
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        name: str,
+        apply: PluginApply,
+        *,
+        default_enabled: bool = True,
+        requires: tuple[str, ...] = (),
+        after: tuple[str, ...] = (),
+        config_model: type[BaseModel] | None = None,
+    ) -> None:
+        super().__init__(
+            name=name,
+            apply=apply,
+            default_enabled=default_enabled,
+            requires=requires,
+            after=after,
+            config_model=config_model,
+        )
+
+    @override
+    def model_post_init(self, _context: Any, /) -> None:
         if not self.name.strip():
             raise ValueError("plugin name cannot be empty")
         if self.name in self.requires:
@@ -416,8 +436,7 @@ class PluginHost:
             raise
         return host
 
-    @staticmethod
-    async def _complete(result: MaybeAwaitable[T], *, error: str) -> T:
+    async def _complete(self, result: MaybeAwaitable[T], *, error: str) -> T:
         if isawaitable(result):
             result = await result
         if result is not None:
@@ -436,14 +455,6 @@ class PluginHost:
 
     def optional_service(self, name: str) -> Any | None:
         return self.context.services.get(name)
-
-    @property
-    def middleware(self) -> tuple[AgentMiddleware[Any, Any], ...]:
-        return tuple(
-            middleware
-            for _, contribution in self._ordered
-            for middleware in contribution.middleware
-        )
 
     @property
     def providers(self) -> tuple[WorldModelProvider, ...]:
@@ -477,6 +488,13 @@ class PluginHost:
 
     async def observe(self, event: ObservationEvent) -> None:
         await self._notify("observe", "observe_hooks", event)
+
+    async def context_evicted(self, event: ContextWindowEvicted) -> None:
+        await self._notify(
+            "context_evicted",
+            "context_eviction_hooks",
+            event,
+        )
 
     async def peek(self, home: SocialHome, state: SelfState) -> str | None:
         outputs = await self._collect("peek", "peek_hooks", home, state)

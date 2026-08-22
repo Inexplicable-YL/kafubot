@@ -2,37 +2,30 @@ import logging
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 from typing_extensions import override
 
-from langchain.agents.middleware import ModelRequest, ModelResponse
-from langchain.agents.middleware.types import ExtendedModelResponse
-from langchain.tools import BaseTool, ToolRuntime, tool
+from langchain.tools import tool
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
-    AIMessage,
     BaseMessage,
     HumanMessage,
 )
 from langgraph.errors import GraphRecursionError
-from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from kafubot.cognition.graph import create_agent
 from kafubot.cognition.models import get_thinking_model
+from kafubot.cognition.plugins.background import BatchProcessOutput, SessionBatchWorker
 from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
-from kafubot.cognition.plugins.daemon import BaseDaemonMiddleware, SessionProcessOutput
-from kafubot.cognition.plugins.lifecycle import ObservationEvent, ReplyPreparation
+from kafubot.cognition.plugins.lifecycle import ContextWindowEvicted, ReplyPreparation
 from kafubot.cognition.plugins.world_model import ProviderQuery
 from kafubot.cognition.types import (
     MODEL_VISIBLE_TZ,
-    ManagerContext,
-    ManagerState,
     UserMessage,
 )
 
@@ -62,25 +55,6 @@ QueryMode = Literal[
 MEMORY_EXTRACTION_MAX_WRITES = 8
 RECENT_MEMORY_CONTEXT_LIMIT = 3
 
-
-TOOL_HINT_PROMPT = """【长期记忆工具】
-
-- query_memory()：当回复明显依赖历史对话、长期偏好、共同经历、人物长期信息或之前约定时使用。适合检索：过去事件、之前聊过的内容、长期偏好、先前承诺、任务进展、近期线索；不适合检索：寒暄、即时情绪回应、轻松接话、只看最近消息就能回答的内容。群聊里更克制；如果对方提到“之前”“上次”“最近”“还记得吗”“我喜欢”“我说过”等类似信号，可以更积极考虑检索。
-- 长期记忆写入由系统在回合结束后自动分析完成，不需要主动调用写入工具。
-
-群聊中请克制使用长期记忆工具。
-
-【近期记忆参考】
-{recent_memory_text}
-"""
-
-QUERY_MEMORY_TOOL_DESCRIPTION = (
-    "检索长期记忆并返回可读结果。"
-    "当回复明显依赖历史对话、长期偏好、共同经历、人物长期信息或之前约定时使用。"
-    "不适合寒暄、即时情绪回应、轻松接话，或只看最近消息就能回答的内容。"
-    "检索模式：search 查事实或偏好；time 查某段时间；episode 查某次经历；"
-    "aggregate 查整体情况；拿不准时用 hybrid。"
-)
 
 ADD_MEMORY_MANUAL_TOOL_DESCRIPTION = (
     "手动写入一条长期记忆。主 Agent 必须直接提供 content、kind、user_name/user_id、"
@@ -169,39 +143,6 @@ class LongMemoryEvent(TypedDict):
     created_at: str
 
 
-class QueryMemoryInput(BaseModel):
-    query: str = Field(
-        default="",
-        description="要检索的关键词或问题。",
-    )
-    limit: int = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description="返回条数，默认使用系统配置值。",
-    )
-    mode: QueryMode = Field(
-        default="search",
-        description=(
-            "检索模式：search/time/hybrid/episode/aggregate。"
-            "search 查事实或偏好；time 查某段时间；episode 查某次经历；"
-            "aggregate 查整体情况；拿不准时用 hybrid。"
-        ),
-    )
-    user_name: str = Field(
-        default="",
-        description="人物名称。提供后优先用于解析 user_id；无法匹配则降级为关键词模糊检索。",
-    )
-    time_start: str = Field(
-        default="",
-        description="起始时间，可填写时间戳或 ISO 时间。",
-    )
-    time_end: str = Field(
-        default="",
-        description="结束时间，可填写时间戳或 ISO 时间。",
-    )
-
-
 class AddMemoryManualInput(BaseModel):
     content: str = Field(
         description="要写入长期记忆的内容。必须是稳定、未来有用、已确认的信息。",
@@ -272,8 +213,7 @@ class MemoryCandidate(BaseModel):
         return [cleaned for item in value if (cleaned := _clean_text(item))]
 
 
-@dataclass(slots=True)
-class NormalizedUserResolution:
+class NormalizedUserResolution(BaseModel):
     user_name: str = ""
     user_id: str = ""
     fallback_query_extra: str = ""
@@ -281,15 +221,12 @@ class NormalizedUserResolution:
     fallback_reason: str = ""
 
 
-@dataclass(slots=True)
-class PendingMemoryAnalysisBatch:
+class PendingMemoryAnalysisBatch(BaseModel):
     session_id: str
     user_messages: list[UserMessage]
 
 
-class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
-    state_schema = ManagerState
-
+class LongMemory(SessionBatchWorker[PendingMemoryAnalysisBatch]):
     def __init__(
         self,
         *,
@@ -338,72 +275,23 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
         self._user_maps: dict[str, dict[str, str]] = defaultdict(dict)
         self._recent_memory_cache: dict[tuple[str, ...], list[LongMemoryHit]] = {}
         self._store: BaseStore | None = store
-        self.tools = self._build_tools()
 
-    @override
-    async def aafter_agent(
-        self, state: ManagerState, runtime: Runtime[ManagerContext]
-    ) -> dict[str, Any] | None:
-        session_id = runtime.context["session_id"]
-        self._remember_users_from_state(state, session_id)
-        await self.learn_from_messages(
-            session_id,
-            state.get("summary_pruned_messages") or (),
-            store=runtime.store,
-        )
-        return None
-
-    async def learn_from_messages(
+    async def consume_evicted(
         self,
         session_id: str,
         messages: Sequence[BaseMessage],
         *,
         store: BaseStore | None = None,
     ) -> None:
-        """Learn observable messages directly from the unified plugin event API."""
+        """Learn only messages evicted from the plugin host's live context."""
         if store is not None:
             self._store = self._store or store
-        await self._handle_pruned_messages(
+        await self._queue_evicted_messages(
             session_id=session_id,
             messages=list(messages),
         )
 
-    @override
-    async def awrap_model_call(
-        self,
-        request: ModelRequest[ManagerContext],
-        handler: Callable[
-            [ModelRequest[ManagerContext]], Awaitable[ModelResponse[Any]]
-        ],
-    ) -> ModelResponse[Any] | AIMessage | ExtendedModelResponse[Any]:
-        if request.runtime.store is not None:
-            self._store = self._store or request.runtime.store
-        if not self.inject_memory_hint:
-            return await handler(request)
-        state = cast("ManagerState", request.state)
-        self._remember_users_from_state(state, request.runtime.context["session_id"])
-        recent_memory_text = "暂无近期记忆。"
-        if request.runtime.store:
-            recent_memory_text = await self._format_recent_memory_context(
-                related_messages=state.get("inputs", []),
-                session_id=request.runtime.context["session_id"],
-                store=request.runtime.store,
-            )
-        hint = HumanMessage(
-            content=TOOL_HINT_PROMPT.format(recent_memory_text=recent_memory_text)
-        )
-        request = request.override(messages=[*request.messages, hint])
-        return await handler(request)
-
-    def _build_tools(self) -> list[BaseTool]:
-        query_tool = tool(
-            "query_memory",
-            description=QUERY_MEMORY_TOOL_DESCRIPTION,
-            args_schema=QueryMemoryInput,
-        )(self._query_memory)
-        return [query_tool]
-
-    async def _handle_pruned_messages(
+    async def _queue_evicted_messages(
         self,
         *,
         session_id: str,
@@ -429,7 +317,7 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
         self,
         session_id: str,
         batches: tuple[PendingMemoryAnalysisBatch, ...],
-    ) -> SessionProcessOutput:
+    ) -> BatchProcessOutput:
         store = self._store
         if store is None:
             logger.warning(
@@ -467,6 +355,7 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
 
     async def clear_session(self, session_id: str) -> None:
         """Delete all session-scoped memory; never touch another QQ chat scope."""
+        self.discard(session_id)
         self._user_maps.pop(session_id, None)
         if self._store is None:
             return
@@ -487,34 +376,11 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
                     await self._store.adelete(namespace, item.key)
                 self._recent_memory_cache.pop(namespace, None)
 
-    @staticmethod
-    def _validate_positive_int(value: int, name: str) -> int:
+    @classmethod
+    def _validate_positive_int(cls, value: int, name: str) -> int:
         if value < 1:
             raise ValueError(f"{name} must be greater than 0, got {value}.")
         return value
-
-    async def _query_memory(  # noqa: PLR0915
-        self,
-        runtime: ToolRuntime[ManagerContext, ManagerState],
-        query: str = "",
-        limit: int = 5,
-        mode: QueryMode = "search",
-        user_name: str = "",
-        time_start: str = "",
-        time_end: str = "",
-    ) -> LongMemoryQueryResult:
-        state = runtime.state
-        return await self.query_memory(
-            runtime.context["session_id"],
-            query=query,
-            limit=limit,
-            mode=mode,
-            user_name=user_name,
-            time_start=time_start,
-            time_end=time_end,
-            user_messages=state.get("inputs", []),
-            store=runtime.store,
-        )
 
     async def query_memory(  # noqa: PLR0915
         self,
@@ -1100,24 +966,6 @@ class LongMemoryMiddleware(BaseDaemonMiddleware[PendingMemoryAnalysisBatch]):
             fallback_reason="user_name_not_resolved",
         )
 
-    def _remember_users_from_state(self, state: ManagerState, session_id: str) -> None:
-        self._remember_users_from_messages(
-            session_id, cast("list[BaseMessage]", state.get("histories"))
-        )
-        self._remember_users_from_user_messages(session_id, state.get("inputs", []))
-
-    def _remember_users_from_messages(
-        self,
-        session_id: str,
-        messages: list[BaseMessage] | None,
-    ) -> None:
-        if not messages:
-            return
-        self._remember_users_from_user_messages(
-            session_id,
-            self._extract_user_messages(messages),
-        )
-
     def _remember_users_from_user_messages(
         self,
         session_id: str,
@@ -1399,17 +1247,19 @@ async def apply(context: PluginContext, config: dict[str, Any]) -> None:
         embedding_model=embedding_model,
         dimensions=dimensions,
     )
-    learner = LongMemoryMiddleware(
+    learner = LongMemory(
         analyze_model=get_thinking_model(reasoning_effort="high"),
         store=store,
         **values,
     )
     environment = cast("SocialEnvironment", context.service("environment"))
 
-    async def observe(event: ObservationEvent) -> None:
-        await learner.learn_from_messages(event.session_id, event.model_messages)
+    async def evicted(event: ContextWindowEvicted) -> None:
+        await learner.consume_evicted(event.session_id, event.model_messages)
 
     async def prepare(preparation: ReplyPreparation) -> str | None:
+        if not learner.inject_memory_hint:
+            return None
         inputs = list(preparation.user_messages)
         if not inputs:
             return None
@@ -1440,7 +1290,7 @@ async def apply(context: PluginContext, config: dict[str, Any]) -> None:
         return result["summary"]
 
     context.resource("memory", learner)
-    context.on_observe(observe)
+    context.on_context_evicted(evicted)
     context.on_prepare_reply(prepare)
     context.on_query(query)
     context.clear_session(learner.clear_session)

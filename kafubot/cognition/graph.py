@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import functools
 import itertools
-from dataclasses import dataclass, field, fields
+from dataclasses import fields
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -57,10 +57,10 @@ from langgraph.prebuilt import ToolCallTransformer
 from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.types import Command, Send
 from langsmith import traceable
+from pydantic import BaseModel, ConfigDict, Field
 
 
-@dataclass
-class _ComposedExtendedModelResponse(Generic[ResponseT]):
+class _ComposedExtendedModelResponse(BaseModel, Generic[ResponseT]):
     """Internal result from composed ``wrap_model_call`` middleware.
 
     Unlike ``ExtendedModelResponse`` (user-facing, single command), this holds the
@@ -68,10 +68,12 @@ class _ComposedExtendedModelResponse(Generic[ResponseT]):
     composition.
     """
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     model_response: ModelResponse[ResponseT]
     """The underlying model response."""
 
-    commands: list[Command[Any]] = field(default_factory=list)
+    commands: list[Command[Any]] = Field(default_factory=list)
     """Commands accumulated from all middleware layers (inner-first, then outer)."""
 
 

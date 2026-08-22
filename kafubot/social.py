@@ -1,64 +1,90 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
-from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 from langchain.agents import AgentState
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphRecursionError
+from pydantic import BaseModel, Field
 
 from kafubot.actions import QQActions
-from kafubot.agency.models import RoundResult, SelfState, SocialHome
+from kafubot.agency.models import (
+    ConversationCandidate,
+    RoundResult,
+    SelfState,
+    SocialHome,
+)
 from kafubot.cognition.graph import create_agent
 from kafubot.cognition.media.image import ImageReadResult, get_analyzer
 from kafubot.cognition.plugins.base import PluginHost
-from kafubot.cognition.plugins.lifecycle import ObservationEvent
+from kafubot.cognition.plugins.lifecycle import ContextWindowEvicted, ObservationEvent
 from kafubot.cognition.plugins.loader import discover_plugins
 from kafubot.cognition.plugins.world_model import ProviderCommit
 from kafubot.log import logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable
+    from typing import Protocol
 
-    from langchain.agents.middleware import AgentMiddleware
     from langchain_core.language_models.chat_models import BaseChatModel
 
     from kafubot.adapters.cqhttp.event import (
         GroupMessageEvent,
         PrivateMessageEvent,
     )
-    from kafubot.cognition.plugins.attention import AttentionScheduler
     from kafubot.cognition.plugins.environment import (
         ConversationState,
+        CQHTTPMessageIngestor,
+        ImageAnalyzer,
         SocialEnvironment,
     )
-    from kafubot.cognition.plugins.ingress import CQHTTPMessageIngestor, ImageAnalyzer
-    from kafubot.cognition.plugins.interaction import ContextCompiler
-    from kafubot.cognition.plugins.replyer import Replyer
-    from kafubot.cognition.plugins.self_state import SelfStateStore
-    from kafubot.cognition.plugins.time_gate import GlobalGate
-    from kafubot.cognition.plugins.world_model import WorldModelHub
+    from kafubot.cognition.plugins.interaction import (
+        ContextCompiler,
+        ExecutiveAgent,
+        Replyer,
+    )
+    from kafubot.cognition.plugins.world_model import (
+        AttentionScheduler,
+        SelfStateStore,
+        WorldModelHub,
+    )
     from kafubot.cognition.types import UserMessage
     from kafubot.config import AgentConfig
 
+    class WakeDecision(Protocol):
+        wake: bool
+        score: float
+        reasons: tuple[str, ...]
 
-@dataclass(slots=True)
-class SocialAgentContext:
+    class WakeGate(Protocol):
+        async def consider(
+            self,
+            session_id: str,
+            message: UserMessage,
+            candidate: ConversationCandidate,
+            state: SelfState,
+        ) -> WakeDecision: ...
+
+        async def force_wake(self) -> None: ...
+
+        async def wait(self, *, timeout: float | None = None) -> bool: ...
+
+
+class SocialAgentContext(BaseModel):
     """One create_agent invocation, owned and managed by the social runtime."""
 
     home: SocialHome
     state: SelfState
     provider_peek: list[str]
     budget: int
-    opened: dict[str, list[int]] = field(default_factory=dict)
+    opened: dict[str, list[int]] = Field(default_factory=dict)
     open_session_id: str | None = None
-    open_context_summaries: dict[str, str] = field(default_factory=dict)
-    focus_stack: list[str] = field(default_factory=list)
-    claimed: set[str] = field(default_factory=set)
-    handled: set[str] = field(default_factory=set)
+    open_context_summaries: dict[str, str] = Field(default_factory=dict)
+    focus_stack: list[str] = Field(default_factory=list)
+    claimed: set[str] = Field(default_factory=set)
+    handled: set[str] = Field(default_factory=set)
     reply_slots_used: int = 0
     replies: int = 0
     skipped: int = 0
@@ -74,7 +100,7 @@ class SocialAgentContext:
 
 
 class SocialAgentState(AgentState[None]):
-    """State carried by the replaceable social-agent middleware graph."""
+    """State carried by the social Executive graph."""
 
 
 class SocialAgentRuntime:
@@ -86,23 +112,18 @@ class SocialAgentRuntime:
         *,
         environment: SocialEnvironment | None = None,
         state_store: SelfStateStore | None = None,
-        middleware: Sequence[
-            AgentMiddleware[SocialAgentState, SocialAgentContext, None]
-        ]
-        | None = None,
         model_factory: Callable[[], BaseChatModel] | None = None,
         image_analyzer_factory: Callable[[], ImageAnalyzer] | None = None,
     ) -> None:
         self.config = config
         self.environment: SocialEnvironment | None = environment
         self.state_store: SelfStateStore | None = state_store
-        self.gate: GlobalGate | None = None
+        self.gate: WakeGate | None = None
         self.attention: AttentionScheduler | None = None
         self.providers: WorldModelHub | None = None
         self.compiler: ContextCompiler | None = None
         self.replyer: Replyer | None = None
-        self.middleware = tuple(middleware or ())
-        self._custom_middleware = tuple(middleware) if middleware is not None else None
+        self._agent_stack: tuple[ExecutiveAgent, ...] = ()
         self._plugin_host: PluginHost | None = None
         self._plugins_lock = anyio.Lock()
         self._model_factory_override = model_factory
@@ -122,7 +143,7 @@ class SocialAgentRuntime:
     def model(self) -> BaseChatModel:
         if self._model is None:
             if self.model_factory is None:
-                raise RuntimeError("model plugin is disabled")
+                raise RuntimeError("interaction plugin did not provide a model")
             self._model = self.model_factory()
         return self._model
 
@@ -132,7 +153,7 @@ class SocialAgentRuntime:
             self._agent = create_agent(
                 model=self.model,
                 tools=[],
-                middleware=self.middleware,
+                middleware=self._agent_stack,
                 state_schema=SocialAgentState,
                 context_schema=SocialAgentContext,
                 name="social_agent",
@@ -151,7 +172,6 @@ class SocialAgentRuntime:
                 services={
                     "config": self.config,
                     "image_analyzer_factory": self._image_analyzer_factory,
-                    "custom_middleware": self._custom_middleware,
                     "model_factory_override": self._model_factory_override,
                     **(
                         {"environment": self.environment}
@@ -169,19 +189,11 @@ class SocialAgentRuntime:
                 "WorldModelHub | None",
                 host.optional_service("world_model"),
             )
-            try:
-                plugin_middleware = cast(
-                    "tuple[AgentMiddleware[SocialAgentState, SocialAgentContext, None], ...]",
-                    host.middleware,
-                )
-                middleware = (
-                    plugin_middleware
-                    if self._custom_middleware is None
-                    else (*self._custom_middleware, *plugin_middleware)
-                )
-            except BaseException:
-                await host.aclose()
-                raise
+            executive = cast(
+                "ExecutiveAgent | None",
+                host.optional_service("executive_agent"),
+            )
+            middleware = (executive,) if executive is not None else ()
             self.providers = providers
             self.environment = cast(
                 "SocialEnvironment | None",
@@ -191,7 +203,7 @@ class SocialAgentRuntime:
                 "SelfStateStore | None",
                 host.optional_service("state_store"),
             )
-            self.gate = cast("GlobalGate | None", host.optional_service("gate"))
+            self.gate = cast("WakeGate | None", host.optional_service("gate"))
             self.attention = cast(
                 "AttentionScheduler | None",
                 host.optional_service("attention"),
@@ -211,7 +223,7 @@ class SocialAgentRuntime:
             )
             if configured_model_factory is not None:
                 self.model_factory = configured_model_factory
-            self.middleware = middleware
+            self._agent_stack = middleware
             self._plugin_host = host
 
     async def aclose(self) -> None:
@@ -219,7 +231,6 @@ class SocialAgentRuntime:
             return
         self._closed = True
         await self._force_wake()
-        await self._close_middleware()
         if self._plugin_host is not None:
             await self._plugin_host.aclose()
             self._plugin_host = None
@@ -397,6 +408,11 @@ class SocialAgentRuntime:
                 actions=actions,
             )
         )
+        evicted = await environment.take_context_evictions(session_id)
+        if evicted:
+            await cast("PluginHost", self._plugin_host).context_evicted(
+                ContextWindowEvicted(session_id=session_id, entries=tuple(evicted))
+            )
         state = await state_store.load()
         if self.gate is not None:
             decision = await self.gate.consider(
@@ -436,31 +452,6 @@ class SocialAgentRuntime:
             if self._wake_event is event:
                 self._wake_event = anyio.Event()
         return True
-
-    async def _close_middleware(self) -> None:
-        closed: set[int] = set()
-        host_owned = (
-            {id(middleware) for middleware in self._plugin_host.middleware}
-            if self._plugin_host is not None
-            else set()
-        )
-        for plugin in reversed(self.middleware):
-            identity = id(plugin)
-            if identity in closed or identity in host_owned:
-                continue
-            closed.add(identity)
-            close = getattr(plugin, "aclose", None)
-            if not callable(close):
-                continue
-            try:
-                result = close()
-                if isawaitable(result):
-                    await result
-            except Exception:
-                logger.exception(
-                    "Agent middleware shutdown failed",
-                    middleware=type(plugin).__name__,
-                )
 
     async def _has_idle_work(self) -> bool:
         if self.state_store is None or self.environment is None:

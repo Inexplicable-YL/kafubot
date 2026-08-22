@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from pydantic import BaseModel, ConfigDict, Field
 
-if TYPE_CHECKING:
-    from kafubot.actions import QQActions
-    from kafubot.agency.models import (
-        ActionContract,
-        CompiledContext,
-        ConversationCandidate,
-        ReplyResult,
-        TimelineEntry,
-    )
-    from kafubot.cognition.types import UserMessage
+from kafubot.actions import QQActions  # noqa: TC001 - Pydantic runtime type
+from kafubot.agency.models import (
+    ActionContract,  # noqa: TC001 - Pydantic runtime type
+    CompiledContext,  # noqa: TC001 - Pydantic runtime type
+    ConversationCandidate,  # noqa: TC001 - Pydantic runtime type
+    ReplyResult,  # noqa: TC001 - Pydantic runtime type
+    TimelineEntry,  # noqa: TC001 - Pydantic runtime type
+)
+from kafubot.cognition.types import UserMessage  # noqa: TC001 - Pydantic runtime type
 
 
 def user_model_message(message: UserMessage) -> HumanMessage:
@@ -37,8 +36,13 @@ def timeline_model_message(entry: TimelineEntry) -> BaseMessage:
     return HumanMessage(content=entry.content)
 
 
-@dataclass(slots=True, frozen=True)
-class ObservationEvent:
+class LifecycleEvent(BaseModel):
+    """Validated data passed through plugin lifecycle hooks."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+
+class ObservationEvent(LifecycleEvent):
     session_id: str
     message: UserMessage
     candidate: ConversationCandidate
@@ -54,12 +58,24 @@ class ObservationEvent:
         return tuple(timeline_model_message(entry) for entry in self.history)
 
 
-@dataclass(slots=True)
-class ReplyPreparation:
+class ContextWindowEvicted(LifecycleEvent):
+    """Messages that just transitioned out of a session's live model window."""
+
+    session_id: str
+    entries: tuple[TimelineEntry, ...]
+
+    @property
+    def model_messages(self) -> tuple[BaseMessage, ...]:
+        return tuple(timeline_model_message(entry) for entry in self.entries)
+
+
+class ReplyPreparation(LifecycleEvent):
+    model_config = ConfigDict(frozen=False)
+
     contract: ActionContract
     context: CompiledContext
     actions: QQActions
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def user_messages(self) -> tuple[UserMessage, ...]:
@@ -74,8 +90,7 @@ class ReplyPreparation:
         return tuple(timeline_model_message(entry) for entry in self.context.messages)
 
 
-@dataclass(slots=True, frozen=True)
-class ReplyCommitted:
+class ReplyCommitted(LifecycleEvent):
     preparation: ReplyPreparation
     result: ReplyResult
 
@@ -87,14 +102,15 @@ class ReplyCommitted:
         )
 
 
-@dataclass(slots=True, frozen=True)
-class SkipCommitted:
+class SkipCommitted(LifecycleEvent):
     session_id: str
     reason: str
     history: tuple[TimelineEntry, ...]
 
 
 __all__ = [
+    "ContextWindowEvicted",
+    "LifecycleEvent",
     "ObservationEvent",
     "ReplyCommitted",
     "ReplyPreparation",

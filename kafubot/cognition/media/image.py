@@ -131,8 +131,8 @@ class ImageCache:
                 await conn.run_sync(Base.metadata.create_all)
             self._ready = True
 
-    @staticmethod
-    def _from_record(r: Record) -> CacheEntry:
+    @classmethod
+    def _from_record(cls, r: Record) -> CacheEntry:
         return CacheEntry(
             record_id=r.record_id,
             base64=r.base64,

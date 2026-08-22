@@ -16,7 +16,7 @@ PluginHost：发现、依赖、配置、所有权、回滚、生命周期
         │
         ├── Ingress ──► Environment ──► Observation Hooks
         ├── Gate / Attention / Self State / World Providers
-        ├── Tool(HOME/OPEN) / Middleware / Reply Hooks
+        ├── Tool(HOME/OPEN) / Native Lifecycle Hooks
         └── Model / Executive / Replyer
                          │
                          ▼
@@ -42,7 +42,7 @@ Action Contract，或以 `quit` 明确保持沉默。Replyer 只实现措辞，�
   `__init__.py` 导出 `plugin`。Loader 只扫描插件目录的直接子文件/包，未导出
   `plugin` 的 `base.py`、`loader.py` 等基础设施不会被视为插件，也不存在
   `builtin/` 或集中插件清单。
-- `PluginContext` 是唯一扩展面：同一 API 注册 Service/Resource、Tool、Middleware、
+- `PluginContext` 是唯一扩展面：同一 API 注册 Service/Resource、Tool、
   World Provider、启动完成回调、会话清理和所有运行时 Hook。不存在
   `SocialPluginHub`、兼容 Bridge 或第二套插件生命周期。
 - `PluginHost` 执行依赖拓扑、配置预校验和两阶段装配。`apply` 阶段发布能力，
@@ -50,13 +50,15 @@ Action Contract，或以 `quit` 明确保持沉默。Replyer 只实现措辞，�
 - Tool 可声明 `HOME`、`OPEN` 或 `BOTH` 作用域。所有工具只向
   执行图注册一次，Executive 每轮仅暴露当前状态的子集，并在实际调用前再次校验
   状态，因此作用域不依赖提示词约束。
-- `on_observe`、`on_peek`、`on_query`、`on_prepare_reply`、`on_guard_reply`、
+- `on_observe`、`on_context_evicted`、`on_peek`、`on_query`、`on_prepare_reply`、`on_guard_reply`、
   `on_reply_committed` 和 `on_skip_committed` 直接注册到 Host。事件 API 提供当前
-  原生消息，不再重建旧 `ManagerState` 或伪造 `ToolRuntime`。
+  原生消息，不再重建旧 `ManagerState`、继承伪 Middleware 或伪造 `ToolRuntime`。
+- `on_context_evicted` 只接收刚刚离开实时模型窗口、且此前未派发过的消息；摘要、
+  长期记忆、黑话、行为和表达学习统一消费这一事件，窗口内消息不会提前进入后台学习。
 - 观察、知识补充和提交后处理采用故障隔离；回复守卫采用失败关闭，避免限流或
   安全组件异常时继续发送消息。
 
-一个插件可以同时贡献 Tool、Middleware 与生命周期行为：
+一个插件可以同时贡献 Tool、服务与生命周期行为：
 
 ```python
 from kafubot.cognition.plugins import PluginContext, PluginDefinition, ToolScope
@@ -65,8 +67,8 @@ from kafubot.cognition.plugins import PluginContext, PluginDefinition, ToolScope
 def apply(context: PluginContext, config: dict[str, object]) -> None:
     service = context.resource("my_service", MyService(**config))
     context.tool(service.search_tool, ToolScope.OPEN)
-    context.middleware(service.middleware)
     context.on_observe(service.observe)
+    context.on_context_evicted(service.learn_from_evicted_context)
     context.on_prepare_reply(service.prepare_reply)
     context.clear_session(service.clear_session)
 
@@ -83,36 +85,32 @@ my_plugin = "my_package.kafubot_plugin"
 
 当前组件均由 `[agent.plugins.<name>]` 独立控制：
 
+核心 loop 只由三个插件组成：`environment → world_model → interaction`。协议摄取、
+状态建模和决策交互分别由一个插件完整负责；其余插件均为可独立关闭的增强能力。
+
 | 插件 | 接入当前运行时的职责 |
 | --- | --- |
-| `environment` | 提供跨会话可观察环境；可由测试或部署注入实现 |
-| `self_state` | 提供 Focus、Active Threads、Fatigue 等自身状态存储 |
-| `model` | 提供 Main Executive 主模型工厂 |
-| `ingress` | 将 OneBot 文本、引用和图片转成稳定认知消息 |
-| `attention` | 从所有活跃会话构造 Social Home |
-| `world_model` | 聚合 Conversation Provider、插件 Provider 与查询 Hook |
-| `replyer` | 根据 Action Contract 生成并发送可见回复 |
-| `interaction` | 启用 Main Executive 的 HOME/OPEN 交互中间件 |
+| `environment` | 将 OneBot 消息转换为认知消息，并维护跨会话可观察环境 |
+| `world_model` | 维护 Self State、Attention、Social Home，并聚合世界查询 Provider |
+| `interaction` | 提供主模型、系统提示、时钟、HOME/OPEN Executive、上下文编译和回复实现 |
 | `social_signals` | 可复用的社交信号分析服务 |
 | `conversation` | 观察会话结构，并向回复注入当前会话框架 |
 | `reply_effects` | 跟踪发送后的可观察反馈，回写行为和表达效果 |
 | `limiter` | 在发送前限流，在可见回复后记账 |
-| `time_gate` | 用 Global Gate 决定何时唤醒；关闭后新消息直接唤醒 |
 | `meme` | 在 OPEN 提供 `search_meme`，并按 Action Contract 的 `meme_intent` 发送 |
 | `jargon` | 后台学习群体黑话，并在相关回复前提供释义 |
 | `memory` | 后台写入长期记忆，并提供自动召回和 `search_memory` 查询 |
 | `summarization` | 后台维护会话摘要，并在回复前提供摘要 |
 | `behavior` | 准备行为参考、学习行为模式并接收可观察效果反馈 |
 | `expression` | 准备表达习惯、学习表达模式并接收可观察效果反馈 |
-| `prompt` | 启用 Main Executive 系统提示 |
-| `clock` | 向 Executive 暴露显示时区中的当前时间 |
 | `search_song` | 在 OPEN 状态提供歌曲检索工具 |
 | `view_message` | 在 OPEN 状态读取当前 QQ 会话中的合并转发消息 |
 
 `conversation` 和 `reply_effects` 依赖 `social_signals`；`interaction` 依赖
-Environment、Model、Replyer、Self State 和 World Model。启用依赖方却关闭依赖、
-配置未知插件或形成循环依赖时，启动会直接报错；已创建的数据库、后台任务、
-Provider、HTTP Client 和 SQLAlchemy Engine 会被回滚释放。
+`environment` 和 `world_model`，`world_model` 依赖 `environment`。系统提示与时钟不再
+用空插件表达，而是由 `interaction.options.prompt_enabled` 和 `clock_enabled` 控制。
+启用依赖方却关闭依赖、配置未知插件或形成循环依赖时，启动会直接报错；已创建的
+数据库、后台任务、Provider、HTTP Client 和 SQLAlchemy Engine 会被回滚释放。
 
 示例：
 
@@ -126,7 +124,7 @@ enabled = false
 ```
 
 旧实现里依赖另一套 Manager Agent、或已被当前多模态摄取和 Main Executive 覆盖的
-`query_image`、`query_expert`、调试工具注入及延迟工具中间件没有保留。歌曲检索和
+`query_image`、`query_expert`、调试工具注入及延迟工具机制没有保留。歌曲检索和
 转发消息读取则改造成只在当前 OPEN 会话中可用的插件工具。
 
 ## 目录职责

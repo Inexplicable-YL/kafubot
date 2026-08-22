@@ -1,28 +1,25 @@
 # ruff: noqa: TC002, TC003, DTZ005, TRY400, TRY401, SIM103, PERF401
-"""Behavior learner middleware entrypoint."""
+"""Behavior learning service and background analysis pipeline."""
 
 import json
 import re
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from typing_extensions import override
 
 import anyio
 from json_repair import repair_json
-from langchain.agents.middleware import ModelRequest, ModelResponse
-from langchain.agents.middleware.types import ExtendedModelResponse
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langgraph.runtime import Runtime
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from kafubot.cognition.plugins.daemon import BaseDaemonMiddleware, SessionProcessOutput
+from kafubot.cognition.plugins.background import BatchProcessOutput, SessionBatchWorker
 from kafubot.cognition.prompts.manager import BOT_NAME
-from kafubot.cognition.types import ManagerContext, ManagerState, UserMessage
+from kafubot.cognition.types import UserMessage
 from kafubot.cognition.utils import content_to_text
 
 from .constants import (
@@ -86,8 +83,9 @@ BEHAVIOR_LEARN_TEMPERATURE = 0.25
 BEHAVIOR_FEEDBACK_TEMPERATURE = 0.15
 
 
-@dataclass(frozen=True, slots=True)
-class BehaviorMessageRecord:
+class BehaviorMessageRecord(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     speaker: Literal["SELF", "USER"]
     content: str
     name: str = ""
@@ -95,8 +93,9 @@ class BehaviorMessageRecord:
     occurred_at: datetime | None = None
 
 
-@dataclass(frozen=True)
-class BehaviorCandidate:
+class BehaviorCandidate(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     action: str
     outcome: str
     source_ids: list[str]
@@ -105,8 +104,9 @@ class BehaviorCandidate:
     learning_type: str = LEARNING_OBSERVED
 
 
-@dataclass(frozen=True)
-class BehaviorParseDiagnostics:
+class BehaviorParseDiagnostics(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     normalized_response: str
     parsed_item_count: int = 0
     accepted_item_count: int = 0
@@ -117,20 +117,23 @@ class BehaviorParseDiagnostics:
     non_list_output: bool = False
 
 
-@dataclass(frozen=True)
-class BehaviorParseResult:
+class BehaviorParseResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     candidates: list[BehaviorCandidate]
     diagnostics: BehaviorParseDiagnostics
 
 
-@dataclass(frozen=True)
-class BehaviorFilterResult:
+class BehaviorFilterResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     candidates: list[BehaviorCandidate]
     skipped_reasons: dict[str, int]
 
 
-@dataclass(frozen=True)
-class BehaviorFeedbackCandidate:
+class BehaviorFeedbackCandidate(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     behavior_id: int
     adopted: bool
     status: str
@@ -140,16 +143,18 @@ class BehaviorFeedbackCandidate:
     source_ids: list[str]
 
 
-@dataclass(frozen=True)
-class BehaviorLearningAcquireResult:
+class BehaviorLearningAcquireResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     acquired: bool
     reason: str = ""
     active_count: int = 0
     max_count: int = 0
 
 
-@dataclass(frozen=True)
-class BehaviorFeedbackContextItem:
+class BehaviorFeedbackContextItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     item_id: str
     item_type: str
     text: str
@@ -157,27 +162,30 @@ class BehaviorFeedbackContextItem:
     source: str = ""
 
 
-@dataclass(frozen=True)
-class BehaviorFeedbackContext:
+class BehaviorFeedbackContext(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     references: list[BehaviorReferenceCandidate]
     timeline_items: list[BehaviorFeedbackContextItem]
 
 
-@dataclass(frozen=True)
-class PendingBehaviorAnalysisBatch:
+class PendingBehaviorAnalysisBatch(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     session_id: str
     messages: list[BaseMessage]
-    selected_references: list[BehaviorReferenceCandidate] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class PreparedBehaviorSelection:
+class PreparedBehaviorSelection(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     selection: BehaviorPatternRetrievalResult
     prepared_at: datetime
 
 
-@dataclass(frozen=True)
-class PendingBehaviorFeedbackState:
+class PendingBehaviorFeedbackState(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     references: list[BehaviorReferenceCandidate]
     created_at: datetime
     reference_text: str = ""
@@ -201,31 +209,31 @@ class BehaviorLearningBatchGate:
     async def acquire(self, session_id: str) -> BehaviorLearningAcquireResult:
         if self.max_count <= 0:
             return BehaviorLearningAcquireResult(
-                False,
-                "max_expression_learner <= 0",
-                0,
-                self.max_count,
+                acquired=False,
+                reason="max_expression_learner <= 0",
+                active_count=0,
+                max_count=self.max_count,
             )
 
         async with self._lock:
             active_count = len(self._active_session_ids)
             if session_id in self._active_session_ids:
                 return BehaviorLearningAcquireResult(
-                    False,
-                    "session_busy",
-                    active_count,
-                    self.max_count,
+                    acquired=False,
+                    reason="session_busy",
+                    active_count=active_count,
+                    max_count=self.max_count,
                 )
             if active_count >= self.max_count:
                 return BehaviorLearningAcquireResult(
-                    False,
-                    "global_limit",
-                    active_count,
-                    self.max_count,
+                    acquired=False,
+                    reason="global_limit",
+                    active_count=active_count,
+                    max_count=self.max_count,
                 )
             self._active_session_ids.add(session_id)
             return BehaviorLearningAcquireResult(
-                True,
+                acquired=True,
                 active_count=active_count + 1,
                 max_count=self.max_count,
             )
@@ -235,605 +243,7 @@ class BehaviorLearningBatchGate:
             self._active_session_ids.discard(session_id)
 
 
-def _coerce_source_ids(raw_value: Any) -> list[str]:
-    if isinstance(raw_value, list):
-        raw_items = raw_value
-    elif raw_value is None:
-        raw_items = []
-    else:
-        raw_items = [raw_value]
-
-    source_ids: list[str] = []
-    for raw_item in raw_items:
-        split_items = (
-            raw_item.split(",")
-            if isinstance(raw_item, str) and "," in raw_item
-            else [raw_item]
-        )
-        for split_item in split_items:
-            source_id = str(split_item or "").strip()
-            if source_id and source_id not in source_ids:
-                source_ids.append(source_id)
-    return source_ids
-
-
-def _coerce_actor_type(raw_value: Any) -> str:
-    normalized_value = str(raw_value or "").strip().lower()
-    if normalized_value in {
-        ACTOR_OTHER_USER,
-        ACTOR_GROUP_COLLECTIVE,
-        ACTOR_MAIBOT_SELF,
-        "unknown",
-    }:
-        return normalized_value
-    return ""
-
-
-def _coerce_learning_type(raw_value: Any) -> str:
-    normalized_value = str(raw_value or "").strip().lower()
-    if normalized_value in {LEARNING_OBSERVED, LEARNING_SELF_REFLECTION}:
-        return normalized_value
-    return ""
-
-
-def _coerce_bool(raw_value: Any) -> bool:
-    if isinstance(raw_value, bool):
-        return raw_value
-    if isinstance(raw_value, (int, float)):
-        return raw_value != 0
-    normalized_value = str(raw_value or "").strip().lower()
-    return normalized_value in {"1", "true", "yes", "y", "adopted", "used"}
-
-
-def _coerce_feedback_status(raw_value: Any) -> str:
-    normalized_value = str(raw_value or "").strip().lower()
-    if normalized_value in ALLOWED_FEEDBACK_STATUSES:
-        return normalized_value
-    if normalized_value in {"succeeded", "completed", "positive"}:
-        return FEEDBACK_STATUS_SUCCESS
-    if normalized_value in {"partial", "partially_successful", "weak_success"}:
-        return FEEDBACK_STATUS_PARTIAL_SUCCESS
-    if normalized_value in {"blocked", "abandoned", "negative", "failure"}:
-        return FEEDBACK_STATUS_FAILED
-    return FEEDBACK_STATUS_NEUTRAL
-
-
-def _coerce_score_delta(raw_value: Any, *, status: str) -> float:
-    try:
-        score_delta = float(raw_value)
-    except (TypeError, ValueError):
-        if status == FEEDBACK_STATUS_SUCCESS:
-            score_delta = 0.6
-        elif status == FEEDBACK_STATUS_PARTIAL_SUCCESS:
-            score_delta = 0.25
-        elif status == FEEDBACK_STATUS_FAILED:
-            score_delta = -0.6
-        else:
-            score_delta = 0.0
-    if status == FEEDBACK_STATUS_SUCCESS:
-        return max(0.1, min(1.0, abs(score_delta)))
-    if status == FEEDBACK_STATUS_PARTIAL_SUCCESS:
-        return max(0.05, min(0.35, abs(score_delta)))
-    if status == FEEDBACK_STATUS_FAILED:
-        return -max(0.1, min(1.0, abs(score_delta)))
-    return 0.0
-
-
-def _compact_log_text(text: str, *, max_length: int = 1200) -> str:
-    compacted_text = " ".join((text or "").split()).strip()
-    if len(compacted_text) <= max_length:
-        return compacted_text
-    return compacted_text[:max_length].rstrip() + "..."
-
-
-def _normalize_text(text: str, *, max_length: int = 240) -> str:
-    normalized = clean_text(text)
-    if len(normalized) <= max_length:
-        return normalized
-    return normalized[:max_length].rstrip()
-
-
-def _coerce_message_datetime(raw_value: Any) -> datetime | None:
-    if isinstance(raw_value, datetime):
-        return raw_value
-    if not raw_value:
-        return None
-    try:
-        return datetime.fromisoformat(str(raw_value).strip())
-    except ValueError:
-        return None
-
-
-def _normalize_record_message(message: BaseMessage) -> BehaviorMessageRecord | None:
-    if isinstance(message, HumanMessage) and isinstance(
-        raw := message.additional_kwargs.get("raw"),
-        UserMessage,
-    ):
-        content = clean_text(raw.message.get_msgcode())
-        if not content:
-            return None
-        return BehaviorMessageRecord(
-            speaker="USER",
-            content=content,
-            name=clean_text(raw.user),
-            timestamp=raw.timestamp.strftime("%H:%M:%S"),
-            occurred_at=raw.timestamp,
-        )
-
-    raw_content = content_to_text(message.content)
-    if not raw_content.strip():
-        return None
-
-    if isinstance(message, HumanMessage):
-        stripped = raw_content.strip()
-        if match := _USER_TAG_PATTERN.match(stripped):
-            content = clean_text(match.group(1))
-            if content:
-                return BehaviorMessageRecord(
-                    speaker="USER",
-                    content=content,
-                    name="未知用户",
-                    timestamp="unknown",
-                    occurred_at=_coerce_message_datetime(
-                        message.additional_kwargs.get("history_timestamp")
-                    ),
-                )
-        if match := _BOT_TAG_PATTERN.match(stripped):
-            content = clean_text(match.group(1))
-            if content:
-                return BehaviorMessageRecord(
-                    speaker="SELF",
-                    content=content,
-                    name=BOT_NAME,
-                    timestamp="unknown",
-                    occurred_at=_coerce_message_datetime(
-                        message.additional_kwargs.get("history_timestamp")
-                    ),
-                )
-        return None
-
-    if isinstance(message, AIMessage):
-        content = clean_text(raw_content)
-        if content:
-            occurred_at = _coerce_message_datetime(
-                message.additional_kwargs.get("history_timestamp")
-            )
-            return BehaviorMessageRecord(
-                speaker="SELF",
-                content=content,
-                name=BOT_NAME,
-                timestamp=(
-                    occurred_at.strftime("%H:%M:%S")
-                    if occurred_at is not None
-                    else "unknown"
-                ),
-                occurred_at=occurred_at,
-            )
-    return None
-
-
-def _parse_behavior_item(raw_item: Any) -> BehaviorCandidate | None:
-    if not isinstance(raw_item, dict):
-        return None
-    action = str(raw_item.get("action") or "").strip()
-    outcome = str(raw_item.get("outcome") or "").strip()
-    source_ids = _coerce_source_ids(raw_item.get("source_ids"))
-    segment_id = str(
-        raw_item.get("segment_id") or raw_item.get("scene_id") or ""
-    ).strip()
-    actor_type = _coerce_actor_type(raw_item.get("actor_type"))
-    learning_type = _coerce_learning_type(raw_item.get("learning_type"))
-    if not action or not outcome or not actor_type or not learning_type:
-        return None
-    if actor_type == ACTOR_MAIBOT_SELF and learning_type != LEARNING_SELF_REFLECTION:
-        return None
-    if actor_type != ACTOR_MAIBOT_SELF and learning_type != LEARNING_OBSERVED:
-        return None
-    return BehaviorCandidate(
-        action=action,
-        outcome=outcome,
-        source_ids=source_ids,
-        segment_id=segment_id,
-        actor_type=actor_type,
-        learning_type=learning_type,
-    )
-
-
-def parse_behavior_response_with_diagnostics(
-    response: str,
-    *,
-    scene_start: str,
-) -> BehaviorParseResult:
-    normalized_response = strip_json_code_fence(response or "")
-    normalized_scene_start = scene_start.strip()
-    if not normalized_response:
-        return BehaviorParseResult(
-            candidates=[],
-            diagnostics=BehaviorParseDiagnostics(
-                normalized_response="",
-                empty_output=True,
-            ),
-        )
-    if not normalized_scene_start:
-        return BehaviorParseResult(
-            candidates=[],
-            diagnostics=BehaviorParseDiagnostics(
-                normalized_response=normalized_response,
-                missing_scene_start=True,
-            ),
-        )
-
-    try:
-        parsed_response = json.loads(repair_json(normalized_response))
-    except Exception as exc:  # noqa: BLE001
-        return BehaviorParseResult(
-            candidates=[],
-            diagnostics=BehaviorParseDiagnostics(
-                normalized_response=normalized_response,
-                parse_error=str(exc),
-            ),
-        )
-
-    if not isinstance(parsed_response, list):
-        return BehaviorParseResult(
-            candidates=[],
-            diagnostics=BehaviorParseDiagnostics(
-                normalized_response=normalized_response,
-                non_list_output=True,
-            ),
-        )
-
-    candidates: list[BehaviorCandidate] = []
-    invalid_item_count = 0
-    for raw_item in parsed_response:
-        candidate = _parse_behavior_item(raw_item)
-        if candidate is not None:
-            candidates.append(candidate)
-        else:
-            invalid_item_count += 1
-
-    return BehaviorParseResult(
-        candidates=candidates,
-        diagnostics=BehaviorParseDiagnostics(
-            normalized_response=normalized_response,
-            parsed_item_count=len(parsed_response),
-            accepted_item_count=len(candidates),
-            invalid_item_count=invalid_item_count,
-        ),
-    )
-
-
-def parse_behavior_feedback_response(response: str) -> list[BehaviorFeedbackCandidate]:
-    normalized_response = strip_json_code_fence(response or "")
-    if not normalized_response:
-        return []
-
-    try:
-        parsed_response = json.loads(repair_json(normalized_response))
-    except Exception:  # noqa: BLE001
-        logger.warning("行为路径反馈结果解析失败: %r", normalized_response)
-        return []
-
-    if isinstance(parsed_response, dict):
-        raw_items = (
-            parsed_response.get("feedback") or parsed_response.get("items") or []
-        )
-    else:
-        raw_items = parsed_response
-    if isinstance(raw_items, dict):
-        raw_items = [raw_items]
-    if not isinstance(raw_items, list):
-        return []
-
-    feedback_items: list[BehaviorFeedbackCandidate] = []
-    used_behavior_ids: set[int] = set()
-    for raw_item in raw_items:
-        if not isinstance(raw_item, dict):
-            continue
-        try:
-            behavior_id = int(raw_item.get("behavior_id") or raw_item.get("id") or 0)
-        except (TypeError, ValueError):
-            behavior_id = 0
-        if behavior_id <= 0 or behavior_id in used_behavior_ids:
-            continue
-        adopted = _coerce_bool(raw_item.get("adopted"))
-        status = _coerce_feedback_status(raw_item.get("status"))
-        score_delta = _coerce_score_delta(raw_item.get("score_delta"), status=status)
-        reason = str(raw_item.get("reason") or "").strip()
-        outcome = str(raw_item.get("outcome") or "").strip()
-        source_ids = _coerce_source_ids(raw_item.get("source_ids"))
-        if (
-            not adopted
-            or status == FEEDBACK_STATUS_NEUTRAL
-            or abs(score_delta) <= 0.0001
-            or not reason
-            or not source_ids
-        ):
-            continue
-        used_behavior_ids.add(behavior_id)
-        feedback_items.append(
-            BehaviorFeedbackCandidate(
-                behavior_id=behavior_id,
-                adopted=adopted,
-                status=status,
-                score_delta=score_delta,
-                reason=reason,
-                outcome=outcome,
-                source_ids=source_ids,
-            )
-        )
-    return feedback_items
-
-
-def _validate_behavior_feedback_evidence(
-    feedback_item: BehaviorFeedbackCandidate,
-    feedback_context: BehaviorFeedbackContext,
-) -> tuple[bool, str, list[str]]:
-    item_by_id = {
-        item.item_id: item
-        for item in feedback_context.timeline_items
-        if item.item_type == "chat_message" and item.item_id
-    }
-    valid_source_ids: list[str] = []
-    cited_items: list[BehaviorFeedbackContextItem] = []
-    for source_id in feedback_item.source_ids:
-        item = item_by_id.get(source_id)
-        if item is None:
-            continue
-        valid_source_ids.append(source_id)
-        cited_items.append(item)
-    if not valid_source_ids:
-        return False, "invalid_source_ids", []
-    has_self_adoption_evidence = any(item.speaker == "SELF" for item in cited_items)
-    if not has_self_adoption_evidence:
-        return False, "missing_self_adoption_evidence", valid_source_ids
-    return True, "", valid_source_ids
-
-
-def _build_evidence_item(
-    *,
-    action: str,
-    outcome: str,
-    source_ids: Sequence[str],
-    actor_type: str,
-    learning_type: str,
-    profile_tag_distribution: Sequence[dict[str, Any]] = (),
-) -> dict[str, Any]:
-    evidence_item: dict[str, Any] = {
-        "action": action,
-        "outcome": outcome,
-        "source_ids": normalize_source_ids(source_ids),
-        "actor_type": actor_type,
-        "learning_type": learning_type,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    if profile_tag_distribution:
-        evidence_item["profile_tag_distribution"] = list(profile_tag_distribution)
-    return evidence_item
-
-
-async def upsert_behavior_pattern(
-    db: BehaviorDatabase,
-    *,
-    action: str,
-    outcome: str,
-    source_ids: Sequence[str],
-    session_id: str,
-    scenario_profile: BehaviorScenarioProfile,
-    scene_start: str,
-    actor_type: str = ACTOR_OTHER_USER,
-    learning_type: str = LEARNING_OBSERVED,
-) -> BehaviorExperiencePath | None:
-    normalized_action = _normalize_text(action, max_length=240)
-    normalized_outcome = _normalize_text(outcome, max_length=240)
-    normalized_source_ids = normalize_source_ids(source_ids)
-    normalized_actor_type = _coerce_actor_type(actor_type) or ACTOR_UNKNOWN
-    normalized_learning_type = (
-        str(learning_type or "").strip().lower()
-        if str(learning_type or "").strip().lower() in ALLOWED_LEARNING_TYPES
-        else (
-            LEARNING_SELF_REFLECTION
-            if normalized_actor_type == ACTOR_MAIBOT_SELF
-            else LEARNING_OBSERVED
-        )
-    )
-    if not normalized_action or not normalized_outcome:
-        logger.warning(
-            "跳过写入行为经验路径：归一化后字段为空 action=%r outcome=%r",
-            normalized_action,
-            normalized_outcome,
-        )
-        return None
-
-    try:
-        async with db.session() as session:
-            graph_refs = await upsert_behavior_graph_refs(
-                session=session,
-                session_id=session_id,
-                profile=scenario_profile,
-                scene_start=scene_start,
-                action=normalized_action,
-                outcome=normalized_outcome,
-            )
-            if graph_refs is None:
-                logger.warning(
-                    "跳过写入行为经验路径：场景簇引用生成失败 session_id=%s action=%s outcome=%s",
-                    session_id,
-                    normalized_action,
-                    normalized_outcome,
-                )
-                return None
-
-            profile_tag_distribution = build_profile_tag_distribution(
-                scenario_profile,
-                tag_lookup=await load_tag_cluster_lookup(session),
-            )
-            now = datetime.now()
-            evidence_item = _build_evidence_item(
-                action=normalized_action,
-                outcome=normalized_outcome,
-                source_ids=normalized_source_ids,
-                actor_type=normalized_actor_type,
-                learning_type=normalized_learning_type,
-                profile_tag_distribution=profile_tag_distribution,
-            )
-
-            statement = (
-                select(BehaviorExperiencePath)
-                .where(BehaviorExperiencePath.session_id == session_id)
-                .where(
-                    BehaviorExperiencePath.scene_cluster_id
-                    == graph_refs.scene_cluster_id
-                )
-                .where(BehaviorExperiencePath.action_id == graph_refs.action_id)
-                .where(BehaviorExperiencePath.outcome_id == graph_refs.outcome_id)
-                .where(BehaviorExperiencePath.actor_type == normalized_actor_type)
-                .where(BehaviorExperiencePath.learning_type == normalized_learning_type)
-            )
-            path = (await session.scalars(statement)).first()
-            if path is None:
-                path = BehaviorExperiencePath(
-                    session_id=session_id,
-                    scene_cluster_id=graph_refs.scene_cluster_id,
-                    action_id=graph_refs.action_id,
-                    outcome_id=graph_refs.outcome_id,
-                    actor_type=normalized_actor_type,
-                    learning_type=normalized_learning_type,
-                    evidence_list=dump_json_list([evidence_item]),
-                    feedback_list=dump_json_list([]),
-                    count=1,
-                    activation_count=0,
-                    success_count=0,
-                    failure_count=0,
-                    score=0.0,
-                    enabled=True,
-                    last_active_time=now,
-                    create_time=now,
-                    update_time=now,
-                )
-            else:
-                evidence_items = load_json_list(path.evidence_list)
-                evidence_items.append(evidence_item)
-                path.evidence_list = dump_json_list(
-                    evidence_items[-EVIDENCE_HISTORY_LIMIT:]
-                )
-                path.count += 1
-                path.last_active_time = now
-                path.update_time = now
-
-            session.add(path)
-            await session.flush()
-            await session.refresh(path)
-            session.expunge(path)
-            return path
-    except Exception as exc:  # noqa: BLE001
-        logger.exception(
-            "写入行为经验路径失败: session_id=%s action=%s outcome=%s source_ids=%s error=%s",
-            session_id,
-            normalized_action,
-            normalized_outcome,
-            normalized_source_ids,
-            exc,
-        )
-        return None
-
-
-async def apply_behavior_scene_feedback(
-    db: BehaviorDatabase,
-    *,
-    experience_path_id: int,
-    score_delta: float,
-    status: str,
-) -> None:
-    del score_delta
-    del status
-    if experience_path_id <= 0:
-        return
-    now = datetime.now()
-    try:
-        async with db.session() as session:
-            path = await session.get(BehaviorExperiencePath, experience_path_id)
-            if path is None:
-                return
-            cluster = await session.get(BehaviorSceneCluster, path.scene_cluster_id)
-            if cluster is None:
-                return
-            cluster.update_time = now
-            session.add(cluster)
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "更新行为场景簇反馈失败: experience_id=%s error=%s", experience_path_id, exc
-        )
-
-
-async def apply_behavior_feedback(
-    db: BehaviorDatabase,
-    *,
-    pattern_id: int,
-    score_delta: float,
-    status: str,
-    reason: str,
-    outcome: str,
-    session_id: str,
-    source_ids: Sequence[str] = (),
-) -> BehaviorExperiencePath | None:
-    normalized_status = str(status or "").strip().lower()
-    normalized_reason = _normalize_text(reason, max_length=300)
-    normalized_outcome = _normalize_text(outcome, max_length=240)
-    normalized_source_ids = normalize_source_ids(source_ids)
-    now = datetime.now()
-    try:
-        async with db.session() as session:
-            path = await session.get(BehaviorExperiencePath, pattern_id)
-            if path is None:
-                return None
-            feedback_items = load_json_list(path.feedback_list)
-            feedback_items.append(
-                {
-                    "score_delta": float(score_delta),
-                    "status": normalized_status,
-                    "reason": normalized_reason,
-                    "outcome": normalized_outcome,
-                    "session_id": session_id,
-                    "source_ids": normalized_source_ids,
-                    "created_at": now.isoformat(timespec="seconds"),
-                }
-            )
-            path.feedback_list = dump_json_list(
-                feedback_items[-FEEDBACK_HISTORY_LIMIT:]
-            )
-            path.score = clamp_score(float(path.score or 0.0) + float(score_delta))
-            path.last_feedback_time = now
-            path.update_time = now
-            if normalized_status in POSITIVE_FEEDBACK_STATUSES:
-                path.success_count += 1
-            elif normalized_status in PARTIAL_POSITIVE_FEEDBACK_STATUSES:
-                pass
-            elif normalized_status in NEGATIVE_FEEDBACK_STATUSES:
-                path.failure_count += 1
-            if path.score <= MIN_BEHAVIOR_SCORE and path.failure_count >= 3:
-                path.enabled = False
-
-            session.add(path)
-            await session.flush()
-            await session.refresh(path)
-            session.expunge(path)
-            feedback_path = path
-    except Exception as exc:  # noqa: BLE001
-        logger.error("写入行为经验路径反馈失败: id=%s error=%s", pattern_id, exc)
-        return None
-    await apply_behavior_scene_feedback(
-        db,
-        experience_path_id=pattern_id,
-        score_delta=score_delta,
-        status=normalized_status,
-    )
-    return feedback_path
-
-
-class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatch]):
-    state_schema = ManagerState
-
+class BehaviorLearner(SessionBatchWorker[PendingBehaviorAnalysisBatch]):
     def __init__(
         self,
         analyze_model: BaseChatModel,
@@ -892,15 +302,632 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         self._learning_backlog: dict[str, deque[BehaviorMessageRecord]] = {}
         self._pending_feedback: dict[str, list[PendingBehaviorFeedbackState]] = {}
 
-    @override
-    async def abefore_agent(
-        self,
-        state: ManagerState,
-        runtime: Runtime[ManagerContext],
-    ) -> dict[str, Any] | None:
-        del state
-        self.prepare_reply_context(runtime.context["session_id"])
+    @classmethod
+    def _coerce_source_ids(cls, raw_value: Any) -> list[str]:
+        if isinstance(raw_value, list):
+            raw_items = raw_value
+        elif raw_value is None:
+            raw_items = []
+        else:
+            raw_items = [raw_value]
+
+        source_ids: list[str] = []
+        for raw_item in raw_items:
+            split_items = (
+                raw_item.split(",")
+                if isinstance(raw_item, str) and "," in raw_item
+                else [raw_item]
+            )
+            for split_item in split_items:
+                source_id = str(split_item or "").strip()
+                if source_id and source_id not in source_ids:
+                    source_ids.append(source_id)
+        return source_ids
+
+    @classmethod
+    def _coerce_actor_type(cls, raw_value: Any) -> str:
+        normalized_value = str(raw_value or "").strip().lower()
+        if normalized_value in {
+            ACTOR_OTHER_USER,
+            ACTOR_GROUP_COLLECTIVE,
+            ACTOR_MAIBOT_SELF,
+            "unknown",
+        }:
+            return normalized_value
+        return ""
+
+    @classmethod
+    def _coerce_learning_type(cls, raw_value: Any) -> str:
+        normalized_value = str(raw_value or "").strip().lower()
+        if normalized_value in {LEARNING_OBSERVED, LEARNING_SELF_REFLECTION}:
+            return normalized_value
+        return ""
+
+    @classmethod
+    def _coerce_bool(cls, raw_value: Any) -> bool:
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, (int, float)):
+            return raw_value != 0
+        normalized_value = str(raw_value or "").strip().lower()
+        return normalized_value in {"1", "true", "yes", "y", "adopted", "used"}
+
+    @classmethod
+    def _coerce_feedback_status(cls, raw_value: Any) -> str:
+        normalized_value = str(raw_value or "").strip().lower()
+        if normalized_value in ALLOWED_FEEDBACK_STATUSES:
+            return normalized_value
+        if normalized_value in {"succeeded", "completed", "positive"}:
+            return FEEDBACK_STATUS_SUCCESS
+        if normalized_value in {"partial", "partially_successful", "weak_success"}:
+            return FEEDBACK_STATUS_PARTIAL_SUCCESS
+        if normalized_value in {"blocked", "abandoned", "negative", "failure"}:
+            return FEEDBACK_STATUS_FAILED
+        return FEEDBACK_STATUS_NEUTRAL
+
+    @classmethod
+    def _coerce_score_delta(
+        cls,
+        raw_value: Any,
+        *,
+        status: str,
+    ) -> float:
+        try:
+            score_delta = float(raw_value)
+        except (TypeError, ValueError):
+            if status == FEEDBACK_STATUS_SUCCESS:
+                score_delta = 0.6
+            elif status == FEEDBACK_STATUS_PARTIAL_SUCCESS:
+                score_delta = 0.25
+            elif status == FEEDBACK_STATUS_FAILED:
+                score_delta = -0.6
+            else:
+                score_delta = 0.0
+        if status == FEEDBACK_STATUS_SUCCESS:
+            return max(0.1, min(1.0, abs(score_delta)))
+        if status == FEEDBACK_STATUS_PARTIAL_SUCCESS:
+            return max(0.05, min(0.35, abs(score_delta)))
+        if status == FEEDBACK_STATUS_FAILED:
+            return -max(0.1, min(1.0, abs(score_delta)))
+        return 0.0
+
+    @classmethod
+    def _compact_log_text(
+        cls,
+        text: str,
+        *,
+        max_length: int = 1200,
+    ) -> str:
+        compacted_text = " ".join((text or "").split()).strip()
+        if len(compacted_text) <= max_length:
+            return compacted_text
+        return compacted_text[:max_length].rstrip() + "..."
+
+    @classmethod
+    def _normalize_text(
+        cls,
+        text: str,
+        *,
+        max_length: int = 240,
+    ) -> str:
+        normalized = clean_text(text)
+        if len(normalized) <= max_length:
+            return normalized
+        return normalized[:max_length].rstrip()
+
+    @classmethod
+    def _coerce_message_datetime(cls, raw_value: Any) -> datetime | None:
+        if isinstance(raw_value, datetime):
+            return raw_value
+        if not raw_value:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw_value).strip())
+        except ValueError:
+            return None
+
+    @classmethod
+    def _normalize_record_message(
+        cls,
+        message: BaseMessage,
+    ) -> BehaviorMessageRecord | None:
+        if isinstance(message, HumanMessage) and isinstance(
+            raw := message.additional_kwargs.get("raw"),
+            UserMessage,
+        ):
+            content = clean_text(raw.message.get_msgcode())
+            if not content:
+                return None
+            return BehaviorMessageRecord(
+                speaker="USER",
+                content=content,
+                name=clean_text(raw.user),
+                timestamp=raw.timestamp.strftime("%H:%M:%S"),
+                occurred_at=raw.timestamp,
+            )
+
+        raw_content = content_to_text(message.content)
+        if not raw_content.strip():
+            return None
+
+        if isinstance(message, HumanMessage):
+            stripped = raw_content.strip()
+            if match := _USER_TAG_PATTERN.match(stripped):
+                content = clean_text(match.group(1))
+                if content:
+                    return BehaviorMessageRecord(
+                        speaker="USER",
+                        content=content,
+                        name="未知用户",
+                        timestamp="unknown",
+                        occurred_at=cls._coerce_message_datetime(
+                            message.additional_kwargs.get("history_timestamp")
+                        ),
+                    )
+            if match := _BOT_TAG_PATTERN.match(stripped):
+                content = clean_text(match.group(1))
+                if content:
+                    return BehaviorMessageRecord(
+                        speaker="SELF",
+                        content=content,
+                        name=BOT_NAME,
+                        timestamp="unknown",
+                        occurred_at=cls._coerce_message_datetime(
+                            message.additional_kwargs.get("history_timestamp")
+                        ),
+                    )
+            return None
+
+        if isinstance(message, AIMessage):
+            content = clean_text(raw_content)
+            if content:
+                occurred_at = cls._coerce_message_datetime(
+                    message.additional_kwargs.get("history_timestamp")
+                )
+                return BehaviorMessageRecord(
+                    speaker="SELF",
+                    content=content,
+                    name=BOT_NAME,
+                    timestamp=(
+                        occurred_at.strftime("%H:%M:%S")
+                        if occurred_at is not None
+                        else "unknown"
+                    ),
+                    occurred_at=occurred_at,
+                )
         return None
+
+    @classmethod
+    def _parse_behavior_item(cls, raw_item: Any) -> BehaviorCandidate | None:
+        if not isinstance(raw_item, dict):
+            return None
+        action = str(raw_item.get("action") or "").strip()
+        outcome = str(raw_item.get("outcome") or "").strip()
+        source_ids = cls._coerce_source_ids(raw_item.get("source_ids"))
+        segment_id = str(
+            raw_item.get("segment_id") or raw_item.get("scene_id") or ""
+        ).strip()
+        actor_type = cls._coerce_actor_type(raw_item.get("actor_type"))
+        learning_type = cls._coerce_learning_type(raw_item.get("learning_type"))
+        if not action or not outcome or not actor_type or not learning_type:
+            return None
+        if (
+            actor_type == ACTOR_MAIBOT_SELF
+            and learning_type != LEARNING_SELF_REFLECTION
+        ):
+            return None
+        if actor_type != ACTOR_MAIBOT_SELF and learning_type != LEARNING_OBSERVED:
+            return None
+        return BehaviorCandidate(
+            action=action,
+            outcome=outcome,
+            source_ids=source_ids,
+            segment_id=segment_id,
+            actor_type=actor_type,
+            learning_type=learning_type,
+        )
+
+    @classmethod
+    def _parse_behavior_response(
+        cls,
+        response: str,
+        *,
+        scene_start: str,
+    ) -> BehaviorParseResult:
+        normalized_response = strip_json_code_fence(response or "")
+        normalized_scene_start = scene_start.strip()
+        if not normalized_response:
+            return BehaviorParseResult(
+                candidates=[],
+                diagnostics=BehaviorParseDiagnostics(
+                    normalized_response="",
+                    empty_output=True,
+                ),
+            )
+        if not normalized_scene_start:
+            return BehaviorParseResult(
+                candidates=[],
+                diagnostics=BehaviorParseDiagnostics(
+                    normalized_response=normalized_response,
+                    missing_scene_start=True,
+                ),
+            )
+
+        try:
+            parsed_response = json.loads(repair_json(normalized_response))
+        except Exception as exc:  # noqa: BLE001
+            return BehaviorParseResult(
+                candidates=[],
+                diagnostics=BehaviorParseDiagnostics(
+                    normalized_response=normalized_response,
+                    parse_error=str(exc),
+                ),
+            )
+
+        if not isinstance(parsed_response, list):
+            return BehaviorParseResult(
+                candidates=[],
+                diagnostics=BehaviorParseDiagnostics(
+                    normalized_response=normalized_response,
+                    non_list_output=True,
+                ),
+            )
+
+        candidates: list[BehaviorCandidate] = []
+        invalid_item_count = 0
+        for raw_item in parsed_response:
+            candidate = cls._parse_behavior_item(raw_item)
+            if candidate is not None:
+                candidates.append(candidate)
+            else:
+                invalid_item_count += 1
+
+        return BehaviorParseResult(
+            candidates=candidates,
+            diagnostics=BehaviorParseDiagnostics(
+                normalized_response=normalized_response,
+                parsed_item_count=len(parsed_response),
+                accepted_item_count=len(candidates),
+                invalid_item_count=invalid_item_count,
+            ),
+        )
+
+    @classmethod
+    def _parse_behavior_feedback_response(
+        cls,
+        response: str,
+    ) -> list[BehaviorFeedbackCandidate]:
+        normalized_response = strip_json_code_fence(response or "")
+        if not normalized_response:
+            return []
+
+        try:
+            parsed_response = json.loads(repair_json(normalized_response))
+        except Exception:  # noqa: BLE001
+            logger.warning("行为路径反馈结果解析失败: %r", normalized_response)
+            return []
+
+        if isinstance(parsed_response, dict):
+            raw_items = (
+                parsed_response.get("feedback") or parsed_response.get("items") or []
+            )
+        else:
+            raw_items = parsed_response
+        if isinstance(raw_items, dict):
+            raw_items = [raw_items]
+        if not isinstance(raw_items, list):
+            return []
+
+        feedback_items: list[BehaviorFeedbackCandidate] = []
+        used_behavior_ids: set[int] = set()
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            try:
+                behavior_id = int(
+                    raw_item.get("behavior_id") or raw_item.get("id") or 0
+                )
+            except (TypeError, ValueError):
+                behavior_id = 0
+            if behavior_id <= 0 or behavior_id in used_behavior_ids:
+                continue
+            adopted = cls._coerce_bool(raw_item.get("adopted"))
+            status = cls._coerce_feedback_status(raw_item.get("status"))
+            score_delta = cls._coerce_score_delta(
+                raw_item.get("score_delta"), status=status
+            )
+            reason = str(raw_item.get("reason") or "").strip()
+            outcome = str(raw_item.get("outcome") or "").strip()
+            source_ids = cls._coerce_source_ids(raw_item.get("source_ids"))
+            if (
+                not adopted
+                or status == FEEDBACK_STATUS_NEUTRAL
+                or abs(score_delta) <= 0.0001
+                or not reason
+                or not source_ids
+            ):
+                continue
+            used_behavior_ids.add(behavior_id)
+            feedback_items.append(
+                BehaviorFeedbackCandidate(
+                    behavior_id=behavior_id,
+                    adopted=adopted,
+                    status=status,
+                    score_delta=score_delta,
+                    reason=reason,
+                    outcome=outcome,
+                    source_ids=source_ids,
+                )
+            )
+        return feedback_items
+
+    @classmethod
+    def _validate_behavior_feedback_evidence(
+        cls,
+        feedback_item: BehaviorFeedbackCandidate,
+        feedback_context: BehaviorFeedbackContext,
+    ) -> tuple[bool, str, list[str]]:
+        item_by_id = {
+            item.item_id: item
+            for item in feedback_context.timeline_items
+            if item.item_type == "chat_message" and item.item_id
+        }
+        valid_source_ids: list[str] = []
+        cited_items: list[BehaviorFeedbackContextItem] = []
+        for source_id in feedback_item.source_ids:
+            item = item_by_id.get(source_id)
+            if item is None:
+                continue
+            valid_source_ids.append(source_id)
+            cited_items.append(item)
+        if not valid_source_ids:
+            return False, "invalid_source_ids", []
+        has_self_adoption_evidence = any(item.speaker == "SELF" for item in cited_items)
+        if not has_self_adoption_evidence:
+            return False, "missing_self_adoption_evidence", valid_source_ids
+        return True, "", valid_source_ids
+
+    @classmethod
+    def _build_evidence_item(
+        cls,
+        *,
+        action: str,
+        outcome: str,
+        source_ids: Sequence[str],
+        actor_type: str,
+        learning_type: str,
+        profile_tag_distribution: Sequence[dict[str, Any]] = (),
+    ) -> dict[str, Any]:
+        evidence_item: dict[str, Any] = {
+            "action": action,
+            "outcome": outcome,
+            "source_ids": normalize_source_ids(source_ids),
+            "actor_type": actor_type,
+            "learning_type": learning_type,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if profile_tag_distribution:
+            evidence_item["profile_tag_distribution"] = list(profile_tag_distribution)
+        return evidence_item
+
+    async def _upsert_behavior_pattern(
+        self,
+        *,
+        action: str,
+        outcome: str,
+        source_ids: Sequence[str],
+        session_id: str,
+        scenario_profile: BehaviorScenarioProfile,
+        scene_start: str,
+        actor_type: str = ACTOR_OTHER_USER,
+        learning_type: str = LEARNING_OBSERVED,
+    ) -> BehaviorExperiencePath | None:
+        normalized_action = self._normalize_text(action, max_length=240)
+        normalized_outcome = self._normalize_text(outcome, max_length=240)
+        normalized_source_ids = normalize_source_ids(source_ids)
+        normalized_actor_type = self._coerce_actor_type(actor_type) or ACTOR_UNKNOWN
+        normalized_learning_type = (
+            str(learning_type or "").strip().lower()
+            if str(learning_type or "").strip().lower() in ALLOWED_LEARNING_TYPES
+            else (
+                LEARNING_SELF_REFLECTION
+                if normalized_actor_type == ACTOR_MAIBOT_SELF
+                else LEARNING_OBSERVED
+            )
+        )
+        if not normalized_action or not normalized_outcome:
+            logger.warning(
+                "跳过写入行为经验路径：归一化后字段为空 action=%r outcome=%r",
+                normalized_action,
+                normalized_outcome,
+            )
+            return None
+
+        try:
+            async with self._db.session() as session:
+                graph_refs = await upsert_behavior_graph_refs(
+                    session=session,
+                    session_id=session_id,
+                    profile=scenario_profile,
+                    scene_start=scene_start,
+                    action=normalized_action,
+                    outcome=normalized_outcome,
+                )
+                if graph_refs is None:
+                    logger.warning(
+                        "跳过写入行为经验路径：场景簇引用生成失败 session_id=%s action=%s outcome=%s",
+                        session_id,
+                        normalized_action,
+                        normalized_outcome,
+                    )
+                    return None
+
+                profile_tag_distribution = build_profile_tag_distribution(
+                    scenario_profile,
+                    tag_lookup=await load_tag_cluster_lookup(session),
+                )
+                now = datetime.now()
+                evidence_item = self._build_evidence_item(
+                    action=normalized_action,
+                    outcome=normalized_outcome,
+                    source_ids=normalized_source_ids,
+                    actor_type=normalized_actor_type,
+                    learning_type=normalized_learning_type,
+                    profile_tag_distribution=profile_tag_distribution,
+                )
+
+                statement = (
+                    select(BehaviorExperiencePath)
+                    .where(BehaviorExperiencePath.session_id == session_id)
+                    .where(
+                        BehaviorExperiencePath.scene_cluster_id
+                        == graph_refs.scene_cluster_id
+                    )
+                    .where(BehaviorExperiencePath.action_id == graph_refs.action_id)
+                    .where(BehaviorExperiencePath.outcome_id == graph_refs.outcome_id)
+                    .where(BehaviorExperiencePath.actor_type == normalized_actor_type)
+                    .where(
+                        BehaviorExperiencePath.learning_type == normalized_learning_type
+                    )
+                )
+                path = (await session.scalars(statement)).first()
+                if path is None:
+                    path = BehaviorExperiencePath(
+                        session_id=session_id,
+                        scene_cluster_id=graph_refs.scene_cluster_id,
+                        action_id=graph_refs.action_id,
+                        outcome_id=graph_refs.outcome_id,
+                        actor_type=normalized_actor_type,
+                        learning_type=normalized_learning_type,
+                        evidence_list=dump_json_list([evidence_item]),
+                        feedback_list=dump_json_list([]),
+                        count=1,
+                        activation_count=0,
+                        success_count=0,
+                        failure_count=0,
+                        score=0.0,
+                        enabled=True,
+                        last_active_time=now,
+                        create_time=now,
+                        update_time=now,
+                    )
+                else:
+                    evidence_items = load_json_list(path.evidence_list)
+                    evidence_items.append(evidence_item)
+                    path.evidence_list = dump_json_list(
+                        evidence_items[-EVIDENCE_HISTORY_LIMIT:]
+                    )
+                    path.count += 1
+                    path.last_active_time = now
+                    path.update_time = now
+
+                session.add(path)
+                await session.flush()
+                await session.refresh(path)
+                session.expunge(path)
+                return path
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "写入行为经验路径失败: session_id=%s action=%s outcome=%s source_ids=%s error=%s",
+                session_id,
+                normalized_action,
+                normalized_outcome,
+                normalized_source_ids,
+                exc,
+            )
+            return None
+
+    async def _apply_behavior_scene_feedback(
+        self,
+        *,
+        experience_path_id: int,
+        score_delta: float,
+        status: str,
+    ) -> None:
+        del score_delta
+        del status
+        if experience_path_id <= 0:
+            return
+        now = datetime.now()
+        try:
+            async with self._db.session() as session:
+                path = await session.get(BehaviorExperiencePath, experience_path_id)
+                if path is None:
+                    return
+                cluster = await session.get(BehaviorSceneCluster, path.scene_cluster_id)
+                if cluster is None:
+                    return
+                cluster.update_time = now
+                session.add(cluster)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "更新行为场景簇反馈失败: experience_id=%s error=%s",
+                experience_path_id,
+                exc,
+            )
+
+    async def _apply_behavior_feedback(
+        self,
+        *,
+        pattern_id: int,
+        score_delta: float,
+        status: str,
+        reason: str,
+        outcome: str,
+        session_id: str,
+        source_ids: Sequence[str] = (),
+    ) -> BehaviorExperiencePath | None:
+        normalized_status = str(status or "").strip().lower()
+        normalized_reason = self._normalize_text(reason, max_length=300)
+        normalized_outcome = self._normalize_text(outcome, max_length=240)
+        normalized_source_ids = normalize_source_ids(source_ids)
+        now = datetime.now()
+        try:
+            async with self._db.session() as session:
+                path = await session.get(BehaviorExperiencePath, pattern_id)
+                if path is None:
+                    return None
+                feedback_items = load_json_list(path.feedback_list)
+                feedback_items.append(
+                    {
+                        "score_delta": float(score_delta),
+                        "status": normalized_status,
+                        "reason": normalized_reason,
+                        "outcome": normalized_outcome,
+                        "session_id": session_id,
+                        "source_ids": normalized_source_ids,
+                        "created_at": now.isoformat(timespec="seconds"),
+                    }
+                )
+                path.feedback_list = dump_json_list(
+                    feedback_items[-FEEDBACK_HISTORY_LIMIT:]
+                )
+                path.score = clamp_score(float(path.score or 0.0) + float(score_delta))
+                path.last_feedback_time = now
+                path.update_time = now
+                if normalized_status in POSITIVE_FEEDBACK_STATUSES:
+                    path.success_count += 1
+                elif normalized_status in PARTIAL_POSITIVE_FEEDBACK_STATUSES:
+                    pass
+                elif normalized_status in NEGATIVE_FEEDBACK_STATUSES:
+                    path.failure_count += 1
+                if path.score <= MIN_BEHAVIOR_SCORE and path.failure_count >= 3:
+                    path.enabled = False
+
+                session.add(path)
+                await session.flush()
+                await session.refresh(path)
+                session.expunge(path)
+                feedback_path = path
+        except Exception as exc:  # noqa: BLE001
+            logger.error("写入行为经验路径反馈失败: id=%s error=%s", pattern_id, exc)
+            return None
+        await self._apply_behavior_scene_feedback(
+            experience_path_id=pattern_id,
+            score_delta=score_delta,
+            status=normalized_status,
+        )
+        return feedback_path
 
     def prepare_reply_context(self, session_id: str) -> tuple[str, list[int]]:
         """Activate the prepared selection for a native Executive reply."""
@@ -924,95 +951,41 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             [item.behavior_id for item in selection.references],
         )
 
-    @override
-    async def aafter_agent(
-        self,
-        state: ManagerState,
-        runtime: Runtime[ManagerContext],
-    ) -> dict[str, Any] | None:
-        session_id = runtime.context["session_id"]
-        selection = self._turn_selection_cache.get(session_id)
-        replied = any(output["type"] == "reply" for output in state["outputs"])
-        if replied and selection and selection.references:
-            for output in state["outputs"]:
-                if output["type"] == "reply":
-                    output["data"]["selected_behavior_ids"] = [
-                        item.behavior_id for item in selection.references
-                    ]
-        messages = (
-            list(state.get("currents") or [])
-            if replied
-            else cast("list[BaseMessage] | None", state.get("summary_pruned_messages"))
-        )
-        await self.learn_from_messages(session_id, messages or (), replied=replied)
-        return None
-
-    async def learn_from_messages(
+    async def consume_evicted(
         self,
         session_id: str,
         messages: Sequence[BaseMessage],
-        *,
-        replied: bool = False,
     ) -> None:
-        """Consume native plugin-event messages without a LangGraph runtime shim."""
-        selection = self._turn_selection_cache.get(session_id)
-        if replied and selection and selection.references:
-            self._enqueue_pending_feedback(
-                session_id,
-                selection.references,
-                selection.reference_text,
-            )
+        """Queue messages that the plugin host evicted from live context."""
         if messages:
             await self._enqueue_batch(
                 session_id,
                 PendingBehaviorAnalysisBatch(
                     session_id=session_id,
                     messages=list(messages),
-                    selected_references=(
-                        list(selection.references)
-                        if replied and selection is not None
-                        else []
-                    ),
                 ),
             )
-        self._turn_selection_cache.pop(session_id, None)
 
-    @override
-    async def awrap_model_call(
-        self,
-        request: ModelRequest[ManagerContext],
-        handler: Callable[
-            [ModelRequest[ManagerContext]], Awaitable[ModelResponse[Any]]
-        ],
-    ) -> ModelResponse[Any] | AIMessage | ExtendedModelResponse[Any]:
-        session_id = request.runtime.context["session_id"]
-        selection = self._turn_selection_cache.get(session_id)
-        if selection is None:
-            # Never start scene analysis from a model wrapper: one agent turn
-            # may enter this hook multiple times.  Only consume a prepared
-            # result; the post-turn batch prepares the next one.
-            selection = BehaviorPatternRetrievalResult()
-            self._turn_selection_cache[session_id] = selection
-
-        if selection and selection.reference_text:
-            request = request.override(
-                messages=[
-                    HumanMessage(
-                        content=selection.reference_text,
-                        additional_kwargs={"lc_source": "behavior_pattern"},
-                    ),
-                    *request.messages,
-                ]
-            )
-        return await handler(request)
+    async def record_reply(self, session_id: str) -> None:
+        """Record selected behavior without treating live context as evicted."""
+        selection = self._turn_selection_cache.pop(session_id, None)
+        if not selection or not selection.references:
+            return
+        self._enqueue_pending_feedback(
+            session_id,
+            selection.references,
+            selection.reference_text,
+        )
+        for reference in selection.references:
+            await mark_behavior_pattern_selected(self._db, reference.behavior_id)
 
     @override
     async def process_batches(  # noqa: PLR0915
         self,
         session_id: str,
         batches: tuple[PendingBehaviorAnalysisBatch, ...],
-    ) -> SessionProcessOutput:
-        records = self._extract_pruned_messages(batches)
+    ) -> BatchProcessOutput:
+        records = self._extract_evicted_messages(batches)
         if not records:
             return len(batches)
 
@@ -1058,21 +1031,6 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
                     selection=selection,
                     prepared_at=datetime.now(UTC),
                 )
-            except Exception as exc:
-                task_errors.append(exc)
-
-        selected_references = {
-            reference.behavior_id: reference
-            for batch in batches
-            for reference in batch.selected_references
-        }
-
-        async def mark_selected_references() -> None:
-            try:
-                for reference in selected_references.values():
-                    await mark_behavior_pattern_selected(
-                        self._db, reference.behavior_id
-                    )
             except Exception as exc:
                 task_errors.append(exc)
 
@@ -1124,8 +1082,6 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         async with anyio.create_task_group() as task_group:
             if not run_learning_task:
                 task_group.start_soon(prepare_next_selection)
-            if selected_references:
-                task_group.start_soon(mark_selected_references)
             if run_learning_task:
                 task_group.start_soon(run_learning)
             if run_feedback_task:
@@ -1154,7 +1110,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             )
 
         for task_error in task_errors:
-            logger.exception("行为中间件任务执行失败", exc_info=task_error)
+            logger.exception("行为学习任务执行失败", exc_info=task_error)
         return len(batches)
 
     @override
@@ -1166,6 +1122,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         await self._db.dispose()
 
     async def clear_session(self, session_id: str) -> None:
+        self.discard(session_id)
         self._turn_selection_cache.pop(session_id, None)
         self._prepared_selection_cache.pop(session_id, None)
         self._learning_backlog.pop(session_id, None)
@@ -1201,8 +1158,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             f"confidence={confidence:.2f}"
         )
         for behavior_id in behavior_ids:
-            await apply_behavior_feedback(
-                self._db,
+            await self._apply_behavior_feedback(
                 pattern_id=behavior_id,
                 score_delta=score_delta,
                 status=status,
@@ -1219,22 +1175,23 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         return [
             record
             for message in messages
-            if (record := _normalize_record_message(message)) is not None
+            if (record := self._normalize_record_message(message)) is not None
         ]
 
-    def _extract_pruned_messages(
+    def _extract_evicted_messages(
         self,
         batches: Sequence[PendingBehaviorAnalysisBatch],
     ) -> list[BehaviorMessageRecord]:
         records: list[BehaviorMessageRecord] = []
         for batch in batches:
             for message in batch.messages:
-                if record := _normalize_record_message(message):
+                if record := self._normalize_record_message(message):
                     records.append(record)
         return records
 
-    @staticmethod
+    @classmethod
     def _append_behavior_selector_context_item(
+        cls,
         context_items: list[str],
         *,
         text: str,
@@ -1280,8 +1237,9 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         )
         return content_to_text(response.content)
 
-    @staticmethod
+    @classmethod
     def _build_scene_analysis_messages(
+        cls,
         records: Sequence[BehaviorMessageRecord],
         system_prompt: str,
     ) -> list[BaseMessage]:
@@ -1315,8 +1273,9 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         )
         return scene_messages
 
-    @staticmethod
+    @classmethod
     def _build_learning_messages(
+        cls,
         records: Sequence[BehaviorMessageRecord],
         system_prompt: str,
     ) -> list[BaseMessage]:
@@ -1350,8 +1309,11 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         learning_messages.append(HumanMessage(content="请根据以上聊天消息输出 JSON。"))
         return learning_messages
 
-    @staticmethod
-    def _build_learning_context_text(records: Sequence[BehaviorMessageRecord]) -> str:
+    @classmethod
+    def _build_learning_context_text(
+        cls,
+        records: Sequence[BehaviorMessageRecord],
+    ) -> str:
         context_lines: list[str] = []
         for index, record in enumerate(records, start=1):
             content = record.content or "[空消息]"
@@ -1569,7 +1531,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             logger.error("学习行为表现失败: %s", exc)
             return False
 
-        parse_result = parse_behavior_response_with_diagnostics(
+        parse_result = self._parse_behavior_response(
             response_text,
             scene_start=scene_start,
         )
@@ -1593,7 +1555,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             logger.info(
                 "%s 行为学习未抽取到有效候选: 模型输出预览=%r",
                 learning_session_id,
-                _compact_log_text(
+                self._compact_log_text(
                     parse_result.diagnostics.normalized_response, max_length=1600
                 ),
             )
@@ -1620,8 +1582,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
                 candidate.learning_type,
                 candidate.source_ids,
             )
-            path = await upsert_behavior_pattern(
-                self._db,
+            path = await self._upsert_behavior_pattern(
                 action=candidate.action,
                 outcome=candidate.outcome,
                 source_ids=candidate.source_ids,
@@ -1689,7 +1650,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         parse_result: BehaviorParseResult,
     ) -> None:
         diagnostics = parse_result.diagnostics
-        response_preview = _compact_log_text(
+        response_preview = self._compact_log_text(
             diagnostics.normalized_response or response,
             max_length=1600,
         )
@@ -1720,8 +1681,9 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
                 candidate.source_ids,
             )
 
-    @staticmethod
+    @classmethod
     def _format_scene_segments_for_prompt(
+        cls,
         segments: Sequence[BehaviorScenarioSegment],
     ) -> str:
         return json.dumps(
@@ -1730,8 +1692,9 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             indent=2,
         )
 
-    @staticmethod
+    @classmethod
     def _select_segment_for_candidate(
+        cls,
         candidate: BehaviorCandidate,
         segments: Sequence[BehaviorScenarioSegment],
     ) -> BehaviorScenarioSegment:
@@ -1812,8 +1775,9 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             )
         ]
 
-    @staticmethod
+    @classmethod
     def _format_feedback_references_for_system_prompt(
+        cls,
         references: Sequence[BehaviorReferenceCandidate],
     ) -> str:
         formatted_references: list[str] = []
@@ -1833,8 +1797,11 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             )
         return "\n\n".join(formatted_references)
 
-    @staticmethod
-    def _format_feedback_timeline_message(item: BehaviorFeedbackContextItem) -> str:
+    @classmethod
+    def _format_feedback_timeline_message(
+        cls,
+        item: BehaviorFeedbackContextItem,
+    ) -> str:
         return "\n".join(
             [
                 "[timeline_item]",
@@ -1843,7 +1810,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
                 f"[speaker:{item.speaker or 'unknown'}]",
                 f"[source:{item.source or 'unknown'}]",
                 "[content]",
-                _compact_log_text(item.text, max_length=900) or "[空]",
+                cls._compact_log_text(item.text, max_length=900) or "[空]",
             ]
         )
 
@@ -1900,7 +1867,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             logger.error("行为路径反馈评估失败: %s", exc)
             return set()
 
-        feedback_items = parse_behavior_feedback_response(response_text)
+        feedback_items = self._parse_behavior_feedback_response(response_text)
         if not feedback_items:
             logger.debug("行为路径反馈评估未产生可写入反馈")
             return set()
@@ -1914,7 +1881,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
                 skipped_reasons["unknown_behavior_id"] += 1
                 continue
             evidence_valid, invalid_reason, valid_source_ids = (
-                _validate_behavior_feedback_evidence(
+                self._validate_behavior_feedback_evidence(
                     feedback_item,
                     feedback_context,
                 )
@@ -1922,8 +1889,7 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
             if not evidence_valid:
                 skipped_reasons[invalid_reason] += 1
                 continue
-            feedback_path = await apply_behavior_feedback(
-                self._db,
+            feedback_path = await self._apply_behavior_feedback(
                 pattern_id=feedback_item.behavior_id,
                 score_delta=feedback_item.score_delta,
                 status=feedback_item.status,
@@ -2016,4 +1982,4 @@ class BehaviorLearnerMiddleware(BaseDaemonMiddleware[PendingBehaviorAnalysisBatc
         )
 
 
-__all__ = ["BehaviorLearnerMiddleware"]
+__all__ = ["BehaviorLearner"]

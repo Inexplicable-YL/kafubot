@@ -72,26 +72,16 @@ state_file = ".database/agent_loop_state.json"
 [agent.plugins.environment]
 enabled = true
 
-[agent.plugins.self_state]
-enabled = true
-
-[agent.plugins.model]
-enabled = true
-
-[agent.plugins.ingress]
-enabled = true
-
-[agent.plugins.attention]
-enabled = true
-
 [agent.plugins.world_model]
-enabled = true
-
-[agent.plugins.replyer]
 enabled = true
 
 [agent.plugins.interaction]
 enabled = true
+
+[agent.plugins.interaction.options]
+reasoning_effort = "max"
+prompt_enabled = true
+clock_enabled = true
 
 [agent.plugins.social_signals]
 enabled = true
@@ -100,9 +90,6 @@ enabled = true
 enabled = true
 
 [agent.plugins.reply_effects]
-enabled = true
-
-[agent.plugins.limiter]
 enabled = true
 
 [agent.plugins.meme]
@@ -121,12 +108,6 @@ enabled = true
 enabled = true
 
 [agent.plugins.expression]
-enabled = true
-
-[agent.plugins.prompt]
-enabled = true
-
-[agent.plugins.clock]
 enabled = true
 
 [agent.plugins.search_song]

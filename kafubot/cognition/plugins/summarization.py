@@ -1,13 +1,13 @@
-"""会话摘要中间件。
+"""消费已离开实时上下文窗口消息的会话摘要插件。
 
-该中间件不负责主动裁剪消息，而是消费上游已经剪掉的历史消息，在后台异步生成
-会话摘要，并在后续模型调用前把摘要重新注入上下文。
+该插件不负责主动裁剪消息，而是消费上游已经剪掉的历史消息，在后台异步生成
+会话摘要，并通过原生回复准备和查询钩子提供摘要。
 
 整体流程分为三段：
 
-1. `abefore_agent` 在主代理开始执行前，预热当前会话的摘要缓存。
-2. `aafter_agent` 接收上游已经裁剪掉的历史消息，并按 `session_id` 投递到后台队列。
-3. 后台 worker 串行更新摘要，`awrap_model_call` 再把最新摘要注入后续模型调用。
+1. 插件宿主发出上下文驱逐事件。
+2. 摘要器按 `session_id` 把被驱逐的历史消息投递到后台队列。
+3. 后台 worker 串行更新摘要，原生钩子在需要时读取最新结果。
 
 与“把所有历史消息一直保留在 live context”相比，这种设计的核心价值在于：
 
@@ -20,33 +20,25 @@
 """
 
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 from typing_extensions import override
 
 from cachetools import LRUCache
-from langchain.agents.middleware.types import (
-    ExtendedModelResponse,
-    ModelRequest,
-    ModelResponse,
-)
-from langchain.messages import HumanMessage
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import BaseMessage
 from langchain_core.messages.utils import get_buffer_string
-from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
 
 from kafubot.cognition.models import get_nonthinking_model
-from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
-from kafubot.cognition.plugins.daemon import (
-    BaseDaemonMiddleware,
-    SessionProcessOutput,
+from kafubot.cognition.plugins.background import (
+    BatchProcessOutput,
+    SessionBatchWorker,
 )
-from kafubot.cognition.plugins.lifecycle import ObservationEvent, ReplyPreparation
+from kafubot.cognition.plugins.base import PluginContext, PluginDefinition
+from kafubot.cognition.plugins.lifecycle import ContextWindowEvicted, ReplyPreparation
 from kafubot.cognition.plugins.world_model import ProviderQuery
-from kafubot.cognition.types import ManagerContext, ManagerState
 from kafubot.cognition.utils import content_to_text
 
 logger = logging.getLogger(__name__)
@@ -90,33 +82,23 @@ DEFAULT_SUMMARY_PROMPT = """<role>
 <messages>{messages}</messages>"""
 
 
-SESSION_SUMMARY_INJECTION_PROMPT = """
-Here is a summary of the conversation to date:
-
-<system-summary>
-{summary}
-</system-summary>
-""".strip()
-
-
 DEFAULT_NAMESPACE_ROOT = "session_memory"
 _DEFAULT_EMPTY_SUMMARY = "None."
 _SUMMARY_SOURCE = "session_summary"
 
 
-class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
+class ConversationSummarizer(SessionBatchWorker[list["BaseMessage"]]):
     """为代理提供异步会话摘要能力。
 
-    这个中间件的核心设计思想，是把“长期上下文压缩”作为一个独立的后台子系统来
+    这个服务的核心设计思想，是把“长期上下文压缩”作为一个独立的后台子系统来
     维护，而不是在主调用链里即时总结。这样既能持续保留会话进展，又能避免把大段
     历史消息反复塞回 live context。
 
     内部流程可以概括为三个层次：
 
-    1. 收集层：`aafter_agent` 接收被上游裁剪掉的历史消息，按会话写入待处理队列。
+    1. 收集层：原生驱逐钩子接收被上游裁剪掉的历史消息并写入待处理队列。
     2. 工作层：后台 worker 串行处理同一会话的批次，生成并持久化最新摘要。
-    3. 注入层：`awrap_model_call` 在主模型调用前读取缓存，把摘要作为额外 system
-       message 注入。
+    3. 提供层：回复准备和查询钩子按需读取缓存并提供摘要。
 
     与普通缓存不同，这里的摘要缓存既承担性能职责，也承担语义职责：
 
@@ -124,10 +106,8 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
     2. 语义上，它代表“当前会话已压缩沉淀出的最重要上下文”。
 
     Attributes:
-        namespace: 当前中间件写入 store 时使用的命名空间。
+        namespace: 当前摘要器写入 store 时使用的命名空间。
     """
-
-    state_schema = ManagerState
 
     def __init__(
         self,
@@ -142,7 +122,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         store: BaseStore | None = None,
         namespace_root: str = DEFAULT_NAMESPACE_ROOT,
     ) -> None:
-        """初始化摘要中间件。
+        """初始化摘要服务。
 
         Args:
             summary_model: 专门用于生成会话摘要的模型。
@@ -184,130 +164,18 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         self._session_summaries: LRUCache[str, str] = LRUCache(maxsize=max_sessions)
         self._loaded_sessions: LRUCache[str, bool] = LRUCache(maxsize=max_sessions)
 
-    @override
-    async def abefore_agent(
-        self,
-        state: ManagerState,
-        runtime: Runtime[ManagerContext],
-    ) -> dict[str, Any] | None:
-        """在主代理开始执行前预热当前会话的摘要缓存。
-
-        该钩子的目标很直接：尽量在真正进入模型调用前，就把当前会话的摘要从
-        store 惰性加载到进程内缓存。这样一来，`awrap_model_call` 通常只需要做一
-        次字典读取，而不必在主调用链上临时访问外部存储。
-
-        Args:
-            state: 当前代理状态。这里不直接读取其中内容，但保留参数以满足中间件
-                接口约定。
-            runtime: 运行时上下文，用于获取 `session_id` 和可用的 store。
-
-        Returns:
-            始终返回 `None`，因为该钩子只做缓存预热，不改写状态。
-        """
-        _ = state
-        if runtime.store is not None:
-            self._store = self._store or runtime.store
-        await self._ensure_session_summary_loaded(runtime.context["session_id"])
-        if summary := self._session_summaries.get(runtime.context["session_id"]):
-            return {
-                "reply_top_messages": [
-                    HumanMessage(
-                        content=SESSION_SUMMARY_INJECTION_PROMPT.format(
-                            summary=summary
-                        ),
-                        additional_kwargs={"lc_source": _SUMMARY_SOURCE},
-                    )
-                ]
-            }
-        return None
-
-    @override
-    async def aafter_agent(
-        self,
-        state: ManagerState,
-        runtime: Runtime[ManagerContext],
-    ) -> dict[str, Any] | None:
-        """接收本轮被裁剪掉的历史消息，并把它们投递到后台摘要队列。
-
-        该钩子只关心 `summary_pruned_messages`。这意味着：
-
-        1. 当前还留在 live context 中的消息不会被重复总结。
-        2. 摘要系统天然与“消息裁剪策略”解耦，只消费其产物。
-        3. 摘要生成延迟到主代理执行之后，不阻塞当前轮响应。
-
-        Args:
-            state: 当前代理状态。这里会读取 `summary_pruned_messages`。
-            runtime: 运行时上下文，用于获取 `session_id` 和 store。
-
-        Returns:
-            始终返回 `None`，因为该钩子只负责排队副作用。
-        """
-        if messages := cast(
-            "list[BaseMessage] | None", state.get("summary_pruned_messages")
-        ):
-            await self.learn_from_messages(
-                runtime.context["session_id"],
-                messages,
-                store=runtime.store,
-            )
-        return None
-
-    async def learn_from_messages(
+    async def consume_evicted(
         self,
         session_id: str,
         messages: Sequence[BaseMessage],
         *,
         store: BaseStore | None = None,
     ) -> None:
-        """Queue observable messages directly from the unified plugin lifecycle."""
+        """Queue messages delivered by the native context-eviction hook."""
         if store is not None:
             self._store = self._store or store
         if messages:
             await self._enqueue_batch(session_id, list(messages))
-
-    @override
-    async def awrap_model_call(
-        self,
-        request: ModelRequest[ManagerContext],
-        handler: Callable[
-            [ModelRequest[ManagerContext]], Awaitable[ModelResponse[Any]]
-        ],
-    ) -> ModelResponse[Any] | AIMessage | ExtendedModelResponse[Any]:
-        """在主模型调用前注入当前会话摘要。
-
-        这里刻意不去修改原始 system prompt，而是额外插入一条新的 `SystemMessage`。
-        这样做的好处是：
-
-        1. 摘要作为独立上下文层存在，更容易与角色提示分离。
-        2. 上游若需要观察或调试注入内容，可以明确识别 `_SUMMARY_SOURCE`。
-        3. 未来如果调整摘要注入策略，不必侵入主提示词模板。
-
-        Args:
-            request: 当前模型调用请求。
-            handler: 下一个处理器。
-
-        Returns:
-            下游处理器返回的模型调用结果。
-        """
-        if request.runtime.store is not None:
-            self._store = self._store or request.runtime.store
-        session_id = request.runtime.context["session_id"]
-        await self._ensure_session_summary_loaded(session_id)
-        if not (summary := self._session_summaries.get(session_id)):
-            return await handler(request)
-        return await handler(
-            request.override(
-                messages=[
-                    HumanMessage(
-                        content=SESSION_SUMMARY_INJECTION_PROMPT.format(
-                            summary=summary
-                        ),
-                        additional_kwargs={"lc_source": _SUMMARY_SOURCE},
-                    ),
-                    *request.messages,
-                ]
-            )
-        )
 
     async def get_session_summary(self, session_id: str) -> str | None:
         """Read the persisted summary through the native Executive plugin API."""
@@ -322,7 +190,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
         self,
         session_id: str,
         batches: tuple[list[BaseMessage], ...],
-    ) -> SessionProcessOutput:
+    ) -> BatchProcessOutput:
         batch_count, messages_text = self._build_summary_input(batches)
         if batch_count <= 0:
             return None
@@ -524,6 +392,7 @@ class SummarizationMiddleware(BaseDaemonMiddleware[list["BaseMessage"]]):
 
     async def clear_session(self, session_id: str) -> None:
         """Delete both cached and persisted summary state for one QQ session."""
+        self.discard(session_id)
         self._session_summaries.pop(session_id, None)
         self._loaded_sessions.pop(session_id, None)
         if self._store is not None:
@@ -557,14 +426,14 @@ async def apply(context: PluginContext, config: dict[str, Any]) -> None:
     path = str(values.pop("store_path", "./.database/summary_store.db"))
     temperature = float(values.pop("temperature", 0.1))
     store = await context.sqlite_store(path)
-    summarizer = SummarizationMiddleware(
+    summarizer = ConversationSummarizer(
         summary_model=get_nonthinking_model(temperature),
         store=store,
         **values,
     )
 
-    async def observe(event: ObservationEvent) -> None:
-        await summarizer.learn_from_messages(event.session_id, event.model_messages)
+    async def evicted(event: ContextWindowEvicted) -> None:
+        await summarizer.consume_evicted(event.session_id, event.model_messages)
 
     async def prepare(preparation: ReplyPreparation) -> str | None:
         summary = await summarizer.get_session_summary(preparation.context.session_id)
@@ -577,7 +446,7 @@ async def apply(context: PluginContext, config: dict[str, Any]) -> None:
         return f"长期会话摘要：\n{summary}" if summary else None
 
     context.resource("summarization", summarizer)
-    context.on_observe(observe)
+    context.on_context_evicted(evicted)
     context.on_prepare_reply(prepare)
     context.on_query(query)
     context.clear_session(summarizer.clear_session)
@@ -586,4 +455,4 @@ async def apply(context: PluginContext, config: dict[str, Any]) -> None:
 plugin = PluginDefinition(name="summarization", apply=apply)
 
 
-__all__ = ["SummarizationMiddleware", "plugin"]
+__all__ = ["ConversationSummarizer", "plugin"]

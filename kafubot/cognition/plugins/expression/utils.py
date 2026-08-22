@@ -4,14 +4,15 @@ import json
 import random
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 from json_repair import repair_json
+from pydantic import BaseModel, ConfigDict
 
 
-@dataclass(frozen=True, slots=True)
-class ExpressionRuntimeConfig:
+class ExpressionRuntimeConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     use_expression: bool = True
     enable_learning: bool = True
 
